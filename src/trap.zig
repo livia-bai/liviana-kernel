@@ -52,7 +52,7 @@ pub fn init() void {
     riscv.write(.sscratch, 0);
 }
 
-/// 在编译期生成保存/恢复 x1..x31 的 31 条指令（sp 单独处理）。
+/// 在编译期生成保存/恢复 x1、x3..x31 的 30 条指令（x0 恒为 0 不用存，sp 单独处理）。
 fn regsAsm(comptime op: []const u8) []const u8 {
     var s: []const u8 = "";
     for (1..32) |i| {
