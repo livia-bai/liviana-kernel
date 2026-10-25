@@ -64,7 +64,7 @@ zig build run -Doptimize=small    # 体积优化，内核代码段约 12.8 KB
 - 内核：[陷阱处理](docs/trap.md)、[串口 / PLIC / 定时器](docs/devices.md)、[CSR 和 SBI](docs/riscv-sbi.md)、[设备树](docs/devicetree.md)、[页分配器](docs/page-allocator.md)、[Sv39 分页](docs/paging.md)、[shell](docs/shell.md)
 - 用户态：[用户程序](docs/user-programs.md)、[进程](docs/process.md)、[系统调用](docs/syscalls.md)
 - 开发：[测试与调试](docs/testing.md)、[Zig 0.17 笔记](docs/zig-0.17.md)
-- [修改与验错记录](docs/changes/README.md)：每次改动做了什么、怎么验证的、发现并修复了哪些问题
+- [修改与验错记录](docs/changes/README.md)：每次内核改动做了什么、怎么验证的、发现并修复了哪些问题
 
 改代码之前先读 [AGENTS.md](AGENTS.md)。
 

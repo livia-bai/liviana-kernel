@@ -1,7 +1,7 @@
 # 0007 文档链接检查脚本加进仓库；删除会话分支
 
 - 日期：2026-10-25
-- 提交：本记录对应的提交（Add a link checker for the documentation）
+- 提交：`e947307` Add a link checker for the documentation
 - 涉及文件：`tools/check_links.py`（新）、`docs/testing.md`、`docs/README.md`、`AGENTS.md`、`README.md`、`docs/changes/0006-docs.md`、`docs/changes/README.md`
 
 ## 目标
