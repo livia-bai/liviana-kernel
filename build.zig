@@ -27,6 +27,44 @@ pub fn build(b: *std.Build) void {
     kernel.setLinkerScript(b.path("linker.ld"));
     b.installArtifact(kernel);
 
+    // 用户程序：每个程序以 user/start.zig 为根文件、user/<名字>.zig 作为 program 模块，
+    // 各自编译成一个 ELF，链接到用户地址空间（user/linker.ld）。ELF 再作为匿名模块交给内核，
+    // 内核用 @embedFile(名字) 拿到它的字节，运行时自己加载。程序名列表通过 build_options 传给内核。
+    const user_programs = [_][]const u8{ "hello", "fault", "spin" };
+    const abi = b.createModule(.{ .root_source_file = b.path("src/abi.zig") });
+    const sys = b.createModule(.{
+        .root_source_file = b.path("user/sys.zig"),
+        .imports = &.{.{ .name = "abi", .module = abi }},
+    });
+    const options = b.addOptions();
+    options.addOption([]const []const u8, "user_programs", &user_programs);
+    kernel.root_module.addOptions("build_options", options);
+    for (user_programs) |name| {
+        const program = b.addExecutable(.{
+            .name = name,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("user/start.zig"),
+                .target = target,
+                .optimize = optimize,
+                .code_model = .medany,
+                // 调试信息和栈回溯用的 unwind 表对用户程序都没用，去掉之后嵌进内核的 ELF 小很多
+                .strip = true,
+                .unwind_tables = .none,
+                .imports = &.{
+                    .{ .name = "sys", .module = sys },
+                    .{ .name = "program", .module = b.createModule(.{
+                        .root_source_file = b.path(b.fmt("user/{s}.zig", .{name})),
+                        .imports = &.{.{ .name = "sys", .module = sys }},
+                    }) },
+                },
+            }),
+        });
+        program.setLinkerScript(b.path("user/linker.ld"));
+        // Debug 模式默认不回收没用到的段，会把整个 compiler_rt 带进来，体积大两倍多
+        program.link_gc_sections = true;
+        kernel.root_module.addAnonymousImport(name, .{ .root_source_file = program.getEmittedBin() });
+    }
+
     // zig build run：用 QEMU 的 virt 机器启动内核。
     // -bios default 使用 QEMU 自带的 OpenSBI 固件，它在 M 模式完成初始化后
     // 以 S 模式跳到 0x80200000 执行内核。按 Ctrl-A 再按 X 退出 QEMU。

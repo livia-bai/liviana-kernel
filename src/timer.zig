@@ -25,3 +25,8 @@ pub fn onInterrupt() void {
     ticks += 1;
     arm();
 }
+
+/// 开机以来的毫秒数（从打开时钟中断算起），精度是一个 tick。
+pub fn uptimeMs() u64 {
+    return ticks * 1000 / tick_hz;
+}

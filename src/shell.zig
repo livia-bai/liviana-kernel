@@ -5,8 +5,9 @@ const uart = @import("uart.zig");
 const timer = @import("timer.zig");
 const sbi = @import("sbi.zig");
 const page = @import("page.zig");
+const proc = @import("proc.zig");
 
-const Command = enum { help, uptime, mem, ebreak, crash, shutdown };
+const Command = enum { help, uptime, mem, run, ebreak, crash, shutdown };
 
 var line: [64]u8 = undefined;
 var len: usize = 0;
@@ -38,8 +39,10 @@ pub fn feed(c: u8) void {
 }
 
 fn execute(input: []const u8) void {
-    const name = std.mem.trim(u8, input, " ");
-    if (name.len == 0) return;
+    const trimmed = std.mem.trim(u8, input, " ");
+    if (trimmed.len == 0) return;
+    // 第一个空格之前是命令名，之后是参数
+    const name, const arg = std.mem.cutScalar(u8, trimmed, ' ') orelse .{ trimmed, "" };
     const cmd = std.meta.stringToEnum(Command, name) orelse {
         uart.print("unknown command: {s} (try 'help')\n", .{name});
         return;
@@ -49,6 +52,7 @@ fn execute(input: []const u8) void {
             \\help      show this message
             \\uptime    time since boot, counted by timer interrupts
             \\mem       free physical pages
+            \\run NAME  run a user program in U-mode (without NAME: list them)
             \\ebreak    trigger a breakpoint exception and recover from it
             \\crash     read from address 0 -> unhandled exception -> panic
             \\shutdown  power off through SBI
@@ -61,6 +65,7 @@ fn execute(input: []const u8) void {
         .mem => uart.print("{d} of {d} pages free ({d} KiB), 4 KiB each\n", .{
             page.free_pages, page.total_pages, page.free_pages * page.size / 1024,
         }),
+        .run => run(std.mem.trim(u8, arg, " ")),
         .ebreak => asm volatile ("ebreak"),
         .crash => {
             const bad: *allowzero volatile u64 = @ptrFromInt(0);
@@ -71,4 +76,12 @@ fn execute(input: []const u8) void {
             sbi.shutdown();
         },
     }
+}
+
+fn run(name: []const u8) void {
+    if (proc.find(name)) |program| return proc.run(program);
+    if (name.len != 0) uart.print("no such program: {s}\n", .{name});
+    uart.write("programs:");
+    for (proc.programs) |p| uart.print(" {s}", .{p.name});
+    uart.write("\n");
 }

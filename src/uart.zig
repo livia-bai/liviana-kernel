@@ -54,9 +54,17 @@ var rx_buf: [256]u8 = undefined;
 var rx_head: u8 = 0;
 var rx_tail: u8 = 0;
 
+/// Ctrl-C（ASCII 0x03）不进缓冲区，只记下来，陷阱处理程序据此结束正在运行的用户程序。
+const ctrl_c = 0x03;
+var ctrl_c_pressed = false;
+
 /// 串口中断处理：把硬件 FIFO 里的字符全部搬进环形缓冲区，满了就丢弃。
 pub fn onInterrupt() void {
     while (getc()) |c| {
+        if (c == ctrl_c) {
+            ctrl_c_pressed = true;
+            continue;
+        }
         if (rx_head +% 1 == rx_tail) continue;
         rx_buf[rx_head] = c;
         rx_head +%= 1;
@@ -69,6 +77,13 @@ pub fn read() ?u8 {
     const c = rx_buf[rx_tail];
     rx_tail +%= 1;
     return c;
+}
+
+/// 上次调用以来是否按过 Ctrl-C。调用方需保证此时中断已关闭。
+pub fn takeCtrlC() bool {
+    const pressed = ctrl_c_pressed;
+    ctrl_c_pressed = false;
+    return pressed;
 }
 
 /// 接入 std.Io.Writer 接口，这样就能用标准库的格式化输出（{d}、{x}、{s} 等）。

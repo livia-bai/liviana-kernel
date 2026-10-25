@@ -6,6 +6,7 @@ pub const Csr = enum {
     sie,
     sip,
     stvec,
+    sscratch,
     sepc,
     scause,
     stval,
@@ -15,6 +16,8 @@ pub const Csr = enum {
 
 // sstatus 中的位
 pub const sstatus_sie: usize = 1 << 1; // S 模式全局中断使能
+pub const sstatus_spie: usize = 1 << 5; // 陷入前的 SIE，sret 时恢复到 SIE
+pub const sstatus_spp: usize = 1 << 8; // 陷入前的特权级：0 = U，1 = S；sret 回到这个特权级
 
 // sie 中的位：分别使能三类 S 模式中断
 pub const sie_ssie: usize = 1 << 1; // 软件中断
