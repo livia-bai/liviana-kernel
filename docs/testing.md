@@ -10,6 +10,15 @@
 2. **四种优化模式都能编译**：`zig build -Doptimize=debug`、`safe`、`fast`、`small`。不能只看退出码：链接器的警告会以 `error: warning(link): ...` 的形式打印出来，构建树里标成 `failure`，但 `zig build` 仍然返回 0（见文末“症状速查”）。构建输出应该是空的。
 3. **在 QEMU 里跑标准测试脚本**（下一节）。改动涉及内联汇编、MMIO、中断、页表、进出 U 模式、陷阱处理时，**四种模式都要跑**；只改文档或纯计算逻辑时，至少跑 Debug 模式。
 4. 新功能、修复的 bug：除了标准脚本，还要针对性地测边界情况（见“边界情况”一节），把测试过程和结果写进 [changes/](changes/README.md) 的记录里。
+5. **文档链接**：改了任何 Markdown 文件（包括新增的修改记录），运行 `python3 tools/check_links.py`，必须输出 `0 broken`。它检查 README.md、AGENTS.md 和 `docs/` 下所有相对链接指向的文件是否存在，`#锚点` 是否对应目标文件里的某个标题（按 GitHub 生成锚点的规则：转小写、去掉标点、空格换成 `-`，同名标题依次加 `-1`、`-2`）。外部链接不检查。有错误时逐条打印、退出码为 1。例如在本文末尾加上 `[a](nope.md) [b](trap.md#没有这个标题)` 时的实际输出：
+
+   ```
+   docs/testing.md: missing file: nope.md
+   docs/testing.md: missing anchor: trap.md#没有这个标题
+   checked 215 links, 2 broken
+   ```
+
+   中文标题的锚点不好手算：标题 `PLIC（plic.zig）` 的锚点是 `#plicpliczig`（全角括号、反引号、`.` 都被去掉）。写好链接后跑一遍脚本最可靠。
 
 为什么要四种模式都跑：release 模式下编译器会更激进地利用类型系统的承诺。漏写 `volatile` 的 MMIO 访问会被合并或删除；漏写的 clobber 会让编译器以为寄存器或内存没变；声明成 `noreturn` 的函数如果实际返回了，调用之后的代码已经被删掉了。这个项目在 U 模式的开发中就有两个 bug 只在 release 模式下出现（[changes/0005](changes/0005-user-mode-and-syscalls.md)）。反过来，Debug/safe 模式有安全检查，能暴露整数溢出、越界、对齐错误这类问题。
 

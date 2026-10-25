@@ -48,6 +48,7 @@ liviana-kernel 的详细文档，按功能组织。仓库根目录的 [README.md
 | `user/sys.zig` | [user-programs.md](user-programs.md#syszig) | [syscalls.md](syscalls.md#用户态封装) |
 | `user/linker.ld` | [build.md](build.md#用户程序的链接脚本) | [process.md](process.md#elf-加载器) |
 | `user/hello.zig`、`user/fault.zig`、`user/spin.zig` | [user-programs.md](user-programs.md#示例程序) | |
+| `tools/check_links.py` | [testing.md](testing.md#必做的检查) | |
 
 ## 修改与验错记录
 
@@ -58,3 +59,4 @@ liviana-kernel 的详细文档，按功能组织。仓库根目录的 [README.md
 - 改了代码就同步改对应的文档（上表）。文档里的实测数字（地址、页数、体积）会随代码变化，大的变化要更新，小的漂移可以不管，但不要留下错误的说法。
 - 文档里写的命令、输出、结论都应该是实际验证过的；没验证的推测要明确标出来。
 - 文档用中文，代码、命令、内核输出保持原样（英文）。
+- 改完运行 `python3 tools/check_links.py` 检查链接和锚点。

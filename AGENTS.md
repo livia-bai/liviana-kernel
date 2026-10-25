@@ -18,6 +18,7 @@ zig build -Doptimize=small             # 可选 debug|safe|fast|small（0.17 起
 zig build run                          # 在 QEMU 中启动，Ctrl-A X 退出
 zig build run -- -d int -D q.log       # -- 之后的参数传给 QEMU
 zig fmt --check build.zig src/ user/   # 格式检查
+python3 tools/check_links.py           # 检查文档里的相对链接和锚点，必须 0 broken
 ```
 
 ## 如何验证改动
@@ -67,6 +68,7 @@ zig fmt --check build.zig src/ user/   # 格式检查
 
 - 改了代码，就同步改 [docs/](docs/README.md) 里对应的文档（对照表在 `docs/README.md`）；新增源码文件要加进对照表。
 - README.md 只放简介、运行方法、shell 命令和文档索引，细节写进 `docs/`。
+- 改了任何 Markdown 文件都要跑 `python3 tools/check_links.py`，输出必须是 `0 broken`（[docs/testing.md](docs/testing.md#必做的检查)）。
 - 文档里写的命令、输出、数字、结论必须是实际验证过的；没验证的推测要明确写“推测”。写文档时发现之前的说法有错，改掉并在本次的修改记录里写明。
 
 ## 修改与验错记录
