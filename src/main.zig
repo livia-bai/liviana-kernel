@@ -9,6 +9,7 @@ const trap = @import("trap.zig");
 const plic = @import("plic.zig");
 const timer = @import("timer.zig");
 const shell = @import("shell.zig");
+const dtb = @import("dtb.zig");
 
 /// 替换标准库默认的 panic 处理。@panic、std.debug.panic 以及
 /// Debug 模式下的安全检查失败（整数溢出、数组越界等）都会走到这里。
@@ -41,12 +42,12 @@ export fn _start() linksection(".text.boot") callconv(.naked) noreturn {
     );
 }
 
-fn kmain(hartid: usize, dtb: usize) callconv(.c) noreturn {
+fn kmain(hartid: usize, dtb_addr: usize) callconv(.c) noreturn {
     uart.init();
     uart.write("\nHello from a Zig kernel on RISC-V!\n");
     const version = sbi.specVersion();
     uart.print("SBI: {s}, spec v{d}.{d} | hart {d} | device tree at 0x{x}\n", .{
-        sbi.implName(), version.major, version.minor, hartid, dtb,
+        sbi.implName(), version.major, version.minor, hartid, dtb_addr,
     });
 
     trap.init();
@@ -54,8 +55,15 @@ fn kmain(hartid: usize, dtb: usize) callconv(.c) noreturn {
     // 自检：主动触发一次断点异常，确认陷阱能进能出
     asm volatile ("ebreak");
 
+    const info = dtb.parse(dtb_addr) catch |err| {
+        std.debug.panic("cannot parse device tree at 0x{x}: {s}", .{ dtb_addr, @errorName(err) });
+    };
+    uart.print("[ok] device tree: {d} MiB RAM at 0x{x}, timebase {d} Hz\n", .{
+        info.memory.size >> 20, info.memory.base, info.timebase_hz,
+    });
+
     plic.init(hartid);
-    timer.init();
+    timer.init(info.timebase_hz);
     riscv.enableInterrupts();
     uart.print("[ok] interrupts enabled: timer at {d} Hz, keyboard via UART + PLIC\n", .{timer.tick_hz});
 

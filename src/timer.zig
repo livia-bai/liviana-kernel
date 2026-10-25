@@ -3,13 +3,15 @@
 const riscv = @import("riscv.zig");
 const sbi = @import("sbi.zig");
 
-/// time CSR 每秒增加的次数。QEMU virt 固定为 10MHz（设备树 /cpus 的 timebase-frequency）。
-const timebase_hz = 10_000_000;
 pub const tick_hz = 100;
+
+/// time CSR 每秒增加的次数，来自设备树 /cpus 的 timebase-frequency（QEMU virt 上是 10MHz）。
+var timebase_hz: u64 = undefined;
 
 pub var ticks: u64 = 0;
 
-pub fn init() void {
+pub fn init(hz: u64) void {
+    timebase_hz = hz;
     arm();
     riscv.set(.sie, riscv.sie_stie);
 }

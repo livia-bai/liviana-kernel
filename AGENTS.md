@@ -33,7 +33,7 @@ zig fmt --check build.zig src/         # 格式检查
 - 目标 CPU 是 rv64imac，不启用 F/D 扩展：内核里不要用浮点，陷阱处理也不保存浮点寄存器。
 - CSR 读写统一走 `src/riscv.zig`，新用到的 CSR 加到 `Csr` 枚举里。
 - `TrapFrame` 的布局和 `trap.trapEntry` 里的汇编是绑在一起的，改一边就要同步改另一边。
-- 外设地址、PLIC 中断号、时钟频率目前是按 QEMU `virt` 写死的，改的话要连注释一起改。
+- 内存范围和时钟频率来自设备树（`src/dtb.zig`）；外设地址和 PLIC 中断号目前仍按 QEMU `virt` 写死，改的话要连注释一起改。
 - 主循环检查输入缓冲区前要先关中断，再 `wfi`，然后开中断（见 `kmain` 里的注释）。不要把这个顺序改掉。
 
 ## 提交与推送

@@ -2,13 +2,14 @@
 
 用 Zig 0.17 写的最小 RISC-V 64 位内核，运行在 QEMU `virt` 机器上，由 OpenSBI 引导。
 
-功能：串口输出、陷阱（异常 + 中断）处理、时钟中断、键盘（串口）中断输入，外加一个能执行几条命令的小 shell。
+功能：串口输出、陷阱（异常 + 中断）处理、解析设备树、时钟中断、键盘（串口）中断输入，外加一个能执行几条命令的小 shell。
 
 ```
 Hello from a Zig kernel on RISC-V!
 SBI: OpenSBI, spec v1.0 | hart 0 | device tree at 0x87e00000
 [ok] trap vector installed
-[trap] breakpoint at 0x80215d30, skipping it
+[trap] breakpoint at 0x80215d34, skipping it
+[ok] device tree: 128 MiB RAM at 0x80000000, timebase 10000000 Hz
 [ok] interrupts enabled: timer at 100 Hz, keyboard via UART + PLIC
 Type 'help' for commands.
 > uptime
@@ -44,7 +45,7 @@ shell 命令：
 
 1. QEMU 上电，执行 OpenSBI（M 模式，最高特权级）。OpenSBI 初始化硬件后切到 S 模式，跳到 `0x80200000`。
 2. `_start`（`src/main.zig`）：设置栈指针、清零 `.bss`，然后跳到 `kmain`。此时 `a0` = hart 编号，`a1` = 设备树地址。
-3. `kmain`：初始化串口 → 安装陷阱向量 `stvec` → 用 `ebreak` 自检 → 配置 PLIC 和定时器 → 打开中断 → 进入主循环。
+3. `kmain`：初始化串口 → 安装陷阱向量 `stvec` → 用 `ebreak` 自检 → 解析设备树 → 配置 PLIC 和定时器 → 打开中断 → 进入主循环。
 4. 主循环大部分时间停在 `wfi` 休眠；时钟或键盘中断把它唤醒。
 
 ## 文件结构
@@ -56,11 +57,22 @@ shell 命令：
 | `src/main.zig` | `_start` 入口、`kmain`、panic 处理 |
 | `src/riscv.zig` | CSR 读写、开关中断、`wfi` |
 | `src/sbi.zig` | SBI 调用：版本查询、设置定时器、关机 |
+| `src/dtb.zig` | 设备树解析：内存范围、时钟频率、保留内存 |
 | `src/uart.zig` | NS16550A 串口驱动 + 接收环形缓冲区 + `std.Io.Writer` 适配 |
 | `src/trap.zig` | 陷阱入口汇编（保存/恢复寄存器）和分发 |
 | `src/plic.zig` | 外部中断控制器，把串口中断送给 CPU |
-| `src/timer.zig` | 每 10 ms 一次的时钟中断 |
+| `src/timer.zig` | 每 10 ms 一次的时钟中断，`time` 的频率来自设备树 |
 | `src/shell.zig` | 逐字符读输入、回显、执行命令 |
+
+## 设备树
+
+OpenSBI 把设备树（DTB）的物理地址放在 `a1` 里交给内核。`dtb.zig` 按 Devicetree 规范第 5 章的格式遍历它，取出：
+
+- `memory` 节点（`device_type = "memory"`）的 `reg`：物理内存的起点和大小。`reg` 的格式由父节点的 `#address-cells` / `#size-cells` 决定，QEMU virt 上都是 2，也就是 64 位地址 + 64 位长度。
+- `/cpus` 的 `timebase-frequency`：`time` CSR 每秒增加多少，定时器按它换算 10 ms 是多少个计数。
+- 不能用的内存：设备树自己占的空间、内存保留块里的条目、`/reserved-memory` 的子节点（OpenSBI 在这里登记了自己占用的 `0x80000000..0x80060000`）。
+
+设备树是固件给的数据，解析时每次读取都检查边界，格式不对就返回错误、内核 panic，不会读到范围外面去。外设地址（串口、PLIC）和中断号目前仍按 QEMU virt 写死。
 
 ## 中断是怎么走的
 
@@ -87,7 +99,6 @@ shell 命令：
 
 ## 可以继续做的方向
 
-- 解析设备树，得到内存大小和时钟频率，替换现在写死的值
 - 物理页分配器 + Sv39 分页
 - U 模式用户程序 + 系统调用（`ecall` 从 U 模式陷入）
 - 多核：用 SBI HSM 扩展启动其他 hart
