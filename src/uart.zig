@@ -3,7 +3,8 @@
 
 const std = @import("std");
 
-const base: usize = 0x1000_0000;
+pub const base: usize = 0x1000_0000;
+pub const mmio_size: usize = 0x100;
 
 const Reg = enum(usize) {
     rbr_thr = 0, // 读：接收缓冲；写：发送保持

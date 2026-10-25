@@ -4,8 +4,9 @@ const std = @import("std");
 const uart = @import("uart.zig");
 const timer = @import("timer.zig");
 const sbi = @import("sbi.zig");
+const page = @import("page.zig");
 
-const Command = enum { help, uptime, ebreak, crash, shutdown };
+const Command = enum { help, uptime, mem, ebreak, crash, shutdown };
 
 var line: [64]u8 = undefined;
 var len: usize = 0;
@@ -47,6 +48,7 @@ fn execute(input: []const u8) void {
         .help => uart.write(
             \\help      show this message
             \\uptime    time since boot, counted by timer interrupts
+            \\mem       free physical pages
             \\ebreak    trigger a breakpoint exception and recover from it
             \\crash     read from address 0 -> unhandled exception -> panic
             \\shutdown  power off through SBI
@@ -56,6 +58,9 @@ fn execute(input: []const u8) void {
             const t = timer.ticks;
             uart.print("up {d}.{d:0>2}s ({d} timer interrupts)\n", .{ t / timer.tick_hz, t % timer.tick_hz, t });
         },
+        .mem => uart.print("{d} of {d} pages free ({d} KiB), 4 KiB each\n", .{
+            page.free_pages, page.total_pages, page.free_pages * page.size / 1024,
+        }),
         .ebreak => asm volatile ("ebreak"),
         .crash => {
             const bad: *allowzero volatile u64 = @ptrFromInt(0);

@@ -1,4 +1,4 @@
-//! RISC-V 特权架构相关的辅助函数：读写 CSR、开关中断。
+//! RISC-V 特权架构相关的辅助函数：读写 CSR、开关中断、刷新 TLB。
 
 /// 内核会用到的 S 模式 CSR。枚举名就是汇编里的寄存器名。
 pub const Csr = enum {
@@ -9,6 +9,7 @@ pub const Csr = enum {
     sepc,
     scause,
     stval,
+    satp,
     time,
 };
 
@@ -19,6 +20,9 @@ pub const sstatus_sie: usize = 1 << 1; // S 模式全局中断使能
 pub const sie_ssie: usize = 1 << 1; // 软件中断
 pub const sie_stie: usize = 1 << 5; // 时钟中断
 pub const sie_seie: usize = 1 << 9; // 外部中断（来自 PLIC）
+
+/// satp 的 MODE 字段（最高 4 位）为 8 表示 Sv39，低 44 位是根页表的物理页号。
+pub const satp_sv39: usize = 8 << 60;
 
 pub inline fn read(comptime csr: Csr) usize {
     return asm volatile ("csrr %[ret], " ++ @tagName(csr)
@@ -61,4 +65,10 @@ pub inline fn disableInterrupts() void {
 /// 只要中断在 sie 里被使能，即使 sstatus.SIE 为 0，wfi 也会被唤醒。
 pub inline fn wfi() void {
     asm volatile ("wfi" ::: .{ .memory = true });
+}
+
+/// 清空整个 TLB（页表缓存）。改了正在使用的页表、或者切换 satp 之后都要执行，
+/// 否则 CPU 可能还在用旧的地址翻译结果。
+pub inline fn sfenceVma() void {
+    asm volatile ("sfence.vma zero, zero" ::: .{ .memory = true });
 }

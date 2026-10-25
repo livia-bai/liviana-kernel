@@ -10,6 +10,8 @@ const plic = @import("plic.zig");
 const timer = @import("timer.zig");
 const shell = @import("shell.zig");
 const dtb = @import("dtb.zig");
+const page = @import("page.zig");
+const vm = @import("vm.zig");
 
 /// 替换标准库默认的 panic 处理。@panic、std.debug.panic 以及
 /// Debug 模式下的安全检查失败（整数溢出、数组越界等）都会走到这里。
@@ -61,6 +63,12 @@ fn kmain(hartid: usize, dtb_addr: usize) callconv(.c) noreturn {
     uart.print("[ok] device tree: {d} MiB RAM at 0x{x}, timebase {d} Hz\n", .{
         info.memory.size >> 20, info.memory.base, info.timebase_hz,
     });
+
+    page.init(vm.kernelEnd(), info.memory.end(), info.reserved());
+    uart.print("[ok] page allocator: {d} free pages ({d} KiB)\n", .{ page.free_pages, page.free_pages * page.size / 1024 });
+
+    vm.init(info.memory) catch |err| std.debug.panic("cannot set up paging: {s}", .{@errorName(err)});
+    uart.write("[ok] Sv39 paging enabled: kernel mapped 1:1, text r-x, rodata r--, data rw-\n");
 
     plic.init(hartid);
     timer.init(info.timebase_hz);

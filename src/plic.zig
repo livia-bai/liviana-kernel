@@ -3,7 +3,9 @@
 
 const riscv = @import("riscv.zig");
 
-const base: usize = 0x0c00_0000;
+pub const base: usize = 0x0c00_0000;
+/// 寄存器区域的大小，见设备树 plic 节点的 reg。分页时要整块映射。
+pub const mmio_size: usize = 0x60_0000;
 
 pub const uart0_irq: u32 = 10;
 
