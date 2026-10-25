@@ -4,6 +4,8 @@
 
 详细文档在 [docs/](docs/README.md)，里面有“源码文件 → 文档”的对照表。改某个文件之前，先读它对应的文档；想知道一段代码为什么写成这样，先查 [docs/changes/](docs/changes/README.md)。
 
+本文说的**涉及内核的改动**，指改了 `src/`、`user/`、`build.zig`、`linker.ld`、`user/linker.ld` 中任何一个的改动。只改文档（README.md、AGENTS.md、`docs/`）、开发脚本（`tools/`）或者做仓库操作（分支、提交作者等）的不算。QEMU 验证和修改记录都只针对涉及内核的改动。
+
 ## 环境
 
 - 必须用 Zig **0.17.0**。0.17 的 API 和旧版差别很大，不要照搬旧教程或训练数据里的写法，拿不准时直接查标准库源码（路径见 `zig env` 输出里的 `std_dir`）。和旧版的差别、踩过的坑见 [docs/zig-0.17.md](docs/zig-0.17.md)。
@@ -23,7 +25,18 @@ python3 tools/check_links.py           # 检查文档里的相对链接和锚点
 
 ## 如何验证改动
 
-没有单元测试，改完要在 QEMU 里实际跑一遍。用管道喂键盘输入，加超时防止卡住：
+按改动的范围：
+
+| 改了什么 | 必须做的检查 |
+| --- | --- |
+| 涉及内核（见开头的定义） | `zig fmt --check`；构建输出为空；在 QEMU 里跑下面的标准测试脚本，需要时四种模式都跑 |
+| 文档（任何 Markdown 文件） | `python3 tools/check_links.py` 必须 `0 broken`；文档里新写的命令、输出要实际跑过 |
+| `tools/` 里的脚本 | 实际运行一遍脚本，包括故意构造出错的情况，确认它能报出来 |
+| 仓库操作 | 操作前后核对状态（比如删分支前确认内容已经在 `main` 上） |
+
+不涉及内核的改动不需要编译和跑 QEMU。
+
+涉及内核的改动没有单元测试，改完要在 QEMU 里实际跑一遍。用管道喂键盘输入，加超时防止卡住：
 
 ```sh
 (sleep 1.5; for c in help uptime mem ebreak 'run hello' 'run fault' 'run spin' '\003' mem; do printf '%b\r' "$c"; sleep 0.4; done; printf 'shutdown\r'; sleep 2) \
@@ -75,8 +88,8 @@ python3 tools/check_links.py           # 检查文档里的相对链接和锚点
 
 每一次涉及内核的改动都要在 [docs/changes/](docs/changes/README.md) 里写一篇记录，和代码放在**同一个提交**里。
 
-- **哪些要写**：改了内核或用户程序的代码、构建配置的改动，也就是 `src/`、`user/`、`build.zig`、`linker.ld`、`user/linker.ld`。
-- **哪些不写**：只改文档（README.md、AGENTS.md、`docs/`）、开发脚本（`tools/`），以及仓库方面的操作（分支、提交作者等）。这类提交照常验证，但不写记录。
+- **哪些要写**：涉及内核的改动（见开头的定义）。
+- **哪些不写**：只改文档、开发脚本，以及仓库方面的操作。这类提交按“如何验证改动”里对应的那一行检查，但不写记录。
 - **文件名**：`NNNN-简短英文描述.md`，编号接着最后一篇往下排，四位数。
 - **索引**：在 `docs/changes/README.md` 的索引表里加一行。
 - **内容**：按 `docs/changes/README.md` 末尾的模板写，必须包括：
@@ -94,7 +107,7 @@ python3 tools/check_links.py           # 检查文档里的相对链接和锚点
 - 仓库只有一位维护者：提交直接推到 `main`，不开分支，也不开 PR。
 - 提交的作者和提交者都用维护者本人（照 `git log` 里已有提交的作者设置 `git config user.name` / `user.email`），提交信息末尾保留 `Co-Authored-By: Claude ...` 一行。
 - 提交信息里不要带 session 链接（`Claude-Session:` 之类的行）。
-- 推送前确认验证、格式检查、链接检查都已通过；涉及内核的改动，修改记录已经写好。
+- 推送前按“如何验证改动”的表格做完对应的检查；涉及内核的改动，修改记录已经写好。
 
 ## Zig 0.17 的坑（摘要）
 
