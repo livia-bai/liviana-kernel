@@ -154,7 +154,7 @@ spinning in U-mode without making syscalls, press Ctrl-C to stop
    ```
 
    必须写 `@import("sys")`，不能写 `@import("sys.zig")`（同一个文件不能属于两个模块，见 [build.md](build.md#用户程序)）。
-2. 在 `build.zig` 的 `user_programs` 数组里加上名字。
+2. 在 `build.zig` 的 `user_programs` 数组里加一项 `.{ .name = "<名字>" }`。（回归测试程序放在 `user/tests/`，加到 `test_programs` 里，见 [testing.md](testing.md#加一个回归测试)。）
 3. `zig build run`，在 shell 里 `run <名字>`。不带参数的 `run` 会列出所有程序。
 
 可以用的：`std.mem`、`std.fmt`、`std.math` 等纯计算的标准库；全局变量；最多约 16 KiB 的栈。

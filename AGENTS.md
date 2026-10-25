@@ -19,7 +19,9 @@ zig build                              # 编译，产物在 zig-out/bin/kernel
 zig build -Doptimize=small             # 可选 debug|safe|fast|small（0.17 起是小写）
 zig build run                          # 在 QEMU 中启动，Ctrl-A X 退出
 zig build run -- -d int -D q.log       # -- 之后的参数传给 QEMU
+zig build -Dtest-programs=true         # 额外嵌入 user/tests/ 里的回归测试程序
 zig fmt --check build.zig src/ user/   # 格式检查
+python3 tools/qemu_test.py             # 在 QEMU 里自动测试四种模式，必须全部 PASS
 python3 tools/check_links.py           # 检查文档里的相对链接和锚点，必须 0 broken
 ```
 
@@ -29,25 +31,21 @@ python3 tools/check_links.py           # 检查文档里的相对链接和锚点
 
 | 改了什么 | 必须做的检查 |
 | --- | --- |
-| 涉及内核（见开头的定义） | `zig fmt --check`；构建输出为空；在 QEMU 里跑下面的标准测试脚本，需要时四种模式都跑 |
+| 涉及内核（见开头的定义） | `zig fmt --check`；`python3 tools/qemu_test.py` 全部 `PASS` |
 | 文档（任何 Markdown 文件） | `python3 tools/check_links.py` 必须 `0 broken`；文档里新写的命令、输出要实际跑过 |
-| `tools/` 里的脚本 | 实际运行一遍脚本，包括故意构造出错的情况，确认它能报出来 |
+| `tools/` 里的脚本 | 实际运行一遍脚本，包括故意构造出错的情况，确认它能报出来（改的是 `qemu_test.py` 就跑它） |
 | 仓库操作 | 操作前后核对状态（比如删分支前确认内容已经在 `main` 上） |
 
 不涉及内核的改动不需要编译和跑 QEMU。
 
-涉及内核的改动没有单元测试，改完要在 QEMU 里实际跑一遍。用管道喂键盘输入，加超时防止卡住：
+涉及内核的改动用 `tools/qemu_test.py` 验证。它对四种优化模式各做两轮：标准轮（`hello`、`fault`、`spin` 等命令）和回归轮（`user/tests/` 里的测试程序），每轮都先构建、再在 QEMU 里按提示符逐条输入命令，自动判定：
 
-```sh
-(sleep 1.5; for c in help uptime mem ebreak 'run hello' 'run fault' 'run spin' '\003' mem; do printf '%b\r' "$c"; sleep 0.4; done; printf 'shutdown\r'; sleep 2) \
-  | timeout 20 qemu-system-riscv64 -machine virt -smp 1 -m 128M -nographic -bios default -kernel zig-out/bin/kernel
-```
+- 构建输出必须为空。链接器的警告会以 `error: warning(link): ...` 的形式出现，但 `zig build` 的退出码仍是 0，只看退出码会漏掉。
+- 每条命令的输出符合预期；前后两次 `mem` 的空闲页数相同（否则就是漏了页）；没有 `KERNEL PANIC`；`shutdown` 后 QEMU 退出码为 0。
+- 四种模式都要过：release 模式最容易暴露漏写 `volatile`、clobber，或者 `noreturn` 写错的问题。调试时可以先 `--mode debug`，提交前跑全部。
+- 失败时会列出没通过的检查和串口日志的位置（`zig-out/qemu-test/<模式>-<轮次>/serial.log`）。
 
-- `shutdown` 成功时 QEMU 退出码为 0；124 是超时（内核 panic 停机或卡住）。`\003` 是 Ctrl-C，用来结束 `spin`。
-- 前后两次 `mem` 的空闲页数必须相同，否则就是运行用户程序漏了页。
-- 构建输出必须是空的。链接器的警告会以 `error: warning(link): ...` 的形式出现，但 `zig build` 的退出码仍是 0，只看退出码会漏掉。
-- 涉及内联汇编、MMIO、中断、页表、陷阱、进出 U 模式的改动，**四种 `-Doptimize` 模式都要跑**：release 模式最容易暴露漏写 `volatile`、clobber，或者 `noreturn` 写错的问题。
-- 新功能和 bug 修复还要针对性地测边界情况（临时用户程序、临时插桩，测完删掉）。方法、期望输出的逐项含义、调试工具和症状速查表见 [docs/testing.md](docs/testing.md)。
+新功能和 bug 修复还要针对性地测边界情况，能固定下来的加成 `user/tests/` 里的回归测试。检查项的完整列表、怎么加回归测试、手动运行 QEMU 的方法、调试工具和症状速查表见 [docs/testing.md](docs/testing.md)。
 
 ## 约定
 
@@ -75,7 +73,7 @@ python3 tools/check_links.py           # 检查文档里的相对链接和锚点
 - 内核碰用户内存只能通过 `vm.copyFromUser` 这类先查页表的函数，不要打开 `sstatus.SUM` 直接解引用用户指针（[docs/syscalls.md](docs/syscalls.md#访问用户内存)）。
 - 页表叶子必须可读或可执行，可写必须可读；ELF 加载器拒绝不可读的段（[docs/process.md](docs/process.md#elf-加载器)）。
 
-用户程序：放在 `user/<名字>.zig`，提供 `pub fn main() u8`，用 `@import("sys")`（不是 `"sys.zig"`），再把名字加到 `build.zig` 的 `user_programs` 里（[docs/user-programs.md](docs/user-programs.md#写一个新程序)）。
+用户程序：放在 `user/<名字>.zig`，提供 `pub fn main() u8`，用 `@import("sys")`（不是 `"sys.zig"`），再在 `build.zig` 的 `user_programs` 里加一项（[docs/user-programs.md](docs/user-programs.md#写一个新程序)）。回归测试程序放在 `user/tests/`，加到 `test_programs` 里，并在 `tools/qemu_test.py` 里加上检查（[docs/testing.md](docs/testing.md#加一个回归测试)）。
 
 ## 文档
 

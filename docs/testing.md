@@ -1,20 +1,19 @@
 # 测试与调试
 
-这个项目没有单元测试，涉及内核的改动（改了 `src/`、`user/`、`build.zig` 或链接脚本）都要在 QEMU 里实际跑一遍。本文给出必做的检查、边界情况的测试方法、调试工具的用法，以及遇到过的症状和对应的原因。
+这个项目的测试都在 QEMU 里跑：`tools/qemu_test.py` 自动构建内核、启动 QEMU、按提示符逐条输入命令，并判定输出是否符合预期。涉及内核的改动（改了 `src/`、`user/`、`build.zig` 或链接脚本）都要跑它。本文给出必做的检查、自动测试做了什么、回归测试程序、边界情况的测试方法、调试工具的用法，以及遇到过的症状和对应的原因。
 
 ## 必做的检查
 
 按改动的范围决定（和 [AGENTS.md](../AGENTS.md#如何验证改动) 的表格一致）：
 
-- **涉及内核的改动**：下面的第 1–4 条。改动里有 Markdown 的话，再加第 5 条。
-- **只改文档**：只做第 5 条，另外文档里新写的命令和输出要实际跑过。不需要编译和跑 QEMU。
-- **只改 `tools/` 里的脚本**：实际运行脚本，包括故意构造出错的输入，确认它能报出来。不需要编译和跑 QEMU。
+- **涉及内核的改动**：下面的第 1–3 条。改动里有 Markdown 的话，再加第 4 条。
+- **只改文档**：只做第 4 条，另外文档里新写的命令和输出要实际跑过。不需要编译和跑 QEMU。
+- **只改 `tools/` 里的脚本**：实际运行脚本，包括故意构造出错的情况，确认它能报出来。不需要编译和跑 QEMU（改的就是 `qemu_test.py` 的话，当然要跑它）。
 
 1. **格式**：`zig fmt --check build.zig src/ user/`
-2. **四种优化模式都能编译**：`zig build -Doptimize=debug`、`safe`、`fast`、`small`。不能只看退出码：链接器的警告会以 `error: warning(link): ...` 的形式打印出来，构建树里标成 `failure`，但 `zig build` 仍然返回 0（见文末“症状速查”）。构建输出应该是空的。
-3. **在 QEMU 里跑标准测试脚本**（下一节）。改动涉及内联汇编、MMIO、中断、页表、进出 U 模式、陷阱处理时，**四种模式都要跑**；其他内核改动（比如只改了纯计算的逻辑、shell 的输出文字）至少跑 Debug 模式。
-4. 新功能、修复的 bug：除了标准脚本，还要针对性地测边界情况（见“边界情况”一节），把测试过程和结果写进 [changes/](changes/README.md) 的记录里。
-5. **文档链接**：改了任何 Markdown 文件（包括新增的修改记录），运行 `python3 tools/check_links.py`，必须输出 `0 broken`。它检查 README.md、AGENTS.md 和 `docs/` 下所有相对链接指向的文件是否存在，`#锚点` 是否对应目标文件里的某个标题（按 GitHub 生成锚点的规则：转小写、去掉标点、空格换成 `-`，同名标题依次加 `-1`、`-2`）。外部链接不检查。有错误时逐条打印、退出码为 1。例如在本文末尾加上 `[a](nope.md) [b](trap.md#没有这个标题)` 时的实际输出：
+2. **自动测试**：`python3 tools/qemu_test.py`，必须全部 `PASS`。默认四种优化模式各跑标准、回归两轮。只想快速看一眼时可以 `--mode debug`，但提交前要跑全部四种：改动涉及内联汇编、MMIO、中断、页表、进出 U 模式、陷阱处理时尤其不能省。
+3. **新功能、修复的 bug**：针对性地测边界情况。能固定下来的，加成回归测试程序（见“回归测试程序”一节）；一次性的实验可以用临时代码，测完删掉。测了什么、结果如何写进 [changes/](changes/README.md) 的记录。
+4. **文档链接**：改了任何 Markdown 文件（包括新增的修改记录），运行 `python3 tools/check_links.py`，必须输出 `0 broken`。它检查 README.md、AGENTS.md 和 `docs/` 下所有相对链接指向的文件是否存在，`#锚点` 是否对应目标文件里的某个标题（按 GitHub 生成锚点的规则：转小写、去掉标点、空格换成 `-`，同名标题依次加 `-1`、`-2`）。外部链接不检查。有错误时逐条打印、退出码为 1。例如在本文末尾加上 `[a](nope.md) [b](trap.md#没有这个标题)` 时的实际输出：
 
    ```
    docs/testing.md: missing file: nope.md
@@ -26,30 +25,91 @@
 
 为什么要四种模式都跑：release 模式下编译器会更激进地利用类型系统的承诺。漏写 `volatile` 的 MMIO 访问会被合并或删除；漏写的 clobber 会让编译器以为寄存器或内存没变；声明成 `noreturn` 的函数如果实际返回了，调用之后的代码已经被删掉了。这个项目在 U 模式的开发中就有两个 bug 只在 release 模式下出现（[changes/0005](changes/0005-user-mode-and-syscalls.md)）。反过来，Debug/safe 模式有安全检查，能暴露整数溢出、越界、对齐错误这类问题。
 
-## 标准测试脚本
+## 自动测试：tools/qemu_test.py
 
 ```sh
-zig build -Doptimize=debug   # 换成 safe / fast / small 各跑一遍
-(sleep 1.5; for c in help uptime mem ebreak 'run hello' 'run fault' 'run spin' '\003' mem; do printf '%b\r' "$c"; sleep 0.4; done; printf 'shutdown\r'; sleep 2) \
+python3 tools/qemu_test.py                          # 四种模式 × 标准、回归两轮
+python3 tools/qemu_test.py --mode debug             # 只测一种模式（可以写多次 --mode）
+python3 tools/qemu_test.py --mode small --no-regression
+```
+
+输出（全部通过时，构建命中缓存的情况下约 10 秒，从零构建约 20 秒）：
+
+```
+PASS  debug  standard    23 checks    2.3s
+PASS  debug  regression  31 checks    1.3s
+PASS  safe   standard    23 checks    0.7s
+PASS  safe   regression  31 checks    0.8s
+PASS  fast   standard    23 checks    0.7s
+PASS  fast   regression  30 checks    0.2s
+PASS  small  standard    23 checks    1.4s
+PASS  small  regression  30 checks    1.0s
+```
+
+全部通过时退出码为 0，否则为 1。fast/small 的回归轮少一项检查，是因为 `t_panic` 在没有安全检查的模式下只检查退出码。
+
+### 每一轮做了什么
+
+1. **构建**：`zig build -Doptimize=<模式> -p zig-out/qemu-test/<模式>-<轮次>`，回归轮再加 `-Dtest-programs=true`。退出码不为 0、或者有**任何输出**都算失败：链接器的警告会以 `error: warning(link): ...` 打印出来，但 `zig build` 仍然返回 0（见“症状速查”）。构建装到单独的目录，不影响 `zig-out/bin/kernel`；也因为每轮都先构建、构建失败就停下，不会出现“构建失败了却跑了旧内核”的情况。
+2. **启动 QEMU**，等第一个提示符，检查启动日志里每一行 `[ok]` 和启动时的断点自检都在。
+3. **逐条执行命令**：每发一条命令，就等下一个提示符 `> ` 出现，再检查这条命令的输出。不靠固定的 `sleep`，机器慢也不会错位；每条命令最多等 60 秒，启动最多等 60 秒。
+4. **收尾**：再执行一次 `mem`，和开头那次比较空闲页数；`shutdown`，要求输出 `bye!`、QEMU 的退出码为 0；整个输出里不能有 `KERNEL PANIC`。
+
+**标准轮**（普通构建，只有 `hello`、`fault`、`spin`）：
+
+| 命令 | 检查 |
+| --- | --- |
+| `help` | 有 `run NAME` 这一行 |
+| `uptime` | 格式正确 |
+| `mem` | 记下空闲页数 |
+| `ebreak` | `[trap] breakpoint at 0x..., skipping it` |
+| `run hello` | pid 1、开机毫秒数、`write() refused a kernel pointer: BadAddress`、`exited with code 0` |
+| `run fault` | `killed: load_page_fault at 0x..., stval=0x80200000` |
+| `uptime`，`run spin`，转 0.5 秒后发 Ctrl-C，`uptime` | `spin` 被 `interrupted by Ctrl-C` 结束；前后两次 `uptime` 的计数至少差 10。`spin` 在 U 模式死循环期间内核只能靠中断拿回 CPU，所以这一项验证了时钟中断在 U 模式下照常发生（实测 0.5 秒约 49 次） |
+| `mem`、`shutdown` | 见上面的“收尾” |
+
+**回归轮**（`-Dtest-programs=true`，多了 `user/tests/` 里的程序）：
+
+| 步骤 | 检查 |
+| --- | --- |
+| 在 shell 里先按 Ctrl-C，再 `run hello` | 正常退出，没有被之前的 Ctrl-C 误杀 |
+| `run t_sys` | `partial write -> 4`（前面输出了 `abcd`）、`huge write -> 4`、`empty write -> 0`、4191 个点加换行后 `cross-page write -> 4192`、`syscall 999 -> -38`、退出码 42 |
+| `run t_wx` | `killed: store_page_fault`，`stval` 在用户区 |
+| `run t_stack` | `killed: store_page_fault`，`stval` 在保护页 `0x7fffb000..0x7fffc000` |
+| `run t_priv` | `killed: illegal_instruction`，`stval` 是 `csrr rd, sstatus` 的编码（不比较 rd） |
+| `run t_panic` | Debug/safe：`panic: integer overflow`、退出码 255；fast/small：退出码 4 |
+| `run t_time` | `rdtime from U-mode = N`（N > 0）、退出码 0 |
+| `run t_noperm` | `run: cannot load t_noperm: BadElf`，程序没有运行 |
+
+### 失败时
+
+失败的那一轮会列出每一条没通过的检查，并给出串口日志的位置：
+
+```
+FAIL  debug  standard    23 checks    1.9s
+    - mem: free pages changed from (32052, 32057) to (31956, 32057) (leak?)
+    serial log: zig-out/qemu-test/debug-standard/serial.log
+```
+
+`serial.log` 是那一轮的完整串口输出（`\r\n` 已换成 `\n`），每一轮都会保存，通过时也有。
+
+写这个脚本时故意往内核里注入过故障，确认它能抓到（详见 [changes/0009](changes/0009-qemu-test.md)）：去掉 ELF 加载器的可读检查、不释放进程的内存、用户程序编译错误、定时器不再预约下一次中断，都会报 `FAIL`。
+
+## 手动运行
+
+想亲眼看输出、或者交互地试一些命令时，直接 `zig build run`，或者用管道喂输入：
+
+```sh
+zig build && (sleep 1.5; for c in help uptime mem ebreak 'run hello' 'run fault' 'run spin' '\003' mem; do printf '%b\r' "$c"; sleep 0.4; done; printf 'shutdown\r'; sleep 2) \
   | timeout 20 qemu-system-riscv64 -machine virt -smp 1 -m 128M -nographic -bios default -kernel zig-out/bin/kernel
 echo "exit=$?"
 ```
 
+- 开头的 `zig build &&` 保证构建失败时不会运行旧内核。
 - 用管道往 QEMU 的标准输入喂键盘输入，每条命令之间等 0.4 秒，开头等 1.5 秒让 OpenSBI 和内核启动完。
 - `printf '%b\r'` 会解释 `\003`，也就是 Ctrl-C，用来结束 `spin`。紧跟在 Ctrl-C 后面的 `\r` 会在 shell 里产生一个空行，无害。
 - `timeout 20` 防止卡住。**退出码**：`shutdown` 成功时 QEMU 退出码是 0；`124` 表示超时，也就是内核 panic 停机了，或者卡住了。
-- 一键四种模式（只看关键行）：
-
-  ```sh
-  for m in debug safe fast small; do
-    zig build -Doptimize=$m || break
-    echo "== $m"
-    (sleep 1.5; for c in help uptime mem ebreak 'run hello' 'run fault' 'run spin' '\003' mem; do printf '%b\r' "$c"; sleep 0.4; done; printf 'shutdown\r'; sleep 2) \
-      | timeout 20 qemu-system-riscv64 -machine virt -smp 1 -m 128M -nographic -bios default -kernel zig-out/bin/kernel \
-      | grep -a -E "^\[|pages free|^up |Hello|refused|PANIC|bye"
-    echo "exit=${PIPESTATUS[1]}"
-  done
-  ```
+- 输出里有非文本字节，用 `grep` 过滤时要加 `-a`，否则只会打印 `binary file matches`。
 
 ### 期望的输出
 
@@ -92,7 +152,7 @@ bye!
 exit=0
 ```
 
-逐项检查：
+逐项的含义：
 
 | 看什么 | 说明什么 |
 | --- | --- |
@@ -106,44 +166,42 @@ exit=0
 | **两次 `mem` 的数字完全相同** | 三个程序（包括被杀掉的）占用的页都还回来了，没有泄漏 |
 | `exit=0` | 能正常关机 |
 
-## 边界情况
+## 回归测试程序
 
-标准脚本只覆盖正常路径。改了某个功能之后，要针对它的边界情况写**临时**的测试代码，测完删掉，不提交。测了什么、结果如何写进 [changes/](changes/README.md) 的记录（记录里可以附上临时代码，方便以后重复）。
-
-### 临时用户程序
-
-测系统调用、加载器、用户态保护时，最方便的是写临时用户程序：
-
-1. 新建 `user/t_xxx.zig`（`const sys = @import("sys");`，`pub fn main() u8`）。
-2. 把名字临时加到 `build.zig` 的 `user_programs` 里。
-3. 在测试脚本里 `run t_xxx`。
-4. 测完删掉文件、恢复 `build.zig`，确认 `git status` 里没有残留。
-
-开发 U 模式时用过的临时程序（代码在 [changes/0005](changes/0005-user-mode-and-syscalls.md) 里）：
+`user/tests/` 里的程序只在 `-Dtest-programs=true` 时编进内核（平时 `run` 列表里看不到它们），由 `qemu_test.py` 的回归轮运行。它们最初是开发 U 模式时的临时测试（[changes/0005](changes/0005-user-mode-and-syscalls.md)），后来固定成了回归测试（[changes/0009](changes/0009-qemu-test.md)）。
 
 | 程序 | 测什么 | 期望结果 |
 | --- | --- | --- |
-| `t_sys` | `write` 的部分越界、长度溢出、零长度、跨页；不存在的调用号 | 部分写返回已写字节数；越界返回 `BadAddress`；零长度返回 0；未知调用号返回 -38 |
+| `t_sys` | `write` 的部分越界、长度溢出、零长度、跨页；不存在的调用号 | 部分写返回已写字节数；零长度返回 0；未知调用号返回 -38；退出码 42 |
 | `t_wx` | 往自己的代码段写 | `store_page_fault`，进程被杀 |
 | `t_stack` | 无限递归 | 撞到保护页：`store_page_fault`，`stval` 在 `0x7fffb000..0x7fffc000` |
 | `t_priv` | U 模式执行 `csrr sstatus` | `illegal_instruction`，进程被杀 |
-| `t_panic` | Debug 模式下整数溢出 | `panic: integer overflow`，退出码 255（fast/small 没有检查，会回绕） |
-| `t_noperm` | 数据段 `FLAGS(0)` 的 ELF（需要配一个临时链接脚本） | `run: cannot load t_noperm: BadElf` |
+| `t_panic` | 整数溢出 | Debug/safe：`panic: integer overflow`，退出码 255；fast/small 没有检查，回绕成 4 |
 | `t_time` | U 模式执行 `rdtime` | 正常返回（`scounteren` 允许，见 [user-programs.md](user-programs.md#写一个新程序)） |
+| `t_noperm` | 数据段 `FLAGS(0)` 的 ELF（用 `user/tests/noperm.ld` 链接） | `run: cannot load t_noperm: BadElf` |
 
-### 临时内核插桩
+### 加一个回归测试
 
-测内核内部的行为时，可以临时在内核里加打印或者故意出错的代码，测完还原：
+1. 新建 `user/tests/t_xxx.zig`（`const sys = @import("sys");`，`pub fn main() u8`）。程序的输出要能让脚本判断对错：打印确定的结果，或者用退出码表达。
+2. 在 `build.zig` 的 `test_programs` 里加一项：`.{ .name = "t_xxx", .dir = "user/tests" }`；需要特殊的链接脚本就再写 `.linker_script = "..."`。
+3. 在 `tools/qemu_test.py` 的 `regression_round` 里加上 `q.command("run t_xxx")` 和对它输出的检查。
+4. 跑一遍 `python3 tools/qemu_test.py`，确认新检查通过；再故意把被测的内核行为改坏，确认它会失败，然后还原。
+5. 更新本文的表格。
+
+## 边界情况的临时测试
+
+有些测试不适合固定下来（要改内核本身、或者只是一次性的测量），可以写临时代码，测完还原：
 
 - 打印设备树解析出的保留区、`__kernel_end`，确认页分配器跳过了哪些页。
 - 往 `kmain` 的代码页写一个字，确认 W^X 生效（应该得到 `store_page_fault`）。
 - 测栈用量：运行前把栈填成 `0xaa`，运行后从栈底找第一个不是 `0xaa` 的字节。
-- 用 `git stash` 或者先复制一份原文件，保证能干净地还原。
-- **每次临时改动后都要确认构建成功（输出为空）再看运行结果。** 构建失败时 `zig-out/bin/kernel` 还是上一次的产物，QEMU 跑的是旧内核，看到的结果和这次的改动无关。这个项目里发生过两次：一次看到了早已修复的 bug 的症状，一次让实验结果无效（[changes/0005](changes/0005-user-mode-and-syscalls.md#开发中遇到的编译错误)、[changes/0006](changes/0006-docs.md#问题-2草稿里没核实就写下的说法)）。在命令里写成 `zig build && qemu-system-riscv64 ...`，构建失败就不会运行。
+- 故意把内核改坏，确认 `qemu_test.py` 能发现（[changes/0009](changes/0009-qemu-test.md) 里有例子）。
+- 用 `git stash` 或者先复制一份原文件，保证能干净地还原；新建的文件 `git checkout` 还原不了，要手动删。
+- **每次临时改动后都要确认构建成功（输出为空）再看运行结果。** 构建失败时 `zig-out/bin/kernel` 还是上一次的产物，手动运行 QEMU 时跑的是旧内核，看到的结果和这次的改动无关。这个项目里发生过两次：一次看到了早已修复的 bug 的症状，一次让实验结果无效（[changes/0005](changes/0005-user-mode-and-syscalls.md#开发中遇到的编译错误)、[changes/0006](changes/0006-docs.md#问题-2草稿里没核实就写下的说法)）。手动运行时写成 `zig build && qemu-system-riscv64 ...`；`qemu_test.py` 已经处理了这一点。
 
 ### 泄漏检查
 
-`mem` 显示的空闲页数在运行用户程序前后应该完全相同。想知道程序运行时占了多少页，用 GDB 在 `proc.switchToUser` 处读 `page.free_pages`（见下文）。
+`mem` 显示的空闲页数在运行用户程序前后应该完全相同，`qemu_test.py` 每一轮都检查。想知道程序运行时占了多少页，用 GDB 在 `proc.switchToUser` 处读 `page.free_pages`（见下文）。
 
 ## 调试工具
 
@@ -236,7 +294,7 @@ dtc -I dtb -O dts virt.dtb
 | `cannot parse device tree at 0x...: <错误>` | 设备树格式不对，或者解析器有 bug | [devicetree.md](devicetree.md#错误) 的错误表；导出设备树用 `dtc` 看 |
 | QEMU 卡住、`timeout` 返回 124 | 内核 panic 停机（看输出最后几行），或者死循环、陷阱风暴 | `-d int` 日志的最后几行 |
 | `run` 完一个程序 `mem` 的数字变小了 | 有页没释放 | 检查 `destroyUserSpace`、新加的分配路径 |
-| 改了代码，运行结果却和改之前一样（或者出现早已修复的问题） | 这次构建失败了，QEMU 跑的是上一次的内核 | 看构建输出；用 `zig build && qemu-system-riscv64 ...` |
+| 改了代码，运行结果却和改之前一样（或者出现早已修复的问题） | 这次构建失败了，手动运行的 QEMU 跑的是上一次的内核 | 看构建输出；手动运行时用 `zig build && qemu-system-riscv64 ...`，或者直接用 `qemu_test.py` |
 | 编译错误 `unable to call function with calling convention 'naked'` | 直接调用了裸函数 | 在内联汇编里 `call`（[process.md](process.md#switchtouser)） |
 | 编译错误 `unused argument in '...'` | `std.fmt.comptimePrint` 的参数结构体里有格式串用不到的字段 | 删掉多余字段，或者改用汇编操作数（如 `"i"` 约束） |
 | 编译错误 `file exists in modules 'sys' and 'program'` | 用户程序按路径 `@import("sys.zig")` | 改成 `@import("sys")` |

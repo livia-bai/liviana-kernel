@@ -21,7 +21,7 @@ liviana-kernel 的详细文档，按功能组织。仓库根目录的 [README.md
 | [process.md](process.md) | 进程：ELF 加载器、进出 U 模式、结束进程、Ctrl-C |
 | [syscalls.md](syscalls.md) | 系统调用：调用约定、调用列表、访问用户内存、怎么加新调用 |
 | [shell.md](shell.md) | shell：输入处理、命令 |
-| [testing.md](testing.md) | 测试与调试：必做检查、标准测试脚本、边界情况、QEMU 日志、GDB、症状速查 |
+| [testing.md](testing.md) | 测试与调试：必做检查、自动测试（`tools/qemu_test.py`）、回归测试程序、边界情况、QEMU 日志、GDB、症状速查 |
 | [zig-0.17.md](zig-0.17.md) | Zig 0.17 和旧版本的差别，以及这个项目里踩过的坑 |
 
 ## 按源码文件
@@ -48,6 +48,8 @@ liviana-kernel 的详细文档，按功能组织。仓库根目录的 [README.md
 | `user/sys.zig` | [user-programs.md](user-programs.md#syszig) | [syscalls.md](syscalls.md#用户态封装) |
 | `user/linker.ld` | [build.md](build.md#用户程序的链接脚本) | [process.md](process.md#elf-加载器) |
 | `user/hello.zig`、`user/fault.zig`、`user/spin.zig` | [user-programs.md](user-programs.md#示例程序) | |
+| `user/tests/*.zig`、`user/tests/noperm.ld` | [testing.md](testing.md#回归测试程序) | [build.md](build.md#用户程序) |
+| `tools/qemu_test.py` | [testing.md](testing.md#自动测试toolsqemu_testpy) | |
 | `tools/check_links.py` | [testing.md](testing.md#必做的检查) | |
 
 ## 修改与验错记录

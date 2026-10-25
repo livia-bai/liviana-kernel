@@ -44,6 +44,12 @@ zig build run -Doptimize=small    # 体积优化，内核代码段约 12.8 KB
 
 退出 QEMU：先按 `Ctrl-A`，再按 `X`；或者在 shell 里输入 `shutdown`。
 
+自动测试（四种优化模式，在 QEMU 里运行演示程序和 `user/tests/` 里的回归测试，并检查输出）：
+
+```sh
+python3 tools/qemu_test.py
+```
+
 ## shell 命令
 
 | 命令 | 作用 |
@@ -75,9 +81,10 @@ build.zig       构建脚本：内核 + 用户程序
 linker.ld       内核的链接脚本
 src/            内核（S 模式）
 user/           用户程序和它们的运行时（U 模式）
+user/tests/     回归测试程序（zig build -Dtest-programs=true 时才编进内核）
 docs/           文档
 docs/changes/   修改与验错记录
-tools/          开发用的脚本（文档链接检查）
+tools/          开发用的脚本：QEMU 自动测试、文档链接检查
 ```
 
 ## 可以继续做的方向

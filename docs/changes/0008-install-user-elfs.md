@@ -1,7 +1,7 @@
 # 0008 用户程序的 ELF 安装到 zig-out/user/
 
 - 日期：2026-10-25
-- 提交：本记录对应的提交（Install user program ELFs to zig-out/user）
+- 提交：`4143238` Install user program ELFs to zig-out/user
 - 涉及文件：`build.zig`、`docs/build.md`、`docs/testing.md`
 
 ## 目标

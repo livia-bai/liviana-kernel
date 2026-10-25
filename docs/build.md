@@ -71,22 +71,41 @@ b.installArtifact(kernel);
 根模块：user/start.zig（相当于 crt0：导出 _start、定义 panic）
 ├── import "sys"     → user/sys.zig（系统调用封装、print）
 │                      └── import "abi" → src/abi.zig（系统调用号、错误码）
-└── import "program" → user/<名字>.zig（程序本身，提供 pub fn main() u8）
+└── import "program" → <目录>/<名字>.zig（程序本身，提供 pub fn main() u8）
                        └── import "sys" → 同一个 sys 模块
 ```
 
-对应的构建代码：
+程序列表是一个结构体数组，每一项可以指定目录和链接脚本（默认 `user/` 和 `user/linker.ld`）：
 
 ```zig
-const user_programs = [_][]const u8{ "hello", "fault", "spin" };
+const UserProgram = struct {
+    name: []const u8,
+    dir: []const u8 = "user",
+    linker_script: []const u8 = "user/linker.ld",
+};
+const user_programs = [_]UserProgram{ .{ .name = "hello" }, .{ .name = "fault" }, .{ .name = "spin" } };
+const test_programs = [_]UserProgram{
+    .{ .name = "t_sys", .dir = "user/tests" },
+    // ……
+    .{ .name = "t_noperm", .dir = "user/tests", .linker_script = "user/tests/noperm.ld" },
+};
+const with_tests = b.option(bool, "test-programs", "Also embed the regression test programs in user/tests/") orelse false;
+const programs: []const UserProgram = if (with_tests) &(user_programs ++ test_programs) else &user_programs;
+```
+
+`-Dtest-programs=true` 时，`user/tests/` 里的回归测试程序也编进内核，`tools/qemu_test.py` 的回归轮用它（[testing.md](testing.md#回归测试程序)）；平时不加这个选项，`run` 列表里只有三个演示程序。
+
+对每个程序的构建代码：
+
+```zig
 const abi = b.createModule(.{ .root_source_file = b.path("src/abi.zig") });
 const sys = b.createModule(.{
     .root_source_file = b.path("user/sys.zig"),
     .imports = &.{.{ .name = "abi", .module = abi }},
 });
-for (user_programs) |name| {
+for (programs) |p| {
     const program = b.addExecutable(.{
-        .name = name,
+        .name = p.name,
         .root_module = b.createModule(.{
             .root_source_file = b.path("user/start.zig"),
             .target = target,
@@ -97,15 +116,15 @@ for (user_programs) |name| {
             .imports = &.{
                 .{ .name = "sys", .module = sys },
                 .{ .name = "program", .module = b.createModule(.{
-                    .root_source_file = b.path(b.fmt("user/{s}.zig", .{name})),
+                    .root_source_file = b.path(b.fmt("{s}/{s}.zig", .{ p.dir, p.name })),
                     .imports = &.{.{ .name = "sys", .module = sys }},
                 }) },
             },
         }),
     });
-    program.setLinkerScript(b.path("user/linker.ld"));
+    program.setLinkerScript(b.path(p.linker_script));
     program.link_gc_sections = true;
-    kernel.root_module.addAnonymousImport(name, .{ .root_source_file = program.getEmittedBin() });
+    kernel.root_module.addAnonymousImport(p.name, .{ .root_source_file = program.getEmittedBin() });
     const install = b.addInstallArtifact(program, .{ .dest_dir = .{ .override = .{ .custom = "user" } } });
     b.getInstallStep().dependOn(&install.step);
 }
@@ -127,12 +146,14 @@ for (user_programs) |name| {
 内核需要知道一共有哪些程序，名字列表通过 `build_options` 传进去：
 
 ```zig
+const names = b.allocator.alloc([]const u8, programs.len) catch @panic("OOM");
+for (programs, names) |p, *name| name.* = p.name;
 const options = b.addOptions();
-options.addOption([]const []const u8, "user_programs", &user_programs);
+options.addOption([]const []const u8, "user_programs", names);
 kernel.root_module.addOptions("build_options", options);
 ```
 
-构建时会在缓存目录里生成一个 `options.zig`，内容是：
+构建时会在缓存目录里生成一个 `options.zig`，普通构建时内容是：
 
 ```zig
 pub const user_programs: []const []const u8 = &[_][]const u8{
@@ -142,7 +163,7 @@ pub const user_programs: []const []const u8 = &[_][]const u8{
 };
 ```
 
-内核 `@import("build_options")` 后在编译期遍历它，对每个名字调用 `@embedFile`（见 [process.md](process.md#程序表)）。所以**新增用户程序只需要两步**：写 `user/<名字>.zig`，把名字加到 `user_programs` 数组里。
+内核 `@import("build_options")` 后在编译期遍历它，对每个名字调用 `@embedFile`（见 [process.md](process.md#程序表)）。所以**新增用户程序只需要两步**：写 `user/<名字>.zig`，在 `user_programs` 数组里加一项 `.{ .name = "<名字>" }`。
 
 ### 用户程序的链接脚本
 
