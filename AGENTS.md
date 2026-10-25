@@ -36,6 +36,11 @@ zig fmt --check build.zig src/         # 格式检查
 - 外设地址、PLIC 中断号、时钟频率目前是按 QEMU `virt` 写死的，改的话要连注释一起改。
 - 主循环检查输入缓冲区前要先关中断，再 `wfi`，然后开中断（见 `kmain` 里的注释）。不要把这个顺序改掉。
 
+## 提交与推送
+
+- 仓库只有一位维护者：提交直接推到 `main`，不开分支，也不开 PR。
+- 提交信息里不要带 session 链接（`Claude-Session:` 之类的行）。
+
 ## Zig 0.17 的坑
 
 - 用 `std.lang`，不用 `std.builtin`（已弃用）；用 `@backingInt` / `@fromBackingInt`，不用 `@intFromEnum` / `@enumFromInt`。
