@@ -207,7 +207,7 @@ llvm-readelf -S zig-out/bin/kernel          # 段的地址和大小：检查各�
 llvm-readelf -l zig-out/bin/kernel          # 程序头：QEMU 按它加载
 llvm-nm zig-out/bin/kernel | grep __        # 链接脚本里的符号（Debug 模式）
 llvm-objdump -d zig-out/bin/kernel | less   # 反汇编：确认内联汇编、编译器生成的代码
-llvm-readelf -hl $(ls -t .zig-cache/o/*/hello | head -1)   # 用户程序：入口地址、段布局
+llvm-readelf -hl zig-out/user/hello       # 用户程序：入口地址、段布局
 ```
 
 用户程序的入口地址是 0、或者没有 `LOAD` 段，说明 `_start` 没有被导出（见下表）。

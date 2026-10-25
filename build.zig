@@ -63,6 +63,9 @@ pub fn build(b: *std.Build) void {
         // Debug 模式默认不回收没用到的段，会把整个 compiler_rt 带进来，体积大两倍多
         program.link_gc_sections = true;
         kernel.root_module.addAnonymousImport(name, .{ .root_source_file = program.getEmittedBin() });
+        // 另外安装一份到 zig-out/user/，方便用 llvm-readelf 等工具查看（内核用的是上面嵌进去的那份）
+        const install = b.addInstallArtifact(program, .{ .dest_dir = .{ .override = .{ .custom = "user" } } });
+        b.getInstallStep().dependOn(&install.step);
     }
 
     // zig build run：用 QEMU 的 virt 机器启动内核。

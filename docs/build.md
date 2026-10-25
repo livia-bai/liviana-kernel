@@ -106,6 +106,8 @@ for (user_programs) |name| {
     program.setLinkerScript(b.path("user/linker.ld"));
     program.link_gc_sections = true;
     kernel.root_module.addAnonymousImport(name, .{ .root_source_file = program.getEmittedBin() });
+    const install = b.addInstallArtifact(program, .{ .dest_dir = .{ .override = .{ .custom = "user" } } });
+    b.getInstallStep().dependOn(&install.step);
 }
 ```
 
@@ -118,6 +120,7 @@ for (user_programs) |name| {
 - **`.unwind_tables = .none`**：不生成 `.eh_frame`。用户程序没有栈回溯，unwind 表只是占地方。
 - **`link_gc_sections = true`**：Debug 模式默认不回收没被引用的段，会把整个 compiler_rt（`sin`、`log10` 等软件浮点函数）和 ubsan 运行时都链接进来。实测 Debug 版 `hello` 的可加载内容：默认 351 KB → 打开 GC 后 125 KB → 再去掉 unwind 表 91 KB。release 模式默认就会回收。
 - **`addAnonymousImport(name, .{ .root_source_file = program.getEmittedBin() })`**：把用户程序的 ELF 作为一个名叫 `name` 的匿名模块交给内核。内核里 `@embedFile("hello")` 拿到的就是这个 ELF 文件的全部字节（`*const [N:0]u8`）。构建系统据此知道内核依赖这些用户程序，用户程序改了会自动重新编译内核。
+- **`addInstallArtifact(..., .{ .dest_dir = .{ .override = .{ .custom = "user" } } })`**：另外把每个用户程序安装到 `zig-out/user/<名字>`，只是为了方便用 `llvm-readelf` 等工具查看，内核用的是嵌进去的那份。两者是同一个构建产物，字节完全相同（在内核 ELF 里能原样找到 `zig-out/user/hello` 的全部字节）。
 
 ### 程序名列表 build_options
 
@@ -153,7 +156,7 @@ pub const user_programs: []const []const u8 = &[_][]const u8{
 
 起始地址 `0x4000_0000` 是用户地址空间的起点（`vm.user_base`）。页对齐是加载器的要求：它按页给每个段设置权限，段的起点必须在页边界上，否则一页可能同时属于两个段（见 [process.md](process.md#elf-加载器)）。入口地址由 ELF 头的 `e_entry` 给出（`ENTRY(_start)`），不要求 `_start` 排在最前面。
 
-实测的段布局（Debug 版 `hello`）：
+实测的段布局（Debug 版 `hello`，`llvm-readelf -l zig-out/user/hello`）：
 
 ```
 LOAD 0x40000000 filesz 0x125d4 R E    （代码，约 73 KiB）
@@ -189,5 +192,6 @@ qemu.addPassthruArgs();
 ## 产物和缓存
 
 - 内核：`zig-out/bin/kernel`。
-- 用户程序的 ELF 只在缓存目录 `.zig-cache/o/<hash>/<名字>` 里，不会安装到 `zig-out`。需要查看时可以找最新的那个，例如 `llvm-readelf -l $(ls -t .zig-cache/o/*/hello | head -1)`；注意缓存里会同时留着不同优化模式的版本，`ls -t` 取到的是最近一次重新编译出来的。
+- 用户程序：`zig-out/user/<名字>`，例如 `llvm-readelf -l zig-out/user/hello`。和内核一样，是最近一次 `zig build` 用的那个优化模式的版本。
+- 不要去 `.zig-cache/o/` 里找用户程序：那里同时留着各个优化模式、各个历史版本的产物（实测光 `hello` 就有十几个），按修改时间挑也不一定挑得对。
 - `zig-out/` 和 `.zig-cache/` 都在 `.gitignore` 里。
