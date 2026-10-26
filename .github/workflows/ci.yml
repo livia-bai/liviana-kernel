@@ -20,7 +20,7 @@ jobs:
       # https://ziglang.org/download/index.json 里 0.17.0 / x86_64-linux 的 shasum
       ZIG_SHA256: 1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install QEMU
         # qemu-system-data（qemu-system-misc 的依赖）里带着 -bios default 用的 OpenSBI 固件
