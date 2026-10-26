@@ -45,6 +45,8 @@ python3 tools/check_links.py           # 检查文档里的相对链接和锚点
 - 四种模式都要过：release 模式最容易暴露漏写 `volatile`、clobber，或者 `noreturn` 写错的问题。调试时可以先 `--mode debug`，提交前跑全部。
 - 失败时会列出没通过的检查和串口日志的位置（`zig-out/qemu-test/<模式>-<轮次>/serial.log`）。
 
+推送到 `main` 后 GitHub Actions 会再跑一遍格式检查、链接检查和 `qemu_test.py`（`.github/workflows/ci.yml`）。CI 失败就是 `main` 坏了，要马上修，不能留着。
+
 新功能和 bug 修复还要针对性地测边界情况，能固定下来的加成 `user/tests/` 里的回归测试。检查项的完整列表、怎么加回归测试、手动运行 QEMU 的方法、调试工具和症状速查表见 [docs/testing.md](docs/testing.md)。
 
 ## 约定

@@ -1,7 +1,7 @@
 # 0009 QEMU 自动测试和回归测试程序
 
 - 日期：2026-10-25
-- 提交：本记录对应的提交（Add automated QEMU tests and regression test programs）
+- 提交：`e3a37ed` Add automated QEMU tests and regression test programs
 - 涉及文件：`tools/qemu_test.py`（新）、`user/tests/`（新：`t_sys.zig`、`t_wx.zig`、`t_stack.zig`、`t_priv.zig`、`t_panic.zig`、`t_time.zig`、`t_noperm.zig`、`noperm.ld`）、`build.zig`、`docs/testing.md`、`docs/build.md`、`docs/user-programs.md`、`docs/process.md`、`docs/README.md`、`docs/changes/0006-docs.md`、`AGENTS.md`、`README.md`
 
 ## 目标

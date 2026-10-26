@@ -23,6 +23,8 @@
 
    中文标题的锚点不好手算：标题 `PLIC（plic.zig）` 的锚点是 `#plicpliczig`（全角括号、反引号、`.` 都被去掉）。写好链接后跑一遍脚本最可靠。
 
+推送到 GitHub 后，CI（[`.github/workflows/ci.yml`](../.github/workflows/ci.yml)）会在 Ubuntu 24.04 上重新装 QEMU 和 Zig 0.17.0，再跑一遍第 1、2、4 条；失败时把各轮的 `serial.log` 作为构件（artifact）上传。它是事后的兜底，不能代替提交前在本地跑。
+
 为什么要四种模式都跑：release 模式下编译器会更激进地利用类型系统的承诺。漏写 `volatile` 的 MMIO 访问会被合并或删除；漏写的 clobber 会让编译器以为寄存器或内存没变；声明成 `noreturn` 的函数如果实际返回了，调用之后的代码已经被删掉了。这个项目在 U 模式的开发中就有两个 bug 只在 release 模式下出现（[changes/0005](changes/0005-user-mode-and-syscalls.md)）。反过来，Debug/safe 模式有安全检查，能暴露整数溢出、越界、对齐错误这类问题。
 
 ## 自动测试：tools/qemu_test.py

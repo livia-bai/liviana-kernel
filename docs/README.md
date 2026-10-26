@@ -51,6 +51,7 @@ liviana-kernel 的详细文档，按功能组织。仓库根目录的 [README.md
 | `user/tests/*.zig`、`user/tests/noperm.ld` | [testing.md](testing.md#回归测试程序) | [build.md](build.md#用户程序) |
 | `tools/qemu_test.py` | [testing.md](testing.md#自动测试toolsqemu_testpy) | |
 | `tools/check_links.py` | [testing.md](testing.md#必做的检查) | |
+| `.github/workflows/ci.yml` | [testing.md](testing.md#必做的检查) | |
 
 ## 修改与验错记录
 

@@ -1,5 +1,7 @@
 # liviana-kernel
 
+[![CI](https://github.com/livia-bai/liviana-kernel/actions/workflows/ci.yml/badge.svg)](https://github.com/livia-bai/liviana-kernel/actions/workflows/ci.yml)
+
 用 Zig 0.17 写的最小 RISC-V 64 位内核，运行在 QEMU `virt` 机器上，由 OpenSBI 引导，内核运行在 S 模式。
 
 功能：
@@ -85,6 +87,7 @@ user/tests/     回归测试程序（zig build -Dtest-programs=true 时才编进
 docs/           文档
 docs/changes/   修改与验错记录
 tools/          开发用的脚本：QEMU 自动测试、文档链接检查
+.github/        CI：每次推送到 main 都跑格式检查、链接检查和 QEMU 自动测试
 ```
 
 ## 可以继续做的方向
