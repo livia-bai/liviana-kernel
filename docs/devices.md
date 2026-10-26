@@ -141,15 +141,17 @@ pub fn init(hartid: usize) void {
 ```zig
 pub const tick_hz = 100;          // 每秒 100 次，也就是每 10 ms 一次
 var timebase_hz: u64 = undefined; // time CSR 每秒增加多少，来自设备树
+var deadline: u64 = undefined;    // 下一次中断预约在 time CSR 的哪个值
 pub var ticks: u64 = 0;
 ```
 
 - **时钟频率**：`time` CSR 以 timebase 频率递增，QEMU `virt` 上是 10 MHz。这个值来自设备树 `/cpus` 节点的 `timebase-frequency`（[devicetree.md](devicetree.md)），`kmain` 把它传给 `timer.init`。
-- **预约**：`arm()` 计算 `time + timebase_hz / tick_hz`（10 MHz 下是 100000 个计数），通过 `sbi.setTimer` 让 OpenSBI 在那时产生 S 模式时钟中断。
-- **初始化**：`init(hz)` 记下频率，预约第一次，再打开 `sie.STIE`。
+- **预约**：`arm()` 把 `deadline` 加上一个周期 `timebase_hz / tick_hz`（10 MHz 下是 100000 个计数），通过 `sbi.setTimer(deadline)` 让 OpenSBI 在那时产生 S 模式时钟中断。下一次的预约时刻以**上一次的预约时刻**为基准，而不是以“现在”为基准，原因见下面的“为什么”。
+- **初始化**：`init(hz)` 记下频率，把 `deadline` 设成当前的 `time`，预约第一次（一个周期之后），再打开 `sie.STIE`。
 - **中断处理**：`onInterrupt()` 让 `ticks` 加 1，再预约下一次。`setTimer` 同时清除了当前挂起的时钟中断，不预约的话处理程序返回后会立刻再次进来。
-- **计时**：`ticks` 从打开时钟中断开始计数，shell 的 `uptime` 命令显示 `ticks / tick_hz` 秒；`uptimeMs()` 返回 `ticks * 1000 / tick_hz` 毫秒，精度 10 ms，是 `uptime` 系统调用的返回值。
-- 下一次的截止时间以“处理中断的时刻”为基准，而不是上一次的截止时间，所以中断处理有延迟时计时会略微变慢。对演示用的 `uptime` 来说足够了。
+- **计时**：`ticks` 从打开时钟中断开始计数，shell 的 `uptime` 命令显示 `ticks / tick_hz` 秒；`uptimeMs()` 返回 `ticks * 1000 / tick_hz` 毫秒，是 `uptime` 系统调用的返回值。误差在一个 tick（10 ms）以内，不随时间累积。
+- **为什么以上一次的预约时刻为基准**：中断从到期到被处理总有一段延迟。以前 `arm()` 按“处理中断时读到的 `time` + 一个周期”预约，每个 tick 都把这段延迟丢掉，误差越积越多。实测 `uptime` 比 `time` 慢 2%～3%，shell 空闲 20 秒就慢了 543 ms。现在每个周期的边界是固定的，延迟不累积，同样空闲 20 秒只差 4 ms。回归测试 `t_clock` 检查 3 秒内两者相差不超过 20 ms（[changes/0010](changes/0010-fpu-timer-panic-fixes.md)）。
+- **处理晚了超过一个周期时**：新的预约时刻已经过去。按 SBI 规范，这时中断会立刻挂起，连续来几次之后 `ticks` 就追上了。这种情况没有实测过。
 
 时钟中断在 U 模式下同样会发生（`sret` 进入 U 模式时 `SPIE = 1`），这是内核能从死循环的用户程序手里拿回 CPU 的原因。
 

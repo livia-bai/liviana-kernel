@@ -163,7 +163,7 @@ spinning in U-mode without making syscalls, press Ctrl-C to stop
 
 - 没有堆：没有分配内存的系统调用，`std.heap.page_allocator` 等依赖操作系统的分配器不可用。需要内存就用全局数组或者栈（可以用 `std.heap.FixedBufferAllocator` 包一个全局数组）。
 - 系统调用只有 `exit`、`write`、`getpid`、`uptime` 四个：没有读键盘、文件、线程、睡眠，也没有命令行参数。
-- 没有浮点硬件，浮点运算由 compiler_rt 软件实现，慢而且让程序变大。
+- 不能用浮点指令：浮点运算由 compiler_rt 软件实现，慢而且让程序变大。浮点单元被内核关掉了（`sstatus.FS = Off`），手写的浮点指令会触发 `illegal_instruction` 被结束（回归测试 `t_fp`）。
 - 栈只有 16 KiB，下面是不映射的保护页：栈溢出时触发 `store_page_fault`（`stval` 落在 `0x7fffb000..0x7fffc000`），进程被结束。
 - 不能执行特权指令、不能访问 S 模式的 CSR（比如 `csrr sstatus`），否则触发 `illegal_instruction` 被结束。例外是 `cycle`、`time`、`instret` 三个计数器：OpenSBI 启动时把 `scounteren` 设成了 7（内核进入时实测，内核没有改它），所以用户程序可以直接用 `rdtime` 等指令读，实测 `rdtime` 在 U 模式下正常返回。
 - 代码段只读：往自己的代码里写会触发 `store_page_fault`。

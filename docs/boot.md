@@ -97,15 +97,16 @@ export fn _start() linksection(".text.boot") callconv(.naked) noreturn {
 
 | 步骤 | 代码 | 启动日志 | 为什么在这个位置 |
 | --- | --- | --- | --- |
-| 1 | `uart.init()` | `Hello from a Zig kernel on RISC-V!` | 最先初始化，之后的每一步都能打印信息 |
-| 2 | `sbi.specVersion()`、`sbi.implName()` | `SBI: OpenSBI, spec v1.0 \| hart 0 \| device tree at 0x87e00000` | 确认 SBI 能用；顺便打印 hart 号和设备树地址 |
-| 3 | `trap.init()` + `ebreak` | `[ok] trap vector installed`、`[trap] breakpoint at ..., skipping it` | 尽早装好陷阱向量：后面解析设备树、建页表时如果出错（访问了坏地址），能得到一条带 `sepc`/`stval` 的 panic 信息，而不是跳到未初始化的 `stvec` 上不知所终。`ebreak` 自检确认陷阱能进能出 |
-| 4 | `dtb.parse(dtb_addr)` | `[ok] device tree: 128 MiB RAM at 0x80000000, timebase 10000000 Hz` | 页分配器要知道内存范围和保留区，定时器要知道时钟频率 |
-| 5 | `page.init(vm.kernelEnd(), info.memory.end(), info.reserved())` | `[ok] page allocator: N free pages (... KiB)` | 建页表需要分配页 |
-| 6 | `vm.init(info.memory)` | `[ok] Sv39 paging enabled: ...` | 写 `satp` 打开分页。恒等映射保证这一刻前后地址不变 |
-| 7 | `plic.init(hartid)`、`timer.init(info.timebase_hz)` | — | 配置外部中断和第一次时钟中断，并在 `sie` 里打开对应的使能位 |
-| 8 | `riscv.enableInterrupts()` | `[ok] interrupts enabled: timer at 100 Hz, keyboard via UART + PLIC` | 最后才置 `sstatus.SIE`，之前的初始化都不会被中断打断 |
-| 9 | `shell.prompt()` + 主循环 | `Type 'help' for commands.`、`> ` | |
+| 1 | `riscv.clear(.sstatus, riscv.sstatus_fs)` | — | 关掉 OpenSBI 留着的浮点单元（`FS`：Dirty → Off，见 [riscv-sbi.md](riscv-sbi.md#位定义)）。内核不会生成浮点指令，放在哪里都行；放在最前面，保证进入 U 模式之前一定已经关了 |
+| 2 | `uart.init()` | `Hello from a Zig kernel on RISC-V!` | 最先初始化，之后的每一步都能打印信息 |
+| 3 | `sbi.specVersion()`、`sbi.implName()` | `SBI: OpenSBI, spec v1.0 \| hart 0 \| device tree at 0x87e00000` | 确认 SBI 能用；顺便打印 hart 号和设备树地址 |
+| 4 | `trap.init()` + `ebreak` | `[ok] trap vector installed`、`[trap] breakpoint at ..., skipping it` | 尽早装好陷阱向量：后面解析设备树、建页表时如果出错（访问了坏地址），能得到一条带 `sepc`/`stval` 的 panic 信息，而不是跳到未初始化的 `stvec` 上不知所终。`ebreak` 自检确认陷阱能进能出 |
+| 5 | `dtb.parse(dtb_addr)` | `[ok] device tree: 128 MiB RAM at 0x80000000, timebase 10000000 Hz` | 页分配器要知道内存范围和保留区，定时器要知道时钟频率 |
+| 6 | `page.init(vm.kernelEnd(), info.memory.end(), info.reserved())` | `[ok] page allocator: N free pages (... KiB)` | 建页表需要分配页 |
+| 7 | `vm.init(info.memory)` | `[ok] Sv39 paging enabled: ...` | 写 `satp` 打开分页。恒等映射保证这一刻前后地址不变 |
+| 8 | `plic.init(hartid)`、`timer.init(info.timebase_hz)` | — | 配置外部中断和第一次时钟中断，并在 `sie` 里打开对应的使能位 |
+| 9 | `riscv.enableInterrupts()` | `[ok] interrupts enabled: timer at 100 Hz, keyboard via UART + PLIC` | 最后才置 `sstatus.SIE`，之前的初始化都不会被中断打断 |
+| 10 | `shell.prompt()` + 主循环 | `Type 'help' for commands.`、`> ` | |
 
 任何一步失败（设备树格式不对、建页表时内存不够）都会 `std.debug.panic`，打印原因后停机。
 
@@ -137,13 +138,14 @@ fn kernelPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
     riscv.disableInterrupts();
     uart.print("\n!!! KERNEL PANIC: {s}\n", .{msg});
     uart.write("system halted.\n");
+    riscv.write(.sie, 0);
     while (true) riscv.wfi();
 }
 ```
 
 - 根文件里的 `pub const panic` 替换标准库默认的 panic 处理（freestanding 下默认是直接 `@trap()`）。`@panic`、`std.debug.panic`，以及 Debug/safe 模式下的安全检查失败（整数溢出、越界、`.?` 取到 null 等）都会走到这里。必须写成 `pub`，0.17 起 `@hasDecl` 只认公开声明。
 - `FullPanic` 会把各种安全检查失败格式化成可读的消息再交给 `kernelPanic`。0.17.0 的 `std.debug.simple_panic` 有回归（#36986），编译不过，不要用。
-- 先关中断再打印，然后停在 `wfi` 循环里。中断关着时 `wfi` 仍可能被唤醒（有使能的中断挂起），所以要放在循环里。
+- 先关中断再打印，然后把 `sie` 清零，停在 `wfi` 循环里。清零 `sie` 是因为 `wfi` 看的是 `sie & sip`，不看 `sstatus.SIE`：panic 之后没人再预约时钟中断，它会一直挂着；`sie.STIE` 还开着的话，`wfi` 每次都立刻返回，停机就成了忙等，QEMU 占满一个 CPU 核（实测 97%～99%，清零 `sie` 之后是 0%，见 [changes/0010](changes/0010-fpu-timer-panic-fixes.md)）。规范允许 `wfi` 无故返回，所以仍然放在循环里。
 - 内核 panic 后 QEMU 不会退出，管道测试会超时（`timeout` 返回 124），见 [testing.md](testing.md)。
 
 用户程序出错不会走到这里：U 模式的异常只结束那个进程（[process.md](process.md#结束进程)）。

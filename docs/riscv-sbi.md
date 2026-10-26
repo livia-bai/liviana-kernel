@@ -31,6 +31,7 @@
 pub const sstatus_sie: usize = 1 << 1;  // S 模式全局中断使能
 pub const sstatus_spie: usize = 1 << 5; // 陷入前的 SIE，sret 时恢复到 SIE
 pub const sstatus_spp: usize = 1 << 8;  // 陷入前的特权级：0 = U，1 = S
+pub const sstatus_fs: usize = 3 << 13;  // 浮点单元状态（2 位）：0 = Off
 
 pub const sie_ssie: usize = 1 << 1;     // 软件中断
 pub const sie_stie: usize = 1 << 5;     // 时钟中断
@@ -41,7 +42,7 @@ pub const satp_sv39: usize = 8 << 60;   // satp.MODE = 8 表示 Sv39
 
 陷阱发生时硬件自动做的事：`SPIE ← SIE`、`SIE ← 0`、`SPP ← 陷入前的特权级`。`sret` 反过来：`SIE ← SPIE`、`SPIE ← 1`、特权级 ← `SPP`、`SPP ← 0`，然后跳到 `sepc`。内核正是利用这一点进入 U 模式：把 `SPP` 设成 0、`SPIE` 设成 1，`sret` 之后就在 U 模式运行并且开着中断（见 [process.md](process.md#run-的步骤)）。
 
-`sstatus` 里还有几个这个内核刻意保持为 0 的位：`SUM`（为 1 时 S 模式可以访问 U 页，见 [syscalls.md](syscalls.md#访问用户内存)）、`MXR`、`FS`（浮点单元状态，没有浮点所以一直是 Off）。
+`sstatus` 里还有几个这个内核刻意保持为 0 的位：`SUM`（为 1 时 S 模式可以访问 U 页，见 [syscalls.md](syscalls.md#访问用户内存)）、`MXR`、`FS`（浮点单元状态）。`SUM` 和 `MXR` 进入内核时就是 0，内核从不设置它们。`FS` 不一样：OpenSBI 交过来时是 3（Dirty，浮点单元开着），实测入口处 `sstatus = 0x8000000200006000`。所以 `kmain` 一开始用 `clear(.sstatus, sstatus_fs)` 把它清成 0（Off），之后是 `0x200000000`，S 模式和 U 模式的浮点指令都是非法指令（[changes/0010](changes/0010-fpu-timer-panic-fixes.md)）。最高位 SD 是只读的汇总位，`FS` 为 Dirty 时它是 1。
 
 ### 函数
 

@@ -76,7 +76,7 @@ user/start.zig ─┬─ user/sys.zig ─── src/abi.zig（与内核共用的
 
 ## 主要控制流
 
-**启动**（[boot.md](boot.md)）：OpenSBI → `_start`（设栈、清 `.bss`）→ `kmain`：串口 → 陷阱向量 → 设备树 → 页分配器 → 内核页表、开分页 → PLIC 和定时器 → 开中断 → shell 主循环。
+**启动**（[boot.md](boot.md)）：OpenSBI → `_start`（设栈、清 `.bss`）→ `kmain`：关浮点单元 → 串口 → 陷阱向量 → 设备树 → 页分配器 → 内核页表、开分页 → PLIC 和定时器 → 开中断 → shell 主循环。
 
 **主循环**：关中断 → 从串口缓冲区取一个字符 → 没有就 `wfi` 休眠 → 开中断（挂起的中断在这一刻被处理）→ 有字符就交给 shell。
 
@@ -97,4 +97,4 @@ user/start.zig ─┬─ user/sys.zig ─── src/abi.zig（与内核共用的
 - 用户程序只能用根页表第 1 项；内核的映射不能放进 `0x4000_0000..0x8000_0000`（[paging.md](paging.md)）。
 - 内核从不直接解引用用户给的指针，`sstatus.SUM` 始终为 0，访问用户内存一律走 `vm.copyFromUser`（[syscalls.md](syscalls.md)）。
 - `TrapFrame` 的布局和 `trapEntry`/`trapExit` 的汇编绑在一起；`proc.Context` 和 `proc.contextAsm` 绑在一起。
-- 内核和用户程序都不用浮点（目标是 rv64imac），陷阱处理不保存浮点寄存器（[build.md](build.md)）。
+- 内核和用户程序都不用浮点（目标是 rv64imac），陷阱处理不保存浮点寄存器；`sstatus.FS` 在启动时清成 Off，手写的浮点指令也会触发非法指令异常（[build.md](build.md)）。

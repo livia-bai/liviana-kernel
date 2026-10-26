@@ -25,7 +25,8 @@ const target = b.resolveTargetQuery(.{
 
 - `freestanding`：没有操作系统，标准库里依赖 OS 的部分（文件、线程、`std.debug` 的栈回溯输出等）都不可用；`std.fmt`、`std.mem`、`std.Io.Writer` 这类纯计算的部分可以用。
 - CPU 是 `generic_rv64` 再加上 M（乘除）、A（原子指令）、C（压缩指令）、Zicsr（`csrr`/`csrw` 等 CSR 指令）、Zifencei（`fence.i`）。在 LLVM 里 Zicsr 和 Zifencei 要单独打开，否则内联汇编里的 `csrr` 会汇编失败。
-- **刻意不开 F/D（浮点）**：编译器保证不生成浮点指令，所以陷阱处理不必保存 32 个浮点寄存器和 `fcsr`，`sstatus.FS` 始终为 Off。用户程序用同一个目标，同样没有浮点；用户程序里写了浮点运算，编译器会用软件浮点（compiler_rt）实现。
+- **刻意不开 F/D（浮点）**：编译器保证不生成浮点指令，所以陷阱处理不必保存 32 个浮点寄存器和 `fcsr`。用户程序用同一个目标，同样没有浮点；用户程序里写了浮点运算，编译器会用软件浮点（compiler_rt）实现。
+- **浮点单元在启动时关掉**：只靠编译目标挡不住手写的浮点指令。QEMU 模拟的 CPU 其实有浮点单元，OpenSBI 交过来时它是开着的（`sstatus.FS` = 3，Dirty），所以 `kmain` 第一件事就是把 `FS` 清成 Off。之后内核和用户程序执行浮点指令都会触发非法指令异常（[boot.md](boot.md#kmain-的初始化顺序)、[changes/0010](changes/0010-fpu-timer-panic-fixes.md)）。
 - 内核和用户程序共用这一个 `target`。
 
 ## 优化模式

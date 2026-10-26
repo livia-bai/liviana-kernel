@@ -126,7 +126,7 @@ pub fn run(program: *const Program) void
 3. 设置 `current`，分配 pid。
 4. 在 `kernel_stack` 的最顶端构造初始 `TrapFrame`：所有寄存器为 0，`sepc` = 入口地址，`regs[2]`（`sp`）= `0x8000_0000`。必须放在栈顶下方正好 `@sizeOf(TrapFrame)` 处：`trapExit` 回到 U 模式时会把“TrapFrame 地址 + 272”当作内核栈顶写进 `sscratch`（[trap.md](trap.md#trapexit)）。
 5. 记下当前的中断状态，**关中断**。切换过程中不能被打断：`sscratch`、`sstatus`、`satp` 会处于一半新一半旧的状态。
-6. `frame.sstatus = (当前 sstatus & ~SPP) | SPIE`：`SPP = 0` 让 `sret` 回到 U 模式；`SPIE = 1` 让 U 模式下中断是开着的（时钟和键盘照常工作，这也是 Ctrl-C 能生效的前提）。其他位（`SUM = 0`、`FS = Off` 等）保持内核当前的值。
+6. `frame.sstatus = (当前 sstatus & ~SPP) | SPIE`：`SPP = 0` 让 `sret` 回到 U 模式；`SPIE = 1` 让 U 模式下中断是开着的（时钟和键盘照常工作，这也是 Ctrl-C 能生效的前提）。其他位保持内核当前的值，其中 `SUM = 0`、`FS = Off`（`kmain` 启动时清的，见 [riscv-sbi.md](riscv-sbi.md#位定义)），所以 U 模式同样不能用浮点。
 7. `uart.takeCtrlC()`：丢掉运行之前按下的 Ctrl-C。
 8. `vm.activate(space)`：切到进程的地址空间。内核映射是共用的，切换之后内核代码照常执行。
 9. `switchToUser(frame)`：进入 U 模式。**进程结束后才从这里返回。**

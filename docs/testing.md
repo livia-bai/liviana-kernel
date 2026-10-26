@@ -11,7 +11,7 @@
 - **只改 `tools/` 里的脚本**：实际运行脚本，包括故意构造出错的情况，确认它能报出来。不需要编译和跑 QEMU（改的就是 `qemu_test.py` 的话，当然要跑它）。
 
 1. **格式**：`zig fmt --check build.zig src/ user/`
-2. **自动测试**：`python3 tools/qemu_test.py`，必须全部 `PASS`。默认四种优化模式各跑标准、回归两轮。只想快速看一眼时可以 `--mode debug`，但提交前要跑全部四种：改动涉及内联汇编、MMIO、中断、页表、进出 U 模式、陷阱处理时尤其不能省。
+2. **自动测试**：`python3 tools/qemu_test.py`，必须全部 `PASS`。默认四种优化模式各跑标准、回归、panic 三轮。只想快速看一眼时可以 `--mode debug`，但提交前要跑全部四种：改动涉及内联汇编、MMIO、中断、页表、进出 U 模式、陷阱处理时尤其不能省。
 3. **新功能、修复的 bug**：针对性地测边界情况。能固定下来的，加成回归测试程序（见“回归测试程序”一节）；一次性的实验可以用临时代码，测完删掉。测了什么、结果如何写进 [changes/](changes/README.md) 的记录。
 4. **文档链接**：改了任何 Markdown 文件（包括新增的修改记录），运行 `python3 tools/check_links.py`，必须输出 `0 broken`。它检查 README.md、AGENTS.md 和 `docs/` 下所有相对链接指向的文件是否存在，`#锚点` 是否对应目标文件里的某个标题（按 GitHub 生成锚点的规则：转小写、去掉标点、空格换成 `-`，同名标题依次加 `-1`、`-2`）。外部链接不检查。有错误时逐条打印、退出码为 1。例如在本文末尾加上 `[a](nope.md) [b](trap.md#没有这个标题)` 时的实际输出：
 
@@ -30,32 +30,38 @@
 ## 自动测试：tools/qemu_test.py
 
 ```sh
-python3 tools/qemu_test.py                          # 四种模式 × 标准、回归两轮
+python3 tools/qemu_test.py                          # 四种模式 × 标准、回归、panic 三轮
 python3 tools/qemu_test.py --mode debug             # 只测一种模式（可以写多次 --mode）
 python3 tools/qemu_test.py --mode small --no-regression
 ```
 
-输出（全部通过时，构建命中缓存的情况下约 10 秒，从零构建约 20 秒）：
+输出（全部通过时，构建命中缓存的情况下约 23 秒，删掉 `.zig-cache`、`zig-out` 从零构建约 42 秒；回归轮里的 `t_clock` 固定要忙等 3 秒）：
 
 ```
-PASS  debug  standard    23 checks    2.3s
-PASS  debug  regression  31 checks    1.3s
+PASS  debug  standard    23 checks    1.4s
+PASS  debug  regression  36 checks    3.2s
+PASS  debug  panic       9 checks    1.2s
 PASS  safe   standard    23 checks    0.7s
-PASS  safe   regression  31 checks    0.8s
+PASS  safe   regression  36 checks    3.9s
+PASS  safe   panic       9 checks    1.2s
 PASS  fast   standard    23 checks    0.7s
-PASS  fast   regression  30 checks    0.2s
-PASS  small  standard    23 checks    1.4s
-PASS  small  regression  30 checks    1.0s
+PASS  fast   regression  35 checks    4.0s
+PASS  fast   panic       9 checks    1.2s
+PASS  small  standard    23 checks    0.7s
+PASS  small  regression  35 checks    3.2s
+PASS  small  panic       9 checks    1.2s
 ```
 
 全部通过时退出码为 0，否则为 1。fast/small 的回归轮少一项检查，是因为 `t_panic` 在没有安全检查的模式下只检查退出码。
+
+panic 轮读 `/proc/<pid>/stat` 统计 QEMU 用掉的 CPU 时间，只能在 Linux 上运行；读不到时这一轮报 `FAIL`。
 
 ### 每一轮做了什么
 
 1. **构建**：`zig build -Doptimize=<模式> -p zig-out/qemu-test/<模式>-<轮次>`，回归轮再加 `-Dtest-programs=true`。退出码不为 0、或者有**任何输出**都算失败：链接器的警告会以 `error: warning(link): ...` 打印出来，但 `zig build` 仍然返回 0（见“症状速查”）。构建装到单独的目录，不影响 `zig-out/bin/kernel`；也因为每轮都先构建、构建失败就停下，不会出现“构建失败了却跑了旧内核”的情况。
 2. **启动 QEMU**，等第一个提示符，检查启动日志里每一行 `[ok]` 和启动时的断点自检都在。
 3. **逐条执行命令**：每发一条命令，就等下一个提示符 `> ` 出现，再检查这条命令的输出。不靠固定的 `sleep`，机器慢也不会错位；每条命令最多等 60 秒，启动最多等 60 秒。
-4. **收尾**：再执行一次 `mem`，和开头那次比较空闲页数；`shutdown`，要求输出 `bye!`、QEMU 的退出码为 0；整个输出里不能有 `KERNEL PANIC`。
+4. **收尾**（panic 轮除外）：再执行一次 `mem`，和开头那次比较空闲页数；`shutdown`，要求输出 `bye!`、QEMU 的退出码为 0；整个输出里不能有 `KERNEL PANIC`。
 
 **标准轮**（普通构建，只有 `hello`、`fault`、`spin`）：
 
@@ -79,9 +85,20 @@ PASS  small  regression  30 checks    1.0s
 | `run t_wx` | `killed: store_page_fault`，`stval` 在用户区 |
 | `run t_stack` | `killed: store_page_fault`，`stval` 在保护页 `0x7fffb000..0x7fffc000` |
 | `run t_priv` | `killed: illegal_instruction`，`stval` 是 `csrr rd, sstatus` 的编码（不比较 rd） |
+| `run t_fp` | `killed: illegal_instruction`，`stval=0xf20500d3`（`fmv.d.x f1, a0`）：浮点单元是关着的 |
 | `run t_panic` | Debug/safe：`panic: integer overflow`、退出码 255；fast/small：退出码 4 |
 | `run t_time` | `rdtime from U-mode = N`（N > 0）、退出码 0 |
+| `run t_clock` | `uptime()` 走过 3000 ms 期间，`rdtime` 按 10 MHz 换算走过的毫秒数和它相差不超过 20 ms、退出码 0。修复前实测差 49.5～72.7 ms，修复后差 1.5～7.3 ms |
 | `run t_noperm` | `run: cannot load t_noperm: BadElf`，程序没有运行 |
+
+**panic 轮**（普通构建，和标准轮一样）：
+
+| 步骤 | 检查 |
+| --- | --- |
+| `crash` | `!!! KERNEL PANIC: unhandled exception: load_page_fault (scause=13), sepc=0x..., stval=0x0`，然后 `system halted.` |
+| 停机后等 1 秒 | 这 1 秒里 QEMU 用掉的 CPU 时间不超过 0.5 秒。停机时如果 `wfi` 还能被一直挂着的时钟中断唤醒，就成了忙等，实测接近 100%；正常是 0% |
+
+这一轮以内核停机结束，不比较 `mem`、不 `shutdown`，最后直接杀掉 QEMU。
 
 ### 失败时
 
@@ -95,7 +112,7 @@ FAIL  debug  standard    23 checks    1.9s
 
 `serial.log` 是那一轮的完整串口输出（`\r\n` 已换成 `\n`），每一轮都会保存，通过时也有。
 
-写这个脚本时故意往内核里注入过故障，确认它能抓到（详见 [changes/0009](changes/0009-qemu-test.md)）：去掉 ELF 加载器的可读检查、不释放进程的内存、用户程序编译错误、定时器不再预约下一次中断，都会报 `FAIL`。
+写这个脚本时故意往内核里注入过故障，确认它能抓到（详见 [changes/0009](changes/0009-qemu-test.md)）：去掉 ELF 加载器的可读检查、不释放进程的内存、用户程序编译错误、定时器不再预约下一次中断，都会报 `FAIL`。panic 轮和 `t_fp`、`t_clock` 是在 [changes/0010](changes/0010-fpu-timer-panic-fixes.md) 里加的，先在修复前的内核上跑过，四种模式都 `FAIL`。
 
 ## 手动运行
 
@@ -180,6 +197,8 @@ exit=0
 | `t_priv` | U 模式执行 `csrr sstatus` | `illegal_instruction`，进程被杀 |
 | `t_panic` | 整数溢出 | Debug/safe：`panic: integer overflow`，退出码 255；fast/small 没有检查，回绕成 4 |
 | `t_time` | U 模式执行 `rdtime` | 正常返回（`scounteren` 允许，见 [user-programs.md](user-programs.md#写一个新程序)） |
+| `t_fp` | U 模式执行浮点指令 `fmv.d.x f1, a0`（手工编码） | `illegal_instruction`，进程被杀（`sstatus.FS = Off`） |
+| `t_clock` | 忙等到 `uptime()` 走过 3 秒，对比 `rdtime` 走过的时间 | 打印两者，由脚本判定误差（见上面的回归轮表格） |
 | `t_noperm` | 数据段 `FLAGS(0)` 的 ELF（用 `user/tests/noperm.ld` 链接） | `run: cannot load t_noperm: BadElf` |
 
 ### 加一个回归测试
@@ -296,9 +315,12 @@ dtc -I dtb -O dts virt.dtb
 | `cannot parse device tree at 0x...: <错误>` | 设备树格式不对，或者解析器有 bug | [devicetree.md](devicetree.md#错误) 的错误表；导出设备树用 `dtc` 看 |
 | QEMU 卡住、`timeout` 返回 124 | 内核 panic 停机（看输出最后几行），或者死循环、陷阱风暴 | `-d int` 日志的最后几行 |
 | `run` 完一个程序 `mem` 的数字变小了 | 有页没释放 | 检查 `destroyUserSpace`、新加的分配路径 |
+| 内核 panic 停机后 QEMU 仍然占满一个 CPU 核 | `wfi` 被一直挂着的中断反复唤醒：停机前没有把 `sie` 清零 | panic 轮会报 `busy-waiting?`；看 `kernelPanic` |
+| `uptime` 比实际时间越走越慢 | 下一次时钟中断按“处理时的 `time` + 周期”预约，每个 tick 都丢掉了处理延迟 | 回归轮的 `t_clock`；看 `timer.arm` |
 | 改了代码，运行结果却和改之前一样（或者出现早已修复的问题） | 这次构建失败了，手动运行的 QEMU 跑的是上一次的内核 | 看构建输出；手动运行时用 `zig build && qemu-system-riscv64 ...`，或者直接用 `qemu_test.py` |
 | 编译错误 `unable to call function with calling convention 'naked'` | 直接调用了裸函数 | 在内联汇编里 `call`（[process.md](process.md#switchtouser)） |
 | 编译错误 `unused argument in '...'` | `std.fmt.comptimePrint` 的参数结构体里有格式串用不到的字段 | 删掉多余字段，或者改用汇编操作数（如 `"i"` 约束） |
+| 编译错误 `name shadows primitive 'u0'` | 变量名和原始类型重名：`u0`、`u1`、`i8` 这类“字母 u/i + 位宽”的名字都是整数类型 | 改名 |
 | 编译错误 `file exists in modules 'sys' and 'program'` | 用户程序按路径 `@import("sys.zig")` | 改成 `@import("sys")` |
 | 编译错误 `@ptrCast increases pointer alignment` | 指针转换后对齐要求变高 | 外面再套一层 `@alignCast(...)` |
 | 构建输出里有 `error: warning(link): unexpected LLD stderr: ld.lld: warning: cannot find entry symbol _start`，构建树里对应的用户程序标着 `failure` | 原因同第一行。**注意**：实测这时 `zig build` 的退出码仍然是 0，内核照样生成，所以不能只看退出码，要看构建输出里有没有 `error:` | 同第一行 |

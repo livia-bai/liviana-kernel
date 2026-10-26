@@ -22,6 +22,9 @@ fn kernelPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
     riscv.disableInterrupts();
     uart.print("\n!!! KERNEL PANIC: {s}\n", .{msg});
     uart.write("system halted.\n");
+    // 把 sie 也清零再 wfi：时钟中断没人再预约，会一直挂着，它在 sie 里还使能的话，
+    // wfi 每次都立刻返回，停机就成了忙等（QEMU 占满一个 CPU 核）
+    riscv.write(.sie, 0);
     while (true) riscv.wfi();
 }
 
@@ -45,6 +48,9 @@ export fn _start() linksection(".text.boot") callconv(.naked) noreturn {
 }
 
 fn kmain(hartid: usize, dtb_addr: usize) callconv(.c) noreturn {
+    // OpenSBI 交过来时 FS 是 Dirty，浮点单元开着。这个内核不支持浮点（陷阱处理不保存浮点寄存器），
+    // 关掉它：否则用户程序能直接用浮点寄存器，里面的值还会留给下一个进程
+    riscv.clear(.sstatus, riscv.sstatus_fs);
     uart.init();
     uart.write("\nHello from a Zig kernel on RISC-V!\n");
     const version = sbi.specVersion();

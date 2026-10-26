@@ -38,10 +38,10 @@ python3 tools/check_links.py           # 检查文档里的相对链接和锚点
 
 不涉及内核的改动不需要编译和跑 QEMU。
 
-涉及内核的改动用 `tools/qemu_test.py` 验证。它对四种优化模式各做两轮：标准轮（`hello`、`fault`、`spin` 等命令）和回归轮（`user/tests/` 里的测试程序），每轮都先构建、再在 QEMU 里按提示符逐条输入命令，自动判定：
+涉及内核的改动用 `tools/qemu_test.py` 验证。它对四种优化模式各做三轮：标准轮（`hello`、`fault`、`spin` 等命令）、回归轮（`user/tests/` 里的测试程序）和 panic 轮（`crash` 之后检查 panic 信息，以及停机后 QEMU 不再占用 CPU；读 `/proc`，只能在 Linux 上跑）。每轮都先构建、再在 QEMU 里按提示符逐条输入命令，自动判定：
 
 - 构建输出必须为空。链接器的警告会以 `error: warning(link): ...` 的形式出现，但 `zig build` 的退出码仍是 0，只看退出码会漏掉。
-- 每条命令的输出符合预期；前后两次 `mem` 的空闲页数相同（否则就是漏了页）；没有 `KERNEL PANIC`；`shutdown` 后 QEMU 退出码为 0。
+- 每条命令的输出符合预期；前后两次 `mem` 的空闲页数相同（否则就是漏了页）；没有 `KERNEL PANIC`；`shutdown` 后 QEMU 退出码为 0。最后三项 panic 轮除外。
 - 四种模式都要过：release 模式最容易暴露漏写 `volatile`、clobber，或者 `noreturn` 写错的问题。调试时可以先 `--mode debug`，提交前跑全部。
 - 失败时会列出没通过的检查和串口日志的位置（`zig-out/qemu-test/<模式>-<轮次>/serial.log`）。
 
@@ -69,6 +69,7 @@ python3 tools/check_links.py           # 检查文档里的相对链接和锚点
 不能破坏的不变量：
 
 - `sscratch`：在 U 模式运行时存进程内核栈顶，在内核里为 0（[docs/trap.md](docs/trap.md#sscratch-约定)）。
+- `sstatus.FS` 保持 Off：`kmain` 一开始就清掉 OpenSBI 留下的 Dirty，进入 U 模式的 `sstatus` 从内核当前的值派生，所以用户程序也不能用浮点（[docs/riscv-sbi.md](docs/riscv-sbi.md#位定义)）。
 - 陷阱处理和系统调用全程关中断执行（[docs/trap.md](docs/trap.md#中断开关不变量)）。
 - 主循环检查输入缓冲区前要先关中断，再 `wfi`，然后开中断（[docs/boot.md](docs/boot.md#主循环)）。
 - 用户地址空间只能用 Sv39 根页表的第 1 项（`vm.user_base..vm.user_end`），内核映射不能放进这个范围（[docs/paging.md](docs/paging.md#用户地址空间)）。
