@@ -101,8 +101,13 @@ pub fn parse(addr: usize) Error!Info {
     const header: *const [8]u8 = @ptrFromInt(addr);
     if (std.mem.readInt(u32, header[0..4], .big) != magic) return error.BadMagic;
     const total = std.mem.readInt(u32, header[4..8], .big);
-    const blob = @as([*]const u8, @ptrFromInt(addr))[0..total];
+    return parseBlob(@as([*]const u8, @ptrFromInt(addr))[0..total]);
+}
 
+/// 解析内存里的一份完整设备树。和地址无关，单元测试直接喂字节进来。
+pub fn parseBlob(blob: []const u8) Error!Info {
+    if (try readBe(u32, blob, 0) != magic) return error.BadMagic;
+    const total = blob.len;
     const off_struct = try readBe(u32, blob, 8);
     const off_strings = try readBe(u32, blob, 12);
     const off_rsvmap = try readBe(u32, blob, 16);
@@ -123,7 +128,7 @@ pub fn parse(addr: usize) Error!Info {
         .reserved_buf = undefined,
         .reserved_len = 0,
     };
-    try addReserved(&info, .{ .base = addr, .size = total });
+    try addReserved(&info, .{ .base = @intFromPtr(blob.ptr), .size = total });
 
     // 内存保留块
     var pos: usize = off_rsvmap;
@@ -227,4 +232,132 @@ fn addReservedReg(info: *Info, reg: []const u8, parent: Node) Error!void {
             .size = try readCells(reg, offset + 4 * parent.address_cells, parent.size_cells),
         });
     }
+}
+
+/// 测试用：按 FDT 格式拼一份设备树。结构块和字符串块先分别写好，finish 时再和文件头、内存保留块拼起来。
+const TestFdt = struct {
+    structure: [1024]u8 = undefined,
+    struct_len: usize = 0,
+    strings: [256]u8 = undefined,
+    strings_len: usize = 0,
+    rsvmap: [4]Region = undefined,
+    rsvmap_len: usize = 0,
+    out: [2048]u8 align(8) = undefined,
+
+    fn put32(f: *TestFdt, value: u32) void {
+        std.mem.writeInt(u32, f.structure[f.struct_len..][0..4], value, .big);
+        f.struct_len += 4;
+    }
+
+    /// 写入字节，再用 0 补齐到 4 字节对齐
+    fn putBytes(f: *TestFdt, bytes: []const u8) void {
+        @memcpy(f.structure[f.struct_len..][0..bytes.len], bytes);
+        const padded = std.mem.alignForward(usize, bytes.len, 4);
+        @memset(f.structure[f.struct_len + bytes.len ..][0 .. padded - bytes.len], 0);
+        f.struct_len += padded;
+    }
+
+    fn beginNode(f: *TestFdt, comptime name: []const u8) void {
+        f.put32(@backingInt(Token.begin_node));
+        f.putBytes(name ++ "\x00");
+    }
+
+    fn endNode(f: *TestFdt) void {
+        f.put32(@backingInt(Token.end_node));
+    }
+
+    fn prop(f: *TestFdt, comptime name: []const u8, value: []const u8) void {
+        // 属性名放进字符串块，结构块里只存偏移
+        const name_offset = f.strings_len;
+        @memcpy(f.strings[name_offset..][0 .. name.len + 1], name ++ "\x00");
+        f.strings_len += name.len + 1;
+        f.put32(@backingInt(Token.prop));
+        f.put32(@intCast(value.len));
+        f.put32(@intCast(name_offset));
+        f.putBytes(value);
+    }
+
+    /// 值是一串大端序的 32 位单元，比如 reg = <0x0 0x80000000 0x0 0x8000000>
+    fn propCells(f: *TestFdt, comptime name: []const u8, comptime cells: []const u32) void {
+        var bytes: [4 * cells.len]u8 = undefined;
+        for (cells, 0..) |cell, i| std.mem.writeInt(u32, bytes[4 * i ..][0..4], cell, .big);
+        f.prop(name, &bytes);
+    }
+
+    fn finish(f: *TestFdt) []const u8 {
+        f.put32(@backingInt(Token.end));
+        const off_rsvmap = 40;
+        const off_struct = off_rsvmap + 16 * (f.rsvmap_len + 1);
+        const off_strings = off_struct + f.struct_len;
+        const total = off_strings + f.strings_len;
+        const header = [_]u32{ magic, @intCast(total), @intCast(off_struct), @intCast(off_strings), off_rsvmap, 17, 16, 0, @intCast(f.strings_len), @intCast(f.struct_len) };
+        for (header, 0..) |value, i| std.mem.writeInt(u32, f.out[4 * i ..][0..4], value, .big);
+        for (f.rsvmap[0..f.rsvmap_len], 0..) |r, i| {
+            std.mem.writeInt(u64, f.out[off_rsvmap + 16 * i ..][0..8], r.base, .big);
+            std.mem.writeInt(u64, f.out[off_rsvmap + 16 * i + 8 ..][0..8], r.size, .big);
+        }
+        @memset(f.out[off_struct - 16 .. off_struct], 0); // 内存保留块以 (0, 0) 结尾
+        @memcpy(f.out[off_struct..off_strings], f.structure[0..f.struct_len]);
+        @memcpy(f.out[off_strings..total], f.strings[0..f.strings_len]);
+        return f.out[0..total];
+    }
+};
+
+/// 和 QEMU virt 给的设备树结构相同的一份（只保留解析器关心的节点和属性）
+fn testTree(f: *TestFdt, comptime with_timebase: bool) []const u8 {
+    f.rsvmap[0] = .{ .base = 0x8700_0000, .size = 0x1000 };
+    f.rsvmap_len = 1;
+    f.beginNode(""); // 根节点的名字是空字符串
+    f.propCells("#address-cells", &.{2});
+    f.propCells("#size-cells", &.{2});
+    f.beginNode("reserved-memory");
+    f.propCells("#address-cells", &.{2});
+    f.propCells("#size-cells", &.{2});
+    f.beginNode("mmode_resv0@80000000");
+    f.propCells("reg", &.{ 0, 0x8000_0000, 0, 0x6_0000 });
+    f.endNode();
+    f.endNode();
+    f.beginNode("memory@80000000");
+    // reg 写在 device_type 前面：解析器要等节点结束才知道它是不是内存节点
+    f.propCells("reg", &.{ 0, 0x8000_0000, 0, 0x800_0000 });
+    f.prop("device_type", "memory\x00");
+    f.endNode();
+    f.beginNode("cpus");
+    f.propCells("#address-cells", &.{1});
+    f.propCells("#size-cells", &.{0});
+    if (with_timebase) f.propCells("timebase-frequency", &.{10_000_000});
+    f.beginNode("cpu@0");
+    f.propCells("reg", &.{0});
+    f.endNode();
+    f.endNode();
+    f.endNode();
+    return f.finish();
+}
+
+test "解析 QEMU virt 风格的设备树" {
+    var f: TestFdt = .{};
+    const blob = testTree(&f, true);
+    const info = try parseBlob(blob);
+    try std.testing.expectEqual(Region{ .base = 0x8000_0000, .size = 128 << 20 }, info.memory);
+    try std.testing.expectEqual(10_000_000, info.timebase_hz);
+    // 保留区：设备树自己、内存保留块里的一项、/reserved-memory 的子节点
+    try std.testing.expectEqualSlices(Region, &.{
+        .{ .base = @intFromPtr(blob.ptr), .size = blob.len },
+        .{ .base = 0x8700_0000, .size = 0x1000 },
+        .{ .base = 0x8000_0000, .size = 0x6_0000 },
+    }, info.reserved());
+}
+
+test "缺少必需的信息、格式不对时返回错误" {
+    var f: TestFdt = .{};
+    try std.testing.expectError(error.NoTimebase, parseBlob(testTree(&f, false)));
+
+    var g: TestFdt = .{};
+    const blob = testTree(&g, true);
+    // 截掉末尾：文件头里记的字符串块超出了实际的数据
+    try std.testing.expectError(error.Truncated, parseBlob(blob[0 .. blob.len - 8]));
+    try std.testing.expectError(error.Truncated, parseBlob(blob[0..2]));
+    var bad = g.out;
+    bad[0] = 0;
+    try std.testing.expectError(error.BadMagic, parseBlob(bad[0..blob.len]));
 }

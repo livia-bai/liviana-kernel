@@ -1,7 +1,5 @@
 # liviana-kernel
 
-[![CI](https://github.com/livia-bai/liviana-kernel/actions/workflows/ci.yml/badge.svg)](https://github.com/livia-bai/liviana-kernel/actions/workflows/ci.yml)
-
 用 Zig 0.17 写的最小 RISC-V 64 位内核，运行在 QEMU `virt` 机器上，由 OpenSBI 引导，内核运行在 S 模式。
 
 功能：
@@ -46,10 +44,12 @@ zig build run -Doptimize=small    # 体积优化，内核代码段约 12.8 KB
 
 退出 QEMU：先按 `Ctrl-A`，再按 `X`；或者在 shell 里输入 `shutdown`。
 
-自动测试（四种优化模式，在 QEMU 里运行演示程序和 `user/tests/` 里的回归测试，并检查输出）：
+测试（详见 [测试与调试](docs/testing.md)）：
 
 ```sh
-python3 tools/qemu_test.py
+zig build test                        # 单元测试：在主机上测设备树解析、页分配器、页表、ELF 加载器
+python3 tools/qemu_test.py --changed  # QEMU 测试：只跑和改动有关的用例
+python3 tools/qemu_test.py            # QEMU 测试：全部用例
 ```
 
 ## shell 命令
@@ -72,7 +72,7 @@ python3 tools/qemu_test.py
 - 内核：[陷阱处理](docs/trap.md)、[串口 / PLIC / 定时器](docs/devices.md)、[CSR 和 SBI](docs/riscv-sbi.md)、[设备树](docs/devicetree.md)、[页分配器](docs/page-allocator.md)、[Sv39 分页](docs/paging.md)、[shell](docs/shell.md)
 - 用户态：[用户程序](docs/user-programs.md)、[进程](docs/process.md)、[系统调用](docs/syscalls.md)
 - 开发：[测试与调试](docs/testing.md)、[Zig 0.17 笔记](docs/zig-0.17.md)
-- [修改与验错记录](docs/changes/README.md)：每次内核改动做了什么、怎么验证的、发现并修复了哪些问题
+- [修改记录](docs/changes.md)：每次改动新增了什么功能、修了什么 bug
 
 改代码之前先读 [AGENTS.md](AGENTS.md)。
 
@@ -85,9 +85,7 @@ src/            内核（S 模式）
 user/           用户程序和它们的运行时（U 模式）
 user/tests/     回归测试程序（zig build -Dtest-programs=true 时才编进内核）
 docs/           文档
-docs/changes/   修改与验错记录
-tools/          开发用的脚本：QEMU 自动测试、文档链接检查
-.github/        CI：每次推送到 main 都跑格式检查、链接检查和 QEMU 自动测试
+tools/          QEMU 测试脚本
 ```
 
 ## 许可证

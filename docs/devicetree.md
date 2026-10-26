@@ -129,7 +129,8 @@ dtc -I dtb -O dts kernel.dtb | less
 ## 解析器
 
 ```zig
-pub fn parse(addr: usize) Error!Info
+pub fn parse(addr: usize) Error!Info         // kmain 用：从地址读出 totalsize，把整个文件当成切片交给 parseBlob
+pub fn parseBlob(blob: []const u8) Error!Info // 真正的解析，只看字节，单元测试直接喂数据进来
 ```
 
 ### 不信任输入
@@ -137,7 +138,7 @@ pub fn parse(addr: usize) Error!Info
 设备树是固件给的数据，原则上可能是坏的。解析器的做法是：
 
 1. 只读文件头的前 8 字节（魔数和 `totalsize`），魔数不对立即返回 `BadMagic`。
-2. 把 `[addr, addr + totalsize)` 当成一个切片 `blob`，**之后的所有读取都通过带边界检查的函数**，越界就返回 `Truncated`：
+2. 把 `[addr, addr + totalsize)` 当成一个切片 `blob` 交给 `parseBlob`，**之后的所有读取都通过带边界检查的函数**，越界就返回 `Truncated`：
    - `readBe(T, bytes, offset)`：读一个大端整数。
    - `readStr(bytes, offset)`：读以 0 结尾的字符串，找不到结尾的 0 也是 `Truncated`。
    - `readCells(bytes, offset, cells)`：按单元个数读一个数，只支持 1 或 2 个单元（32/64 位），否则返回 `UnsupportedCells`。

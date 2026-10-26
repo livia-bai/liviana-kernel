@@ -246,3 +246,50 @@ fn loadSegment(space: *vm.PageTable, image: []const u8, phdr: elf.Elf64.Phdr) Lo
         }
     }
 }
+
+/// 测试用的“物理内存”，用法见 vm.zig 里的测试。
+var test_memory: [256 * page.size]u8 align(page.size) = undefined;
+
+/// 把 image 加载进一个新的地址空间，检查完之后释放，确认没有漏页。
+fn testLoad(image: []const u8) !usize {
+    const base = @intFromPtr(&test_memory);
+    page.init(base, base + test_memory.len, &.{});
+    vm.kernel_root = @ptrCast(try page.alloc());
+    const before = page.free_pages;
+    const space = try vm.createUserSpace();
+    defer {
+        vm.destroyUserSpace(space);
+        std.testing.expectEqual(before, page.free_pages) catch @panic("leaked pages");
+    }
+    const entry = try load(space, image);
+    // 入口可读，栈的两端可读，栈下面的保护页没有映射
+    var buf: [2]u8 = undefined;
+    try std.testing.expect(entry >= vm.user_base and entry < stack_bottom);
+    vm.copyFromUser(space, &buf, entry) catch return error.BadElf;
+    vm.copyFromUser(space, &buf, stack_bottom) catch return error.BadElf;
+    vm.copyFromUser(space, &buf, stack_top - 2) catch return error.BadElf;
+    try std.testing.expectError(error.BadAddress, vm.copyFromUser(space, &buf, stack_bottom - 2));
+    return entry;
+}
+
+test "加载真正的用户程序 hello" {
+    _ = try testLoad(@embedFile("hello"));
+}
+
+test "ELF 加载器拒绝坏文件" {
+    const good = @embedFile("hello");
+    const image = try std.testing.allocator.dupe(u8, good);
+    defer std.testing.allocator.free(image);
+
+    try std.testing.expectError(error.BadElf, testLoad(good[0..32])); // 比文件头还短
+    image[0] = 0; // 魔数不对
+    try std.testing.expectError(error.BadElf, testLoad(image));
+    @memcpy(image, good);
+    std.mem.writeInt(u16, image[18..20], @backingInt(elf.EM.X86_64), .little); // 不是 RISC-V
+    try std.testing.expectError(error.BadElf, testLoad(image));
+    @memcpy(image, good);
+    std.mem.writeInt(u64, image[32..40], image.len - 8, .little); // 程序头表超出文件
+    try std.testing.expectError(error.BadElf, testLoad(image));
+    // 数据段 R/W/X 全为 0（用 user/tests/noperm.ld 链接的）
+    try std.testing.expectError(error.BadElf, testLoad(@embedFile("t_noperm")));
+}

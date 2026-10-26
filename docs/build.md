@@ -26,7 +26,7 @@ const target = b.resolveTargetQuery(.{
 - `freestanding`：没有操作系统，标准库里依赖 OS 的部分（文件、线程、`std.debug` 的栈回溯输出等）都不可用；`std.fmt`、`std.mem`、`std.Io.Writer` 这类纯计算的部分可以用。
 - CPU 是 `generic_rv64` 再加上 M（乘除）、A（原子指令）、C（压缩指令）、Zicsr（`csrr`/`csrw` 等 CSR 指令）、Zifencei（`fence.i`）。在 LLVM 里 Zicsr 和 Zifencei 要单独打开，否则内联汇编里的 `csrr` 会汇编失败。
 - **刻意不开 F/D（浮点）**：编译器保证不生成浮点指令，所以陷阱处理不必保存 32 个浮点寄存器和 `fcsr`。用户程序用同一个目标，同样没有浮点；用户程序里写了浮点运算，编译器会用软件浮点（compiler_rt）实现。
-- **浮点单元在启动时关掉**：只靠编译目标挡不住手写的浮点指令。QEMU 模拟的 CPU 其实有浮点单元，OpenSBI 交过来时它是开着的（`sstatus.FS` = 3，Dirty），所以 `kmain` 第一件事就是把 `FS` 清成 Off。之后内核和用户程序执行浮点指令都会触发非法指令异常（[boot.md](boot.md#kmain-的初始化顺序)、[changes/0010](changes/0010-fpu-timer-panic-fixes.md)）。
+- **浮点单元在启动时关掉**：只靠编译目标挡不住手写的浮点指令。QEMU 模拟的 CPU 其实有浮点单元，OpenSBI 交过来时它是开着的（`sstatus.FS` = 3，Dirty），所以 `kmain` 第一件事就是把 `FS` 清成 Off。之后内核和用户程序执行浮点指令都会触发非法指令异常（[boot.md](boot.md#kmain-的初始化顺序)）。
 - 内核和用户程序共用这一个 `target`。
 
 ## 优化模式
@@ -42,7 +42,7 @@ const target = b.resolveTargetQuery(.{
 
 （体积是本文写作时实测，代码变化后会变；当前值用 `llvm-readelf -S zig-out/bin/kernel` 查看。）
 
-优化模式之间的差别不只是速度和体积：编译器在 release 模式下会更激进地利用类型系统给出的承诺（比如 `noreturn`、没有 `volatile` 的内存访问可以合并或删除），所以内联汇编、MMIO、页表、进出 U 模式相关的改动必须四种模式都跑一遍。这个项目里有两个 bug 只在 release 模式下出现，见 [changes/0005-user-mode-and-syscalls.md](changes/0005-user-mode-and-syscalls.md)。
+优化模式之间的差别不只是速度和体积：编译器在 release 模式下会更激进地利用类型系统给出的承诺（比如 `noreturn`、没有 `volatile` 的内存访问可以合并或删除），所以内联汇编、MMIO、页表、进出 U 模式相关的改动要四种模式都测一遍（`python3 tools/qemu_test.py --all-modes`）。这个项目里有两个 bug 只在 release 模式下出现。
 
 ## 内核
 
@@ -91,10 +91,11 @@ const test_programs = [_]UserProgram{
     .{ .name = "t_noperm", .dir = "user/tests", .linker_script = "user/tests/noperm.ld" },
 };
 const with_tests = b.option(bool, "test-programs", "Also embed the regression test programs in user/tests/") orelse false;
-const programs: []const UserProgram = if (with_tests) &(user_programs ++ test_programs) else &user_programs;
+const all_programs = user_programs ++ test_programs;
+const programs: []const UserProgram = if (with_tests) &all_programs else &user_programs;
 ```
 
-`-Dtest-programs=true` 时，`user/tests/` 里的回归测试程序也编进内核，`tools/qemu_test.py` 的回归轮用它（[testing.md](testing.md#回归测试程序)）；平时不加这个选项，`run` 列表里只有三个演示程序。
+`-Dtest-programs=true` 时，`user/tests/` 里的回归测试程序也编进内核，`tools/qemu_test.py` 会自动加上这个选项（[testing.md](testing.md#回归测试程序)）；平时不加，`run` 列表里只有三个演示程序。
 
 对每个程序的构建代码：
 
@@ -104,7 +105,7 @@ const sys = b.createModule(.{
     .root_source_file = b.path("user/sys.zig"),
     .imports = &.{.{ .name = "abi", .module = abi }},
 });
-for (programs) |p| {
+for (all_programs, 0..) |p, i| {
     const program = b.addExecutable(.{
         .name = p.name,
         .root_module = b.createModule(.{
@@ -125,6 +126,8 @@ for (programs) |p| {
     });
     program.setLinkerScript(b.path(p.linker_script));
     program.link_gc_sections = true;
+    unit_tests.root_module.addAnonymousImport(p.name, .{ .root_source_file = program.getEmittedBin() });
+    if (i >= programs.len) continue; // 没被选中的测试程序只给单元测试用
     kernel.root_module.addAnonymousImport(p.name, .{ .root_source_file = program.getEmittedBin() });
     const install = b.addInstallArtifact(program, .{ .dest_dir = .{ .override = .{ .custom = "user" } } });
     b.getInstallStep().dependOn(&install.step);
@@ -133,7 +136,7 @@ for (programs) |p| {
 
 要点：
 
-- **根文件是 `user/start.zig`，不是程序本身。** `_start` 必须在根文件里导出：Zig 只分析被引用到的声明，写在被导入文件里的 `comptime { @export(...) }`，只有当这个文件被引用时才会执行。最初的写法把 `_start` 放在 `sys.zig` 里，Debug 模式下碰巧导出了，release 模式下则根本没有导出，链接器找不到入口、产出一个空文件（详见 [changes/0005](changes/0005-user-mode-and-syscalls.md)）。
+- **根文件是 `user/start.zig`，不是程序本身。** `_start` 必须在根文件里导出：Zig 只分析被引用到的声明，写在被导入文件里的 `comptime { @export(...) }`，只有当这个文件被引用时才会执行。最初的写法把 `_start` 放在 `sys.zig` 里，Debug 模式下碰巧导出了，release 模式下则根本没有导出，链接器找不到入口、产出一个空文件。
 - **`abi`、`sys` 模块只创建一次**，被所有用户程序共用。没有指定 `target`/`optimize` 的模块会继承导入它的父模块的设置。
 - **一个文件在一次编译里只能属于一个模块。** 程序里必须写 `@import("sys")`（按模块名），不能写 `@import("sys.zig")`（按路径）：后者会让 `user/sys.zig` 同时属于 `sys` 和 `program` 两个模块，编译报错 `file exists in modules 'sys' and 'program'`。`src/abi.zig` 同时被内核（按路径导入）和用户程序（作为 `abi` 模块）使用没有问题，因为它们是不同的编译。
 - **`.strip = true`**：去掉调试信息。内核加载用户程序时只看程序头，用不到符号和 DWARF。
@@ -141,6 +144,8 @@ for (programs) |p| {
 - **`link_gc_sections = true`**：Debug 模式默认不回收没被引用的段，会把整个 compiler_rt（`sin`、`log10` 等软件浮点函数）和 ubsan 运行时都链接进来。实测 Debug 版 `hello` 的可加载内容：默认 351 KB → 打开 GC 后 125 KB → 再去掉 unwind 表 91 KB。release 模式默认就会回收。
 - **`addAnonymousImport(name, .{ .root_source_file = program.getEmittedBin() })`**：把用户程序的 ELF 作为一个名叫 `name` 的匿名模块交给内核。内核里 `@embedFile("hello")` 拿到的就是这个 ELF 文件的全部字节（`*const [N:0]u8`）。构建系统据此知道内核依赖这些用户程序，用户程序改了会自动重新编译内核。
 - **`addInstallArtifact(..., .{ .dest_dir = .{ .override = .{ .custom = "user" } } })`**：另外把每个用户程序安装到 `zig-out/user/<名字>`，只是为了方便用 `llvm-readelf` 等工具查看，内核用的是嵌进去的那份。两者是同一个构建产物，字节完全相同（在内核 ELF 里能原样找到 `zig-out/user/hello` 的全部字节）。
+
+- **所有程序都交给单元测试**：单元测试用真正的用户程序 ELF 来测 ELF 加载器（见下面的“单元测试”）。构建系统只编译被用到的产物，所以 `zig build` 不会编译没选中的测试程序，`zig build test` 才会。
 
 ### 程序名列表 build_options
 
@@ -188,6 +193,22 @@ Entry point 0x40011426
 ```
 
 small 模式下同一个程序的代码段只有 0x3bc 字节，ELF 文件约 13 KB（大部分是页对齐留下的空隙）。
+
+## 单元测试
+
+```zig
+const unit_tests = b.addTest(.{ .root_module = b.createModule(.{
+    .root_source_file = b.path("src/tests.zig"),
+    .target = b.graph.host,
+    .optimize = optimize,
+}) });
+const test_step = b.step("test", "Run the unit tests on the host");
+test_step.dependOn(&b.addRunArtifact(unit_tests).step);
+```
+
+- `zig build test` 编译 `src/tests.zig` 引用到的各个文件里的 `test` 块，然后运行。
+- `.target = b.graph.host`：测试编译成**主机**的程序（比如 x86_64 Linux）直接运行，不是 RISC-V，所以只能测不碰硬件的代码（[testing.md](testing.md#单元测试zig-build-test)）。
+- 和内核共用同一批源文件：Zig 只编译被用到的函数，测试用不到的 CSR 读写、裸函数里的 RISC-V 汇编不会被编译，所以不影响在主机上构建。
 
 ## 运行步骤
 

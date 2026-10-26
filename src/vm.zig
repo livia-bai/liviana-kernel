@@ -226,3 +226,54 @@ pub fn copyFromUser(root: *PageTable, dst: []u8, src: usize) error{BadAddress}!v
         done += n;
     }
 }
+
+/// 测试用的“物理内存”：页分配器管理这块数组，页表就建在里面。
+var test_memory: [64 * page.size]u8 align(page.size) = undefined;
+
+fn testInit() void {
+    const base = @intFromPtr(&test_memory);
+    page.init(base, base + test_memory.len, &.{});
+}
+
+test "对齐和长度允许时用大页" {
+    testInit();
+    kernel_root = @ptrCast(try page.alloc());
+    const before = page.free_pages;
+    // 2 MiB + 4 KiB：一个 2 MiB 的大页（第 1 级叶子）加一个 4 KiB 的页（第 0 级叶子），需要第 1、0 级各一张页表
+    try map(kernel_root, 0x8000_0000, 0x8000_0000, (2 << 20) + page.size, .{ .r = true, .w = true });
+    try std.testing.expectEqual(before - 2, page.free_pages);
+    // 1 GiB 对齐的 1 GiB：根页表里的一项就够了，不需要新的页表
+    try map(kernel_root, 0xc000_0000, 0xc000_0000, 1 << 30, .{ .r = true, .w = true });
+    try std.testing.expectEqual(before - 2, page.free_pages);
+    // 已经被大页覆盖的地址不能再映射
+    try std.testing.expectError(error.AlreadyMapped, map(kernel_root, 0x8010_0000, 0x8010_0000, page.size, .{ .r = true }));
+}
+
+test "copyFromUser 只读得到 U 模式可读的用户页，用户空间释放后不漏页" {
+    testInit();
+    kernel_root = @ptrCast(try page.alloc());
+    try map(kernel_root, 0x8020_0000, 0x8020_0000, page.size, .{ .r = true, .x = true });
+    const before = page.free_pages;
+
+    const space = try createUserSpace();
+    const p0 = try allocUserPage(space, user_base, .{ .r = true, .w = true });
+    const p1 = try allocUserPage(space, user_base + page.size, .{ .r = true });
+    _ = try allocUserPage(space, user_base + 2 * page.size, .{ .x = true }); // 只能执行，不可读
+    @memcpy(p0[page.size - 3 ..], "abc");
+    @memcpy(p1[0..3], "def");
+
+    var buf: [6]u8 = undefined;
+    try copyFromUser(space, &buf, user_base + page.size - 3); // 跨页
+    try std.testing.expectEqualStrings("abcdef", &buf);
+    const bad = [_]usize{
+        user_base + 2 * page.size, // 不可读
+        user_base + 3 * page.size, // 没有映射
+        0x8020_0000, // 内核的页：这个地址空间里有映射，但不在用户区、没有 U 位
+        std.math.maxInt(usize) - 2, // 地址加长度溢出
+    };
+    for (bad) |va| try std.testing.expectError(error.BadAddress, copyFromUser(space, &buf, va));
+
+    // 释放的只是用户区的页和页表，和内核共用的页表不动
+    destroyUserSpace(space);
+    try std.testing.expectEqual(before, page.free_pages);
+}

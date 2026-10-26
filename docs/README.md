@@ -1,6 +1,6 @@
 # 文档目录
 
-liviana-kernel 的详细文档，按功能组织。仓库根目录的 [README.md](../README.md) 只有简介和上手步骤，[AGENTS.md](../AGENTS.md) 是给代码代理（以及任何改代码的人）的工作规则。
+liviana-kernel 的详细文档，按功能组织，讲这个用 Zig 写的 RISC-V 内核每一部分是怎么做的、为什么这样做。仓库根目录的 [README.md](../README.md) 只有简介和上手步骤。
 
 ## 按功能
 
@@ -21,7 +21,7 @@ liviana-kernel 的详细文档，按功能组织。仓库根目录的 [README.md
 | [process.md](process.md) | 进程：ELF 加载器、进出 U 模式、结束进程、Ctrl-C |
 | [syscalls.md](syscalls.md) | 系统调用：调用约定、调用列表、访问用户内存、怎么加新调用 |
 | [shell.md](shell.md) | shell：输入处理、命令 |
-| [testing.md](testing.md) | 测试与调试：必做检查、自动测试（`tools/qemu_test.py`）、回归测试程序、边界情况、QEMU 日志、GDB、症状速查 |
+| [testing.md](testing.md) | 测试与调试：单元测试、QEMU 测试（`tools/qemu_test.py`）、回归测试程序、QEMU 日志、GDB、症状速查 |
 | [zig-0.17.md](zig-0.17.md) | Zig 0.17 和旧版本的差别，以及这个项目里踩过的坑 |
 
 ## 按源码文件
@@ -49,17 +49,9 @@ liviana-kernel 的详细文档，按功能组织。仓库根目录的 [README.md
 | `user/linker.ld` | [build.md](build.md#用户程序的链接脚本) | [process.md](process.md#elf-加载器) |
 | `user/hello.zig`、`user/fault.zig`、`user/spin.zig` | [user-programs.md](user-programs.md#示例程序) | |
 | `user/tests/*.zig`、`user/tests/noperm.ld` | [testing.md](testing.md#回归测试程序) | [build.md](build.md#用户程序) |
-| `tools/qemu_test.py` | [testing.md](testing.md#自动测试toolsqemu_testpy) | |
-| `tools/check_links.py` | [testing.md](testing.md#必做的检查) | |
-| `.github/workflows/ci.yml` | [testing.md](testing.md#必做的检查) | |
+| `src/tests.zig` | [testing.md](testing.md#单元测试zig-build-test) | [build.md](build.md#单元测试) |
+| `tools/qemu_test.py` | [testing.md](testing.md#qemu-测试toolsqemu_testpy) | |
 
-## 修改与验错记录
+## 修改记录
 
-[changes/](changes/README.md)：每一次涉及内核的改动一篇记录，写明改了什么、为什么这样设计、怎么验证的、测试中发现了哪些问题以及如何修复。想知道某段代码为什么写成现在这样，先去那里找。写记录的规则见 [AGENTS.md](../AGENTS.md#修改与验错记录)。
-
-## 维护文档
-
-- 改了代码就同步改对应的文档（上表）。文档里的实测数字（地址、页数、体积）会随代码变化，大的变化要更新，小的漂移可以不管，但不要留下错误的说法。
-- 文档里写的命令、输出、结论都应该是实际验证过的；没验证的推测要明确标出来。
-- 文档用中文，代码、命令、内核输出保持原样（英文）。
-- 改完运行 `python3 tools/check_links.py` 检查链接和锚点。
+[changes.md](changes.md)：每次改动新增了什么功能、修了什么 bug。

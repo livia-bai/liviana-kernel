@@ -35,7 +35,7 @@ fn panicImpl(msg: []const u8, first_trace_addr: ?usize) noreturn {
 ```
 
 - **入口**：内核跳到 `_start` 时，`sp` = 用户栈顶 `0x8000_0000`（16 字节对齐），其他寄存器全为 0。`export fn` 默认是 C 调用约定，它的序言会正常使用 `sp`。`main` 的返回值就是退出码。没有命令行参数、没有环境变量。
-- **为什么 `_start` 在这里而不在 `sys.zig` 里**：Zig 按需分析代码，只有根文件里的 `export` 一定会被处理；写在 `sys.zig` 里的 `comptime { @export(...) }` 只有在 `sys.zig` 被引用到时才会执行。最初就是那么写的，结果 release 模式下 `_start` 没有导出，产出的 ELF 是空的（入口地址 0），运行时在地址 0 取指出错（详见 [changes/0005](changes/0005-user-mode-and-syscalls.md)）。
+- **为什么 `_start` 在这里而不在 `sys.zig` 里**：Zig 按需分析代码，只有根文件里的 `export` 一定会被处理；写在 `sys.zig` 里的 `comptime { @export(...) }` 只有在 `sys.zig` 被引用到时才会执行。最初就是那么写的，结果 release 模式下 `_start` 没有导出，产出的 ELF 是空的（入口地址 0），运行时在地址 0 取指出错。
 - **panic**：用户程序里的 `@panic`，以及 Debug/safe 模式下的安全检查失败（整数溢出、数组越界等），都会打印 `panic: <原因>` 并以退出码 255 结束。fast/small 模式没有安全检查，同样的代码不会 panic（比如整数溢出直接回绕）。没有栈回溯（没有调试信息和 unwind 表）。
 
 ## sys.zig

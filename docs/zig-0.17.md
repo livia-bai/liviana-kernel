@@ -38,7 +38,7 @@ error: unable to call function with calling convention 'naked'
 裸函数（`callconv(.naked)`）没有序言和尾声，Zig 不允许从 Zig 代码直接调用。可行的办法：
 
 - **在内联汇编里 `call` 它**，并把调用者保存的寄存器（`ra`、`t0..t6`、`a0..a7`）和 memory 声明为 clobber（`proc.switchToUser` 的做法）。编译器只把它当作一段汇编，不对裸函数做任何假设。
-- 或者 `@ptrCast` 成 `callconv(.c)` 的函数指针来调用。这也能编译、能工作，但**签名必须如实**：一个调用之后还会回来的裸函数如果声明成了 `noreturn`，编译器就会认为调用之后的代码永远不会执行，release 模式下把它们全部删掉。这个项目就因此出过一次只在 release 模式下出现的崩溃（[changes/0005](changes/0005-user-mode-and-syscalls.md)）。
+- 或者 `@ptrCast` 成 `callconv(.c)` 的函数指针来调用。这也能编译、能工作，但**签名必须如实**：一个调用之后还会回来的裸函数如果声明成了 `noreturn`，编译器就会认为调用之后的代码永远不会执行，release 模式下把它们全部删掉。这个项目就因此出过一次只在 release 模式下出现的崩溃。
 
 ### `comptime @export` 和按需分析
 

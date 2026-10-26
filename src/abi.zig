@@ -36,3 +36,12 @@ pub fn errnoOf(ret: usize) ?Errno {
     if (ret < 0 -% @as(usize, max_errno)) return null;
     return @fromBackingInt(0 -% ret);
 }
+
+test "错误码编码成返回值，再取回来" {
+    const expectEqual = @import("std").testing.expectEqual;
+    try expectEqual(@as(?Errno, .fault), errnoOf(fail(.fault)));
+    try expectEqual(@as(?Errno, .nosys), errnoOf(0 -% @as(usize, 38)));
+    // 普通返回值不是错误；-4096 超出了错误码的范围，也当成普通返回值
+    try expectEqual(@as(?Errno, null), errnoOf(42));
+    try expectEqual(@as(?Errno, null), errnoOf(0 -% @as(usize, 4096)));
+}

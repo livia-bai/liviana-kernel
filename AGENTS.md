@@ -2,9 +2,11 @@
 
 用 Zig 写的最小 RISC-V 64 位内核，跑在 QEMU `virt` 机器上，由 OpenSBI 引导，内核运行在 S 模式，用户程序运行在 U 模式。
 
-详细文档在 [docs/](docs/README.md)，里面有“源码文件 → 文档”的对照表。改某个文件之前，先读它对应的文档；想知道一段代码为什么写成这样，先查 [docs/changes/](docs/changes/README.md)。
+详细文档在 [docs/](docs/README.md)，里面有“源码文件 → 文档”的对照表。改某个文件之前，先读它对应的文档。
 
-本文说的**涉及内核的改动**，指改了 `src/`、`user/`、`build.zig`、`linker.ld`、`user/linker.ld` 中任何一个的改动。只改文档（README.md、AGENTS.md、`docs/`）、开发脚本（`tools/`）或者做仓库操作（分支、提交作者等）的不算。QEMU 验证和修改记录都只针对涉及内核的改动。
+本文说的**涉及内核的改动**，指改了 `src/`、`user/`、`build.zig`、`linker.ld`、`user/linker.ld` 中任何一个的改动。只改文档或 `tools/` 的不算。
+
+`docs/` 是给维护者学习“用 Zig 写的内核长什么样”的：只写内核本身的设计和原理，不写开发流程。
 
 ## 环境
 
@@ -19,35 +21,21 @@ zig build                              # 编译，产物在 zig-out/bin/kernel
 zig build -Doptimize=small             # 可选 debug|safe|fast|small（0.17 起是小写）
 zig build run                          # 在 QEMU 中启动，Ctrl-A X 退出
 zig build run -- -d int -D q.log       # -- 之后的参数传给 QEMU
-zig build -Dtest-programs=true         # 额外嵌入 user/tests/ 里的回归测试程序
+zig build test                         # 单元测试（在主机上运行）
 zig fmt --check build.zig src/ user/   # 格式检查
-python3 tools/qemu_test.py             # 在 QEMU 里自动测试四种模式，必须全部 PASS
-python3 tools/check_links.py           # 检查文档里的相对链接和锚点，必须 0 broken
+python3 tools/qemu_test.py --changed   # QEMU 测试：只跑和未提交的改动有关的用例
+python3 tools/qemu_test.py --list      # 列出 QEMU 测试的用例和它们覆盖的文件
 ```
 
 ## 如何验证改动
 
-按改动的范围：
+涉及内核的改动，提交前做这几项：
 
-| 改了什么 | 必须做的检查 |
-| --- | --- |
-| 涉及内核（见开头的定义） | `zig fmt --check`；`python3 tools/qemu_test.py` 全部 `PASS` |
-| 文档（任何 Markdown 文件） | `python3 tools/check_links.py` 必须 `0 broken`；文档里新写的命令、输出要实际跑过 |
-| `tools/` 里的脚本 | 实际运行一遍脚本，包括故意构造出错的情况，确认它能报出来（改的是 `qemu_test.py` 就跑它） |
-| 仓库操作 | 操作前后核对状态（比如删分支前确认内容已经在 `main` 上） |
+1. `zig fmt --check build.zig src/ user/`
+2. `zig build test`：单元测试，几毫秒。改了设备树解析、页分配器、页表、ELF 加载器这类纯逻辑，优先在这里加测试。
+3. `python3 tools/qemu_test.py --changed`：只跑和改动的文件有关的 QEMU 用例，默认 safe 模式。改了内联汇编、MMIO、中断、页表、进出 U 模式的代码时加 `--all-modes`（release 模式最容易暴露漏写 `volatile`、clobber，或者 `noreturn` 写错的问题）。新增源文件或测试程序时，在 `tools/qemu_test.py` 的 `CASES` 里登记它属于哪个用例。
 
-不涉及内核的改动不需要编译和跑 QEMU。
-
-涉及内核的改动用 `tools/qemu_test.py` 验证。它对四种优化模式各做三轮：标准轮（`hello`、`fault`、`spin` 等命令）、回归轮（`user/tests/` 里的测试程序）和 panic 轮（`crash` 之后检查 panic 信息，以及停机后 QEMU 不再占用 CPU；读 `/proc`，只能在 Linux 上跑）。每轮都先构建、再在 QEMU 里按提示符逐条输入命令，自动判定：
-
-- 构建输出必须为空。链接器的警告会以 `error: warning(link): ...` 的形式出现，但 `zig build` 的退出码仍是 0，只看退出码会漏掉。
-- 每条命令的输出符合预期；前后两次 `mem` 的空闲页数相同（否则就是漏了页）；没有 `KERNEL PANIC`；`shutdown` 后 QEMU 退出码为 0。最后三项 panic 轮除外。
-- 四种模式都要过：release 模式最容易暴露漏写 `volatile`、clobber，或者 `noreturn` 写错的问题。调试时可以先 `--mode debug`，提交前跑全部。
-- 失败时会列出没通过的检查和串口日志的位置（`zig-out/qemu-test/<模式>-<轮次>/serial.log`）。
-
-推送到 `main` 后 GitHub Actions 会再跑一遍格式检查、链接检查和 `qemu_test.py`（`.github/workflows/ci.yml`）。CI 失败就是 `main` 坏了，要马上修，不能留着。
-
-新功能和 bug 修复还要针对性地测边界情况，能固定下来的加成 `user/tests/` 里的回归测试。检查项的完整列表、怎么加回归测试、手动运行 QEMU 的方法、调试工具和症状速查表见 [docs/testing.md](docs/testing.md)。
+改什么测什么，不要为了测试而测试：只改文档或 `tools/` 不需要编译、不跑 QEMU；同一份代码通过了就不要重复跑。新功能和 bug 修复要测到边界情况：能在主机上测的写单元测试，只能在 QEMU 里看到的加进 `user/tests/` 和 `qemu_test.py`。详见 [docs/testing.md](docs/testing.md)。
 
 ## 约定
 
@@ -82,33 +70,18 @@ python3 tools/check_links.py           # 检查文档里的相对链接和锚点
 
 - 改了代码，就同步改 [docs/](docs/README.md) 里对应的文档（对照表在 `docs/README.md`）；新增源码文件要加进对照表。
 - README.md 只放简介、运行方法、shell 命令和文档索引，细节写进 `docs/`。
-- 改了任何 Markdown 文件都要跑 `python3 tools/check_links.py`，输出必须是 `0 broken`（[docs/testing.md](docs/testing.md#必做的检查)）。
-- 文档里写的命令、输出、数字、结论必须是实际验证过的；没验证的推测要明确写“推测”。写文档时发现之前的说法有错，改掉并写明改了什么：涉及内核的改动写在这次的修改记录里，只改文档的提交写在提交信息里。
+- 文档里写的命令、输出、数字、结论必须是实际验证过的；没验证的推测要明确写“推测”。发现之前的说法有错，直接改掉。
 
-## 修改与验错记录
+## 修改记录
 
-每一次涉及内核的改动都要在 [docs/changes/](docs/changes/README.md) 里写一篇记录，和代码放在**同一个提交**里。
-
-- **哪些要写**：涉及内核的改动（见开头的定义）。
-- **哪些不写**：只改文档、开发脚本，以及仓库方面的操作。这类提交按“如何验证改动”里对应的那一行检查，但不写记录。
-- **文件名**：`NNNN-简短英文描述.md`，编号接着最后一篇往下排，四位数。
-- **索引**：在 `docs/changes/README.md` 的索引表里加一行。
-- **内容**：按 `docs/changes/README.md` 末尾的模板写，必须包括：
-  - 目标：维护者的原始要求。
-  - 改动：按文件列出。
-  - 设计决策：为什么这样做，考虑过但没选的做法。
-  - 验证：环境（Zig、QEMU、OpenSBI 版本）、实际运行的命令、每种优化模式的结果、关键输出。临时测试代码也贴进来，方便以后重复。
-  - 发现的问题：验证过程中发现的**每一个**问题，包括自己写错又改掉的地方，各写现象（原样贴报错或输出）、根本原因、修复、怎么确认修好了。没有发现问题也要写明测了哪些情况。
-  - 遗留问题。
-- **提交哈希**：写记录时还没有这次提交的哈希，写“本记录对应的提交”；之后的下一次提交（不管是不是涉及内核）顺手把哈希补上（索引表里也补上）。
-- 记录写的是当时的事实，以后不要回头改写结论；后来发现记录里有错，在旧记录里加一句注，写明错在哪里、正确的是什么。如果是在某次涉及内核的改动里发现的，也在那次的记录里说明，注里指向它。
+涉及内核的改动，在 [docs/changes.md](docs/changes.md) 的最上面加一段：日期、标题，加上几行“新增了什么功能、修了什么 bug”。不写验证过程、不写提交哈希。和代码放在同一个提交里。
 
 ## 提交与推送
 
 - 仓库只有一位维护者：提交直接推到 `main`，不开分支，也不开 PR。
 - 提交的**作者**用维护者本人，**提交者**用 Claude：在仓库里设置 `git config author.name` / `author.email`（照 `git log` 里最近提交的作者），提交者沿用环境默认的 `Claude <noreply@anthropic.com>`，不要在仓库里设置 `user.name` / `user.email` 把它覆盖掉。原因：这个环境会自动用 Claude 的密钥给提交签名，GitHub 只在签名属于提交者时显示 Verified。提交前用 `git var GIT_AUTHOR_IDENT` 和 `git var GIT_COMMITTER_IDENT` 确认。提交信息末尾保留 `Co-Authored-By: Claude ...` 一行。
 - 提交信息里不要带 session 链接（`Claude-Session:` 之类的行）。
-- 推送前按“如何验证改动”的表格做完对应的检查；涉及内核的改动，修改记录已经写好。
+- 推送前做完“如何验证改动”里的检查；涉及内核的改动，修改记录已经写好。
 
 ## Zig 0.17 的坑（摘要）
 

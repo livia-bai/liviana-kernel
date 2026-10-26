@@ -145,7 +145,7 @@ fn kernelPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
 
 - 根文件里的 `pub const panic` 替换标准库默认的 panic 处理（freestanding 下默认是直接 `@trap()`）。`@panic`、`std.debug.panic`，以及 Debug/safe 模式下的安全检查失败（整数溢出、越界、`.?` 取到 null 等）都会走到这里。必须写成 `pub`，0.17 起 `@hasDecl` 只认公开声明。
 - `FullPanic` 会把各种安全检查失败格式化成可读的消息再交给 `kernelPanic`。0.17.0 的 `std.debug.simple_panic` 有回归（#36986），编译不过，不要用。
-- 先关中断再打印，然后把 `sie` 清零，停在 `wfi` 循环里。清零 `sie` 是因为 `wfi` 看的是 `sie & sip`，不看 `sstatus.SIE`：panic 之后没人再预约时钟中断，它会一直挂着；`sie.STIE` 还开着的话，`wfi` 每次都立刻返回，停机就成了忙等，QEMU 占满一个 CPU 核（实测 97%～99%，清零 `sie` 之后是 0%，见 [changes/0010](changes/0010-fpu-timer-panic-fixes.md)）。规范允许 `wfi` 无故返回，所以仍然放在循环里。
+- 先关中断再打印，然后把 `sie` 清零，停在 `wfi` 循环里。清零 `sie` 是因为 `wfi` 看的是 `sie & sip`，不看 `sstatus.SIE`：panic 之后没人再预约时钟中断，它会一直挂着；`sie.STIE` 还开着的话，`wfi` 每次都立刻返回，停机就成了忙等，QEMU 占满一个 CPU 核（实测 97%～99%，清零 `sie` 之后是 0%）。规范允许 `wfi` 无故返回，所以仍然放在循环里。
 - 内核 panic 后 QEMU 不会退出，管道测试会超时（`timeout` 返回 124），见 [testing.md](testing.md)。
 
 用户程序出错不会走到这里：U 模式的异常只结束那个进程（[process.md](process.md#结束进程)）。

@@ -21,6 +21,8 @@ pub fn init(start: usize, end: usize, reserved: []const dtb.Region) void {
     const lo = std.mem.alignForward(usize, start, size);
     const hi = std.mem.alignBackward(usize, end, size);
     range = .{ .base = lo, .size = hi - lo };
+    free_list = .{};
+    total_pages = 0;
     // 从高地址往低地址插到表头，这样先分配出去的是低地址的页，调试时更好认
     var addr = hi;
     while (addr > lo) {
@@ -55,4 +57,27 @@ pub fn free(page: *align(size) Page) void {
     }
     free_list.prepend(@ptrCast(page));
     free_pages += 1;
+}
+
+test "先分配低地址、分配时清零、跳过保留区、释放后能再用" {
+    var mem: [8 * size]u8 align(size) = undefined;
+    @memset(&mem, 0xaa);
+    const base = @intFromPtr(&mem);
+    // 第 2 页被保留（哪怕只保留了 1 个字节，整页都不能用）
+    init(base, base + mem.len, &.{.{ .base = base + 2 * size, .size = 1 }});
+    try std.testing.expectEqual(7, total_pages);
+
+    const a = try alloc();
+    const b = try alloc();
+    const c = try alloc();
+    try std.testing.expectEqual(base, @intFromPtr(a));
+    try std.testing.expectEqual(base + size, @intFromPtr(b));
+    try std.testing.expectEqual(base + 3 * size, @intFromPtr(c));
+    try std.testing.expect(std.mem.allEqual(u8, c, 0));
+    try std.testing.expectEqual(4, free_pages);
+
+    free(b);
+    try std.testing.expectEqual(@intFromPtr(b), @intFromPtr(try alloc())); // 刚释放的页最先被拿走
+    for (0..4) |_| _ = try alloc();
+    try std.testing.expectError(error.OutOfMemory, alloc());
 }

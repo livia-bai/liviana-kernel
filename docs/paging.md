@@ -84,7 +84,7 @@ pub fn map(root: *PageTable, va: usize, pa: usize, size: usize, perm: Perm) MapE
 **前提**（用 `std.debug.assert` 检查，Debug/safe 模式下违反会 panic）：
 
 - `va`、`pa`、`size` 都按 4 KiB 对齐。
-- 叶子权限合法：`r` 或 `x` 至少有一个，有 `w` 就必须有 `r`。R/W/X 全为 0 的“叶子”会被 CPU 当成指向下一级页表的指针，后果很严重（见 [changes/0005](changes/0005-user-mode-and-syscalls.md) 里 ELF 加载器的那个问题）。
+- 叶子权限合法：`r` 或 `x` 至少有一个，有 `w` 就必须有 `r`。R/W/X 全为 0 的“叶子”会被 CPU 当成指向下一级页表的指针，后果很严重（见 [process.md](process.md#elf-加载器) 里“为什么一定要拒绝不可读的段”）。
 - 用户映射（`perm.u`）必须完全落在 `[user_base, user_end)` 里；内核映射不能和这个范围有任何重叠（原因见下文“用户地址空间”）。
 
 **算法**：从 `offset = 0` 开始，每一步选一个尽量大的页：
@@ -220,4 +220,4 @@ pub fn copyFromUser(root: *PageTable, dst: []u8, src: usize) error{BadAddress}!v
 
   `attr` 依次是 r、w、x、u、g、a、d；内核映射都没有 `u`，都有 `g`。在用户程序运行时停下（比如断在 `syscall.dispatch`），还能看到 `0x4000_0000` 起带 `u` 的用户映射。GDB 的用法见 [testing.md](testing.md#gdb)。
 - 想看缺页发生在哪：内核态的缺页会 panic 并打印 `sepc`（出错指令）和 `stval`（出错地址）；QEMU 的 `-d int` 会记录每一次陷阱（[testing.md](testing.md#qemu-的陷阱日志)）。
-- 改了内核映射以后，四种优化模式都要跑：映射错一页往往只在某些模式下才会被访问到（各模式下内核镜像的大小、段边界都不一样）。
+- 改了内核映射以后，四种优化模式都要跑（`qemu_test.py --all-modes`）：映射错一页往往只在某些模式下才会被访问到（各模式下内核镜像的大小、段边界都不一样）。

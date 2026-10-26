@@ -95,7 +95,7 @@ fn write(ptr: usize, len: usize) usize {
   - 写出了一部分之后遇到坏地址 → 返回已经写出的字节数（小于 `len`），和 POSIX 的部分写语义一致。
   - `len = 0` → 返回 0，不检查指针。
 - `ptr + done` 不会溢出：`done > 0` 说明 `[ptr, ptr + done)` 已经全部通过了检查，都在用户区内。
-- 最初的实现不按页分块，一个 128 字节的块可能跨过有效页和无效页的边界，导致“前 4 个字节有效，后面无效”的写入整体失败、返回 EFAULT，而不是写出 4 个字节。测试时发现并修正了，见 [changes/0005](changes/0005-user-mode-and-syscalls.md)。
+- 最初的实现不按页分块，一个 128 字节的块可能跨过有效页和无效页的边界，导致“前 4 个字节有效，后面无效”的写入整体失败、返回 EFAULT，而不是写出 4 个字节。测试时发现并修正了。
 
 ## 访问用户内存
 
@@ -143,4 +143,4 @@ pub fn print(comptime fmt: []const u8, args: anytype) void   // 通过 write 做
 3. 涉及用户指针的，一律通过 `vm.copyFromUser`（或新写的 `copyToUser`）访问，不要打开 `SUM`。
 4. 要阻塞等待的（比如等键盘输入），要在里面打开中断再 `wfi`。这时会出现嵌套的陷阱（来自 S 模式，压在当前的进程内核栈上），先读 [trap.md](trap.md#中断开关不变量) 再动手。
 5. `user/sys.zig`：加一个封装函数。
-6. 更新本文的调用列表，并在 [changes/](changes/README.md) 里写修改与验错记录。
+6. 更新本文的调用列表，在 [changes.md](changes.md) 里加一行。

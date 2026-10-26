@@ -45,12 +45,22 @@ pub fn build(b: *std.Build) void {
         .{ .name = "t_panic", .dir = "user/tests" },
         .{ .name = "t_time", .dir = "user/tests" },
         .{ .name = "t_fp", .dir = "user/tests" },
-        .{ .name = "t_clock", .dir = "user/tests" },
         // 数据段没有任何权限，用来验证 ELF 加载器会拒绝它
         .{ .name = "t_noperm", .dir = "user/tests", .linker_script = "user/tests/noperm.ld" },
     };
     const with_tests = b.option(bool, "test-programs", "Also embed the regression test programs in user/tests/") orelse false;
-    const programs: []const UserProgram = if (with_tests) &(user_programs ++ test_programs) else &user_programs;
+    const all_programs = user_programs ++ test_programs;
+    const programs: []const UserProgram = if (with_tests) &all_programs else &user_programs;
+
+    // zig build test：在主机上运行单元测试（src/tests.zig），测设备树解析、页分配器、页表、ELF 加载器这些纯逻辑。
+    // 用户程序的 ELF 也交给单元测试，用来测 ELF 加载器。
+    const unit_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/tests.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    }) });
+    const test_step = b.step("test", "Run the unit tests on the host");
+    test_step.dependOn(&b.addRunArtifact(unit_tests).step);
 
     const abi = b.createModule(.{ .root_source_file = b.path("src/abi.zig") });
     const sys = b.createModule(.{
@@ -62,7 +72,7 @@ pub fn build(b: *std.Build) void {
     const options = b.addOptions();
     options.addOption([]const []const u8, "user_programs", names);
     kernel.root_module.addOptions("build_options", options);
-    for (programs) |p| {
+    for (all_programs, 0..) |p, i| {
         const program = b.addExecutable(.{
             .name = p.name,
             .root_module = b.createModule(.{
@@ -85,6 +95,8 @@ pub fn build(b: *std.Build) void {
         program.setLinkerScript(b.path(p.linker_script));
         // Debug 模式默认不回收没用到的段，会把整个 compiler_rt 带进来，体积大两倍多
         program.link_gc_sections = true;
+        unit_tests.root_module.addAnonymousImport(p.name, .{ .root_source_file = program.getEmittedBin() });
+        if (i >= programs.len) continue; // 没被选中的测试程序只给单元测试用
         kernel.root_module.addAnonymousImport(p.name, .{ .root_source_file = program.getEmittedBin() });
         // 另外安装一份到 zig-out/user/，方便用 llvm-readelf 等工具查看（内核用的是上面嵌进去的那份）
         const install = b.addInstallArtifact(program, .{ .dest_dir = .{ .override = .{ .custom = "user" } } });
