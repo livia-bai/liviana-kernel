@@ -12,6 +12,7 @@ const shell = @import("shell.zig");
 const dtb = @import("dtb.zig");
 const page = @import("page.zig");
 const vm = @import("vm.zig");
+const proc = @import("proc.zig");
 
 /// 替换标准库默认的 panic 处理。@panic、std.debug.panic 以及
 /// Debug 模式下的安全检查失败（整数溢出、数组越界等）都会走到这里。
@@ -83,13 +84,17 @@ fn kmain(hartid: usize, dtb_addr: usize) callconv(.c) noreturn {
 
     uart.write("Type 'help' for commands.\n");
     shell.prompt();
+    // 主循环同时是调度器：每一轮先处理 Ctrl-C 和一个键盘字符，没有字符要处理时运行一个就绪进程的一个时间片。
     while (true) {
         // 先关中断再查缓冲区：如果查完发现为空、正要 wfi 时恰好来了字符，
         // 中断会保持挂起，wfi 立即返回，不会白睡一轮。
         // （wfi 只看 sie，不看 sstatus.SIE，所以关着中断也能被唤醒。）
+        // 进程切换也必须在关中断时进行，schedule 正好在这段里。
         riscv.disableInterrupts();
-        const c = uart.read();
-        if (c == null) riscv.wfi();
+        if (uart.takeCtrlC()) shell.interrupt();
+        // 有前台进程时不读输入，留在缓冲区里等它结束
+        const c = if (shell.waiting()) null else uart.read();
+        if (c == null and !proc.schedule()) riscv.wfi();
         riscv.enableInterrupts(); // 挂起的中断在这里立刻被处理
         if (c) |ch| shell.feed(ch);
     }

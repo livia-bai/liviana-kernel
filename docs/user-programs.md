@@ -1,6 +1,6 @@
 # 用户程序
 
-涉及文件：`user/start.zig`、`user/sys.zig`、`user/linker.ld`、`user/hello.zig`、`user/fault.zig`、`user/spin.zig`
+涉及文件：`user/start.zig`、`user/sys.zig`、`user/linker.ld`、`user/hello.zig`、`user/fault.zig`、`user/spin.zig`、`user/ticker.zig`
 
 用户程序运行在 U 模式，只能访问自己地址空间里的页，要输出文字、查询时间、退出都要通过系统调用（[syscalls.md](syscalls.md)）。它们在构建时编译成独立的 ELF 并嵌进内核（[build.md](build.md#用户程序)），运行时由 shell 的 `run` 命令加载（[process.md](process.md)）。
 
@@ -46,6 +46,8 @@ pub const WriteError = error{ BadAddress, Unexpected };
 pub fn write(bytes: []const u8) WriteError!usize
 pub fn getpid() usize
 pub fn uptime() u64                      // 开机以来的毫秒数
+pub fn yield() void                      // 让出 CPU
+pub fn sleep(ms: u64) void               // 睡至少 ms 毫秒，精度 10 ms
 pub fn print(comptime fmt: []const u8, args: anytype) void
 ```
 
@@ -126,18 +128,40 @@ reading kernel memory at 0x80200000 from U-mode...
 
 ```zig
 pub fn main() u8 {
-    sys.print("spinning in U-mode without making syscalls, press Ctrl-C to stop\n", .{});
+    sys.print("pid {d} spinning in U-mode without making syscalls\n", .{sys.getpid()});
     while (true) {}
 }
 ```
 
-进入死循环，不再做任何系统调用。时钟中断每 10 ms 打断它一次，串口中断在收到字符时打断它；收到 Ctrl-C 时内核结束它。证明用户程序没法霸占 CPU。
+进入死循环，不再做任何系统调用。时钟中断每 10 ms 打断它一次，串口中断在收到字符时打断它，每次打断它都要让出 CPU，别的进程和 shell 照样运行。证明用户程序没法霸占 CPU。前台运行时按 Ctrl-C 结束它；后台运行时用 `kill` 结束它，`ps` 能看到它的 `TICKS` 一直在涨。
 
 ```
 > run spin
-spinning in U-mode without making syscalls, press Ctrl-C to stop
+pid 3 spinning in U-mode without making syscalls
 ^C
 [proc] pid 3 (spin) killed: interrupted by Ctrl-C
+```
+
+### ticker
+
+```zig
+pub fn main() u8 {
+    const pid = sys.getpid();
+    for (1..6) |i| {
+        sys.sleep(1000);
+        sys.print("[ticker pid {d}] tick {d} at {d} ms\n", .{ pid, i, sys.uptime() });
+    }
+    return 0;
+}
+```
+
+每秒打印一行，共 5 行，然后退出。睡眠期间不被调度，`ps` 里是 `sleeping`、`TICKS` 几乎不涨。适合放到后台（`run ticker &`），和别的程序、shell 一起跑，看输出交错；多开几个，它们的输出间隔仍然是 1 秒：
+
+```
+> run ticker &
+[proc] pid 3 (ticker) started in the background
+> [ticker pid 3] tick 1 at 2580 ms
+[ticker pid 3] tick 2 at 3590 ms
 ```
 
 ## 写一个新程序
@@ -155,14 +179,14 @@ spinning in U-mode without making syscalls, press Ctrl-C to stop
 
    必须写 `@import("sys")`，不能写 `@import("sys.zig")`（同一个文件不能属于两个模块，见 [build.md](build.md#用户程序)）。
 2. 在 `build.zig` 的 `user_programs` 数组里加一项 `.{ .name = "<名字>" }`。（回归测试程序放在 `user/tests/`，加到 `test_programs` 里，见 [testing.md](testing.md#加一个回归测试)。）
-3. `zig build run`，在 shell 里 `run <名字>`。不带参数的 `run` 会列出所有程序。
+3. `zig build run`，在 shell 里 `run <名字>`（加 ` &` 在后台运行）。不带参数的 `run` 会列出所有程序。
 
 可以用的：`std.mem`、`std.fmt`、`std.math` 等纯计算的标准库；全局变量；最多约 16 KiB 的栈。
 
 不能用或要注意的：
 
 - 没有堆：没有分配内存的系统调用，`std.heap.page_allocator` 等依赖操作系统的分配器不可用。需要内存就用全局数组或者栈（可以用 `std.heap.FixedBufferAllocator` 包一个全局数组）。
-- 系统调用只有 `exit`、`write`、`getpid`、`uptime` 四个：没有读键盘、文件、线程、睡眠，也没有命令行参数。
+- 系统调用只有 `exit`、`write`、`getpid`、`uptime`、`yield`、`sleep` 六个：没有读键盘、文件、线程，也没有命令行参数。
 - 不能用浮点指令：浮点运算由 compiler_rt 软件实现，慢而且让程序变大。浮点单元被内核关掉了（`sstatus.FS = Off`），手写的浮点指令会触发 `illegal_instruction` 被结束（回归测试 `t_fp`）。
 - 栈只有 16 KiB，下面是不映射的保护页：栈溢出时触发 `store_page_fault`（`stval` 落在 `0x7fffb000..0x7fffc000`），进程被结束。
 - 不能执行特权指令、不能访问 S 模式的 CSR（比如 `csrr sstatus`），否则触发 `illegal_instruction` 被结束。例外是 `cycle`、`time`、`instret` 三个计数器：OpenSBI 启动时把 `scounteren` 设成了 7（内核进入时实测，内核没有改它），所以用户程序可以直接用 `rdtime` 等指令读，实测 `rdtime` 在 U 模式下正常返回。

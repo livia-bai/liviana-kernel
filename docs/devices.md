@@ -90,9 +90,8 @@ Ctrl-C（ASCII `0x03`）不进缓冲区，只把 `ctrl_c_pressed` 置为 `true`�
 pub fn takeCtrlC() bool   // 返回上次调用以来是否按过 Ctrl-C，并清除标志
 ```
 
-- 陷阱处理程序在处理完一次**来自 U 模式**的中断后调用 `takeCtrlC()`，按过就结束当前用户程序（[trap.md](trap.md#分发)、[process.md](process.md#ctrl-c)）。用户程序就算在 U 模式死循环、从不做系统调用，串口中断也照样会打断它。
-- `proc.run` 进入 U 模式前先调用一次 `takeCtrlC()` 丢掉之前按下的 Ctrl-C，免得在 shell 里随手按的 Ctrl-C 把下一个程序一启动就杀掉。
-- 在 shell 里按 Ctrl-C 没有任何效果（不进缓冲区，shell 看不到）。
+- 主循环每一轮先调用 `takeCtrlC()`（关着中断），按过就交给 `shell.interrupt()`，由它结束前台进程（[process.md](process.md#ctrl-c)）。用户程序就算在 U 模式死循环、从不做系统调用，串口中断也照样会打断它，陷阱处理程序让它让出 CPU，主循环马上就能看到这次 Ctrl-C。
+- 没有前台进程时按的 Ctrl-C 也在这里被取走、什么都不做，所以不会留到下一个程序一启动就把它杀掉。Ctrl-C 不进缓冲区，shell 看不到它。
 - 管道测试里用 `printf '\003'` 发送 Ctrl-C。QEMU `-nographic` 会把 Ctrl-C 原样交给客户机串口，不会结束 QEMU 自己（结束 QEMU 是 Ctrl-A X）。
 
 ## PLIC（`plic.zig`）

@@ -8,29 +8,40 @@
 - 陷阱处理：异常和中断，时钟中断
 - 解析设备树，得到内存范围和时钟频率
 - 物理页分配器，Sv39 分页，内核按段设置权限（代码只读可执行，数据不可执行）
-- U 模式用户程序：独立编译的 ELF 嵌进内核，由内核加载；四个系统调用；用户程序出错或按 Ctrl-C 只结束进程，内核照常运行
+- U 模式用户程序：独立编译的 ELF 嵌进内核，由内核加载；六个系统调用；用户程序出错或按 Ctrl-C 只结束进程，内核照常运行
+- 多进程：最多 8 个进程，时钟中断驱动的时间片轮转调度；程序可以在后台运行，`sleep` 的进程不占 CPU
 
 ```
 Hello from a Zig kernel on RISC-V!
 SBI: OpenSBI, spec v1.0 | hart 0 | device tree at 0x87e00000
 [ok] trap vector installed
-[trap] breakpoint at 0x80215d34, skipping it
+[trap] breakpoint at 0x80215d56, skipping it
 [ok] device tree: 128 MiB RAM at 0x80000000, timebase 10000000 Hz
-[ok] page allocator: 32057 free pages (128228 KiB)
+[ok] page allocator: 31999 free pages (127996 KiB)
 [ok] Sv39 paging enabled: kernel mapped 1:1, text r-x, rodata r--, data rw-
 [ok] interrupts enabled: timer at 100 Hz, keyboard via UART + PLIC
 Type 'help' for commands.
 > run hello
-Hello from U-mode! I am pid 1, the kernel has been up for 5120 ms.
+Hello from U-mode! I am pid 1, the kernel has been up for 780 ms.
 write() refused a kernel pointer: BadAddress
 [proc] pid 1 (hello) exited with code 0
-> run fault
-reading kernel memory at 0x80200000 from U-mode...
-[proc] pid 2 (fault) killed: load_page_fault at 0x40011454, stval=0x80200000
+> run spin &
+[proc] pid 2 (spin) started in the background
+> pid 2 spinning in U-mode without making syscalls
+run ticker &
+[proc] pid 3 (ticker) started in the background
+> [ticker pid 3] tick 1 at 2580 ms
+ps
+  PID STATE     TICKS NAME
+    2 ready       161 spin
+    3 sleeping      0 ticker
 > run spin
-spinning in U-mode without making syscalls, press Ctrl-C to stop
+pid 4 spinning in U-mode without making syscalls
+[ticker pid 3] tick 2 at 3590 ms
 ^C
-[proc] pid 3 (spin) killed: interrupted by Ctrl-C
+[proc] pid 4 (spin) killed: interrupted by Ctrl-C
+> kill 2
+[proc] pid 2 (spin) killed: kill command
 ```
 
 ## 运行
@@ -59,7 +70,10 @@ python3 tools/qemu_test.py            # QEMU 测试：全部用例
 | `help` | 列出命令 |
 | `uptime` | 开机时长，由时钟中断计数得出 |
 | `mem` | 物理页的使用情况 |
-| `run NAME` | 在 U 模式运行用户程序 `NAME`（`hello`、`fault`、`spin`），等它结束；不带参数时列出所有程序 |
+| `run NAME` | 在 U 模式运行用户程序 `NAME`（`hello`、`fault`、`spin`、`ticker`），等它结束，Ctrl-C 结束它；不带参数时列出所有程序 |
+| `run NAME &` | 在后台运行，马上回到提示符 |
+| `ps` | 列出进程：pid、状态、用掉的时钟 tick 数 |
+| `kill PID` | 结束进程 |
 | `ebreak` | 触发断点异常，处理后恢复执行 |
 | `crash` | 读地址 0（没有映射），触发缺页异常，内核 panic |
 | `shutdown` | 通过 SBI 关机，QEMU 随之退出 |
@@ -94,7 +108,6 @@ tools/          QEMU 测试脚本
 
 ## 可以继续做的方向
 
-- 多进程：每个进程一块内核栈，在时钟中断里切换，实现抢占式调度
-- 更多系统调用：阻塞读键盘的 `read`、`sleep`，以及用户程序自己申请内存
+- 更多系统调用：阻塞读键盘的 `read`、`fork`/`exec`/`wait`，以及用户程序自己申请内存
 - 从设备树读串口、PLIC 的地址和中断号
 - 多核：用 SBI HSM 扩展启动其他 hart

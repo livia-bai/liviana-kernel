@@ -112,21 +112,32 @@ export fn _start() linksection(".text.boot") callconv(.naked) noreturn {
 
 ## 主循环
 
+主循环同时是 shell 的输入循环和进程的调度器：
+
 ```zig
 while (true) {
     riscv.disableInterrupts();
-    const c = uart.read();
-    if (c == null) riscv.wfi();
+    if (uart.takeCtrlC()) shell.interrupt();
+    const c = if (shell.waiting()) null else uart.read();
+    if (c == null and !proc.schedule()) riscv.wfi();
     riscv.enableInterrupts(); // 挂起的中断在这里立刻被处理
     if (c) |ch| shell.feed(ch);
 }
 ```
 
-顺序不能改，原因是一个经典的竞争：如果开着中断检查缓冲区，可能出现“检查时缓冲区为空 → 正要执行 `wfi` 时字符到了，中断处理程序把它放进缓冲区 → `wfi` 睡下去”，这个字符要等到下一个中断（最长 10 ms 后的时钟中断）才会被处理。
+每一轮：
+
+1. 关中断。
+2. 按过 Ctrl-C 就交给 shell，由它结束前台进程（没有前台进程时什么也不做）。
+3. `shell.waiting()`：有前台进程在运行时返回 `true`，这时不读键盘输入，字符留在缓冲区里，等前台进程结束再交给 shell；它发现前台进程刚结束时打印提示符（[shell.md](shell.md#前台和后台)）。
+4. 有字符就不调度，开中断后交给 shell。没有字符就调用 `proc.schedule()` 运行一个就绪进程的一个时间片（[process.md](process.md#调度)），它返回时又回到了这个循环、中断仍是关着的；一个就绪的进程都没有时 `wfi` 休眠。
+5. 开中断。
+
+**先关中断再检查、再 `wfi`，顺序不能改**，原因是一个经典的竞争：如果开着中断检查缓冲区，可能出现“检查时缓冲区为空 → 正要执行 `wfi` 时字符到了，中断处理程序把它放进缓冲区 → `wfi` 睡下去”，这个字符要等到下一个中断（最长 10 ms 后的时钟中断）才会被处理。同样的道理也适用于睡眠的进程到点、Ctrl-C。
 
 关中断后再检查就没有这个问题：字符在检查之后到达时，中断只是挂起（`sip.SEIP` 置位）而不会被处理；`wfi` 只看 `sie` 和 `sip`、不看 `sstatus.SIE`，有挂起的中断就立即返回；接着 `enableInterrupts()` 让挂起的中断马上被处理。
 
-`uart.read()` 要求调用时中断是关着的（它和中断处理程序共用环形缓冲区的索引），这个循环正好满足。`shell.feed` 在开着中断时调用，shell 执行 `run` 时会在里面停留到用户程序结束。
+`uart.read()`、`uart.takeCtrlC()` 要求调用时中断是关着的（它们和中断处理程序共用缓冲区的索引和标志），进程切换也必须关着中断，这个循环都满足。`shell.feed` 在开着中断时调用，执行命令期间时钟和键盘中断照常发生；`run` 只是把进程放进进程表就返回，不会停在里面。
 
 ## panic 处理
 

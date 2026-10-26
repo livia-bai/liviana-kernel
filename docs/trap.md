@@ -1,6 +1,6 @@
 # 陷阱处理
 
-涉及文件：`src/trap.zig`（以及调用它的 `src/proc.zig`、`src/syscall.zig`）
+涉及文件：`src/trap.zig`（以及它调用的 `src/proc.zig`、`src/syscall.zig`）
 
 RISC-V 把同步的**异常**（非法指令、缺页、`ebreak`、`ecall` 等）和异步的**中断**（时钟、外设）统称为陷阱（trap）。陷阱发生时 CPU 跳到 `stvec` 指向的地址，相当于 x86 上 IDT 的角色，但只有一个入口，由软件读 `scause` 自己分发。
 
@@ -70,7 +70,7 @@ pub const TrapFrame = extern struct {
 办法是用 `sscratch` 暂存：
 
 - 在内核里（S 模式）运行时，`sscratch` = 0。
-- 在 U 模式运行时，`sscratch` = 当前进程内核栈的栈顶。
+- 在 U 模式运行时，`sscratch` = 当前进程内核栈的栈顶。每个进程有自己的内核栈（[process.md](process.md#进程表)），`trapExit` 每次回到 U 模式时都按这次要回去的进程重新写 `sscratch`，所以切换进程不需要另外维护它。
 
 `trap.init` 把 `sscratch` 清零（固件不保证它的初值）；之后由 `trapEntry`/`trapExit` 维护这个约定。
 
@@ -130,10 +130,10 @@ ld    sp, 16(sp)            # 最后恢复 sp
 sret
 ```
 
-- `trapExit` 是 `pub` 的，因为除了陷阱返回，`proc.switchToUser` 也从这里**第一次**进入 U 模式：它在进程内核栈顶构造一个 `TrapFrame`，把 `sp` 指向它，然后跳进 `trapExit`（[process.md](process.md#进出-u-模式)）。
+- `trapExit` 是 `pub` 的，因为除了陷阱返回，新进程也从这里**第一次**进入 U 模式：`proc.spawn` 在进程内核栈顶构造一个 `TrapFrame`，再构造一个 `ra` = `trapExit`、`sp` = 这个 `TrapFrame` 的上下文；第一次被调度时 `switchContext` 恢复这个上下文、`ret` 进 `trapExit`（[process.md](process.md#创建进程)）。
 - SPP 的掩码 `0x100` 通过 `"i"`（立即数）约束传入：`%[spp]`。如果放进 `comptimePrint` 的参数结构体里，`trapEntry` 那边用不到这个字段，`comptimePrint` 会报“unused argument”。
-- “`addi t0, sp, 272` 就是内核栈顶”成立的前提是：来自 U 模式的陷阱，`TrapFrame` 总是压在进程内核栈的最顶端。`trapEntry` 从 `sscratch`（= 栈顶）减去 272 压栈，`proc.run` 也把初始的 `TrapFrame` 放在栈顶下方 272 字节处，所以一直成立。
-- 用户程序被打断时 `sstatus` 的值原样写回，包括 `SPIE = 1`，所以 `sret` 回到 U 模式后中断是开着的。
+- “`addi t0, sp, 272` 就是内核栈顶”成立的前提是：来自 U 模式的陷阱，`TrapFrame` 总是压在进程内核栈的最顶端。`trapEntry` 从 `sscratch`（= 栈顶）减去 272 压栈，`proc.spawn` 也把初始的 `TrapFrame` 放在栈顶下方 272 字节处，所以一直成立。
+- 用户程序被打断时 `sstatus` 的值原样写回，包括 `SPIE = 1`，所以 `sret` 回到 U 模式后中断是开着的。写回的值里 `SIE` 必须是 0（陷阱入口保存的值天然如此，`proc.spawn` 构造初始值时专门清掉了），否则恢复寄存器的途中就会被中断打断。
 - 写 `sscratch` 发生在写回 `sstatus`（`SIE = 0`）之后、`sret` 之前，这段时间不会有中断进来，不会出现“人在内核里、`sscratch` 却不为 0”的窗口。
 
 ## 分发
@@ -155,12 +155,12 @@ const from_user = frame.sstatus & riscv.sstatus_spp == 0;
 
 | 条件 | 处理 |
 | --- | --- |
-| 中断 5（时钟） | `timer.onInterrupt()` |
+| 中断 5（时钟） | `timer.onInterrupt()`；`from_user` 时当前进程的 `ticks` 加 1 |
 | 中断 9（外部） | `handleExternal()`：PLIC claim → 串口 → complete（[devices.md](devices.md#claim--complete)） |
 | 其他中断 | `std.debug.panic("unexpected interrupt N")` |
-| 中断处理完，且 `from_user`，且 `uart.takeCtrlC()` 为真 | 打印 `^C`，`proc.kill("interrupted by Ctrl-C")` |
+| 中断处理完，且 `from_user` | `proc.yield()`：让出 CPU 回到主循环（调度器），下次轮到这个进程时返回（[process.md](process.md#调度)） |
 | 来自 U 模式的异常 8（`ecall`） | `frame.sepc += 4`，`frame.regs[10] = syscall.dispatch(frame)`（[syscalls.md](syscalls.md)） |
-| 来自 U 模式的其他异常 | `proc.kill("<异常名> at <sepc>, stval=<stval>")`：结束进程，内核照常运行 |
+| 来自 U 模式的其他异常 | `proc.killCurrent("<异常名> at <sepc>, stval=<stval>")`：结束进程，内核照常运行 |
 | 来自 S 模式的异常 3（`ebreak`） | 打印 `[trap] breakpoint at ...`，`frame.sepc += instructionLength(frame.sepc)` 跳过它 |
 | 来自 S 模式的其他异常 | `std.debug.panic("unhandled exception: ...")`：内核自己的错，停机 |
 
@@ -168,7 +168,9 @@ const from_user = frame.sstatus & riscv.sstatus_spp == 0;
 
 - **`sepc` 要手动前进。** 异常时 `sepc` 指向出错的指令本身，原样返回会再执行一遍。`ecall` 固定 4 字节（没有压缩形式），直接加 4；`ebreak` 有 4 字节的标准形式和 2 字节的压缩形式 `c.ebreak`，由 `instructionLength` 判断：指令的低 2 位为 `0b11` 是 4 字节，否则是 2 字节。中断不需要调整 `sepc`。
 - **`syscall.dispatch` 在 `sepc += 4` 之后调用**，这样即使系统调用是 `exit`（不返回），状态也是一致的。
-- **`proc.kill` 和 `proc.exit` 不返回**：它们直接恢复 shell 的上下文，当前的 `TrapFrame` 和进程内核栈上的其他内容一起被丢弃（[process.md](process.md#结束进程)）。所以 Ctrl-C 检查放在中断处理（包括 PLIC 的 complete）全部完成之后。
+- **`proc.killCurrent` 和 `proc.exit` 不返回**：它们切回主循环，当前的 `TrapFrame` 和进程内核栈上的其他内容一起被丢弃（[process.md](process.md#结束进程)）。
+- **`proc.yield` 可能很久以后才返回**：别的进程会先运行。所以它放在中断处理（包括 PLIC 的 complete）全部完成之后，否则 PLIC 会一直以为串口中断还在处理中。`syscall.dispatch` 里的 `yield`、`sleep` 也一样，返回之后照常把返回值写进 `a0`：`frame` 在这个进程自己的内核栈上，切走期间没人动它。
+- 中断来自 S 模式（打断的是主循环）时不让出 CPU：那时没有进程在运行，主循环本来就是调度器。
 - 异常名来自 `Exception` 枚举的标签名（`std.enums.tagName`），不认识的编号显示为 `unknown`/`unknown exception`。
 
 ## 中断开关不变量
@@ -176,11 +178,12 @@ const from_user = frame.sstatus & riscv.sstatus_spp == 0;
 陷阱处理全程 `sstatus.SIE = 0`（硬件进陷阱时清零，`handleTrap` 里没有任何地方打开它），所以：
 
 - 不会有嵌套的陷阱，除非处理程序自己出了异常（那是内核 bug，会 panic）。
-- 系统调用都是关着中断执行的。将来如果要实现会阻塞的系统调用（比如等键盘输入），在里面打开中断时要想清楚嵌套陷阱的处理：嵌套的陷阱来自 S 模式，会压在当前内核栈上，这本身没问题，但要保证 `sscratch` 此时为 0（现在的代码满足）。
-- 用户程序运行期间，中断只可能打断 U 模式；shell 运行期间，中断只可能打断 shell 或 `wfi`。
+- 系统调用都是关着中断执行的。会阻塞的系统调用（`sleep`）不在里面开中断等，而是切回主循环，由主循环开着中断 `wfi`，等条件满足再调度回来。以后再加阻塞的调用也照这个办法做。
+- 进程切换（`proc.switchContext`）都发生在关中断时：主循环在关中断的那一段里调用 `proc.schedule`，进程这边是在陷阱处理程序里让出 CPU。
+- 中断只可能打断 U 模式，或者主循环（包括 shell 执行命令、`wfi`）开着中断的那一段。
 
 ## 扩展
 
 - **处理新的中断源**：在 PLIC 里使能它（`plic.init`），在 `handleExternal` 的 `switch` 里加一个分支。
 - **处理新的异常**：来自 U 模式的，加到 `from_user` 分支的 `switch` 里（比如以后实现按需分页，可以在这里处理缺页，而不是直接杀进程）；来自内核的，加到最后一个分支里。
-- **改 `TrapFrame`**：同时检查 `trapEntry`、`trapExit`、`proc.run` 里构造初始 `TrapFrame` 的代码和 `syscall.dispatch` 读参数的下标。
+- **改 `TrapFrame`**：同时检查 `trapEntry`、`trapExit`、`proc.spawn` 里构造初始 `TrapFrame` 的代码和 `syscall.dispatch` 读参数的下标。

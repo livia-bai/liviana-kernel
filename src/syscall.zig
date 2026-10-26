@@ -1,5 +1,6 @@
 //! 系统调用。用户程序执行 ecall 陷入内核后，handleTrap 把它交给 dispatch。
-//! 调用约定见 abi.zig。处理期间中断是关着的，系统调用都很短，不会长时间占着 CPU。
+//! 调用约定见 abi.zig。处理期间中断是关着的，系统调用都很短，不会长时间占着 CPU；
+//! yield 和 sleep 在里面切到别的进程，轮到这个进程时再从切走的地方返回。
 
 const abi = @import("abi.zig");
 const uart = @import("uart.zig");
@@ -18,8 +19,20 @@ pub fn dispatch(frame: *TrapFrame) usize {
         .write => write(args[0], args[1]),
         .getpid => proc.current.?.pid,
         .uptime => timer.uptimeMs(),
+        .yield => yield(),
+        .sleep => sleep(args[0]),
         _ => abi.fail(.nosys),
     };
+}
+
+fn yield() usize {
+    proc.yield();
+    return 0;
+}
+
+fn sleep(ms: usize) usize {
+    proc.sleep(ms);
+    return 0;
 }
 
 /// 用户内存先分块复制到内核缓冲区再输出，每块都经过 vm.copyFromUser 检查。

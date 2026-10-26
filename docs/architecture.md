@@ -37,7 +37,7 @@ QEMU `virt` 机器、`-m 128M` 时，和这个内核有关的物理地址如下�
 内核开启 Sv39 分页后，有两种地址空间：
 
 ```
-内核地址空间（vm.kernel_root）            用户进程的地址空间（每次 run 新建）
+内核地址空间（vm.kernel_root）            用户进程的地址空间（每个进程一个）
                                           
 0x0c00_0000  PLIC        RW- (G)          0x0c00_0000  PLIC        RW- (G)  ┐
 0x1000_0000  串口        RW- (G)          0x1000_0000  串口        RW- (G)  │ 和内核共用
@@ -60,13 +60,14 @@ main.zig ─┬─ uart.zig ──────────── 串口输出、
           ├─ sbi.zig ───────────── ecall 到 OpenSBI
           ├─ trap.zig ─┬─ timer.zig、plic.zig、uart.zig（中断）
           │            ├─ syscall.zig ─── abi.zig、vm.zig、proc.zig
-          │            └─ proc.zig（杀进程）
+          │            └─ proc.zig（让出 CPU、杀进程）
           ├─ dtb.zig ───────────── 设备树
           ├─ page.zig ──────────── 物理页
           ├─ vm.zig ────────────── 页表（用 page.zig 分配页表）
           ├─ plic.zig、timer.zig
+          ├─ proc.zig ──────────── 主循环调用 schedule 调度进程
           └─ shell.zig ─┬─ page.zig（mem 命令）
-                        └─ proc.zig ─── vm.zig、trap.zig（进出 U 模式）、build_options + 嵌入的用户程序
+                        └─ proc.zig ─── vm.zig、trap.zig（进入 U 模式）、timer.zig（sleep）、build_options + 嵌入的用户程序
 
 user/start.zig ─┬─ user/sys.zig ─── src/abi.zig（与内核共用的系统调用约定）
                 └─ user/<程序>.zig ─── user/sys.zig
@@ -82,18 +83,21 @@ user/start.zig ─┬─ user/sys.zig ─── src/abi.zig（与内核共用的
 
 **中断**（[trap.md](trap.md)、[devices.md](devices.md)）：硬件跳到 `trap.trapEntry` → 压 `TrapFrame` → `handleTrap` 按 `scause` 分发：时钟中断让 `ticks` 加 1 并预约下一次；外部中断向 PLIC 领取中断号，串口中断把字符搬进环形缓冲区 → `trapExit` 恢复寄存器、`sret`。
 
-**运行用户程序**（[process.md](process.md)）：shell 的 `run NAME` → `proc.run`：新建地址空间、加载 ELF、映射栈 → 在进程内核栈顶构造 `TrapFrame` → 保存 shell 的上下文 → 走 `trapExit` 进入 U 模式。
+**创建进程**（[process.md](process.md)）：shell 的 `run NAME` → `proc.spawn`：新建地址空间、加载 ELF、映射栈 → 在这个槽位的进程内核栈顶构造 `TrapFrame` → 放进进程表，状态 `ready`。不带 `&` 时 shell 等它结束才打印下一个提示符。
+
+**调度**（[process.md](process.md#调度)）：主循环没有键盘输入要处理时调用 `proc.schedule` → 轮流挑一个就绪的进程 → 切到它的地址空间 → `switchContext` 换到它的内核栈：新进程从 `trapExit` 进入 U 模式，老进程从上次让出 CPU 的地方继续。进程被中断打断（时钟每 10 ms 一次）、调用 `yield`/`sleep` 时 `switchContext` 回到主循环，主循环处理输入，再挑下一个。
 
 **系统调用**（[syscalls.md](syscalls.md)）：用户程序 `ecall` → `trapEntry` 通过 `sscratch` 换到内核栈 → `handleTrap` → `syscall.dispatch` → 返回值写进 `TrapFrame` 的 `a0` → `trapExit` 回到 U 模式。
 
-**进程结束**：`exit` 系统调用、U 模式下的任何其他异常、或者运行期间按 Ctrl-C → `proc.exit` / `proc.kill` 打印原因 → `switchBack` 恢复 shell 的上下文 → `proc.run` 像普通函数一样返回：切回内核页表，释放进程的全部内存 → 回到 shell。
+**进程结束**：`exit` 系统调用或 U 模式下的任何其他异常 → `proc.exit` / `proc.killCurrent` 打印原因，状态改成 `exited`，切回主循环 → `schedule` 切回内核页表，释放进程的全部内存。shell 的 `kill` 命令和对前台进程按的 Ctrl-C 由主循环直接调用 `proc.kill` 释放（那时进程没在运行）。
 
 ## 全局不变量
 
 改代码时要守住的几条约定，详细原因见各篇文档：
 
-- 内核在 S 模式时 `sscratch` 为 0；在 U 模式运行时 `sscratch` 存着进程内核栈顶（[trap.md](trap.md)）。
-- 陷阱处理和系统调用全程关着中断（`sstatus.SIE = 0`），所以中断只会打断 shell 或 U 模式，不会嵌套（[trap.md](trap.md)）。
+- 内核在 S 模式时 `sscratch` 为 0；在 U 模式运行时 `sscratch` 存着当前进程的内核栈顶（[trap.md](trap.md)）。
+- 陷阱处理和系统调用全程关着中断（`sstatus.SIE = 0`），所以中断只会打断主循环（含 shell）或 U 模式，不会嵌套（[trap.md](trap.md)）。
+- 进程切换只在关中断时发生，并且总是经过主循环：主循环 ↔ 进程，进程之间不直接切换（[process.md](process.md#切换上下文)）。
 - 用户程序只能用根页表第 1 项；内核的映射不能放进 `0x4000_0000..0x8000_0000`（[paging.md](paging.md)）。
 - 内核从不直接解引用用户给的指针，`sstatus.SUM` 始终为 0，访问用户内存一律走 `vm.copyFromUser`（[syscalls.md](syscalls.md)）。
 - `TrapFrame` 的布局和 `trapEntry`/`trapExit` 的汇编绑在一起；`proc.Context` 和 `proc.contextAsm` 绑在一起。

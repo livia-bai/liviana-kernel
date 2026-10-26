@@ -37,7 +37,7 @@ error: unable to call function with calling convention 'naked'
 
 裸函数（`callconv(.naked)`）没有序言和尾声，Zig 不允许从 Zig 代码直接调用。可行的办法：
 
-- **在内联汇编里 `call` 它**，并把调用者保存的寄存器（`ra`、`t0..t6`、`a0..a7`）和 memory 声明为 clobber（`proc.switchToUser` 的做法）。编译器只把它当作一段汇编，不对裸函数做任何假设。
+- **在内联汇编里 `call` 它**，并把调用者保存的寄存器（`ra`、`t0..t6`、`a0..a7`）和 memory 声明为 clobber（`proc.switchContext` 的做法）。编译器只把它当作一段汇编，不对裸函数做任何假设。
 - 或者 `@ptrCast` 成 `callconv(.c)` 的函数指针来调用。这也能编译、能工作，但**签名必须如实**：一个调用之后还会回来的裸函数如果声明成了 `noreturn`，编译器就会认为调用之后的代码永远不会执行，release 模式下把它们全部删掉。这个项目就因此出过一次只在 release 模式下出现的崩溃。
 
 ### `comptime @export` 和按需分析
@@ -81,6 +81,7 @@ error: unused argument in '...'
 ### 其他
 
 - `packed struct(u64)` 的字段从最低位开始排，用来描述硬件格式（页表项）很方便，编译器保证总宽度正好是 64 位。
-- 元组可以在运行时拼接：`.{ p.pid, p.name } ++ args`（`proc.kill` 用它把固定参数和调用者的参数合在一起交给 `print`）。
+- 元组可以在运行时拼接：`.{ p.pid, p.name } ++ args`（`proc.killCurrent` 用它把固定参数和调用者的参数合在一起交给 `print`）。
+- 数组重复运算符 `**` 已经没有了：`[_]T{x} ** n` 会报 `binary operator '*' has whitespace on one side, but not the other`（`**` 不再是一个运算符，被拆成了两个 `*`）。把同一个值铺满数组用 `@splat`：`var table: [8]Process = @splat(.{});`（`proc.table`）。
 - 编译期构造数组后要复制成 `const` 才能从块里返回：`const final = list; break :blk final;`（`proc.programs`）。
 - Debug 模式默认不做段回收（gc-sections），会把整个 compiler_rt 链接进来；需要小体积的产物（这里是要嵌进内核的用户程序）要显式设置 `link_gc_sections = true`。

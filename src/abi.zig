@@ -13,6 +13,10 @@ pub const Syscall = enum(usize) {
     getpid = 2,
     /// uptime() 返回开机以来的毫秒数
     uptime = 3,
+    /// yield() 让出 CPU，让别的就绪进程先运行，返回 0
+    yield = 4,
+    /// sleep(ms) 睡至少 ms 毫秒（按 10 ms 的 tick 向上取整），期间不占 CPU，返回 0
+    sleep = 5,
     _,
 };
 

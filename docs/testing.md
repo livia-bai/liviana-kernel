@@ -21,7 +21,7 @@ zig build test --summary all   # 显示通过了几个
 | `src/dtb.zig` | 用测试里的 `TestFdt` 按 FDT 格式拼一份设备树，检查解析出的内存、时钟频率、保留区；截断、魔数不对、缺少时钟频率时返回错误 |
 | `src/page.zig` | 先分配低地址、分配时清零、跳过保留区、内存用完时报 `OutOfMemory` |
 | `src/vm.zig` | 能用大页时用大页（比较用掉的页表数）；`copyFromUser` 只读得到 U 模式可读的用户页；释放用户空间后不漏页 |
-| `src/proc.zig` | 加载真正的用户程序 `hello`（`build.zig` 把用户程序的 ELF 也交给了单元测试）；拒绝截断、魔数不对、不是 RISC-V、程序头越界、没有权限的段 |
+| `src/proc.zig` | 加载真正的用户程序 `hello`（`build.zig` 把用户程序的 ELF 也交给了单元测试）；拒绝截断、魔数不对、不是 RISC-V、程序头越界、没有权限的段；调度器的 `pickNext` 轮流挑就绪的进程、跳过空槽位和没睡够的进程、到点唤醒 |
 | `src/abi.zig` | 系统调用返回值和错误码的互相转换 |
 
 为什么页表能在主机上测：内核对物理内存做了恒等映射，页表里的地址就是能直接用的指针。测试拿一块按 4 KiB 对齐的数组交给页分配器当作“物理内存”，页表就建在这块数组里，代码不用改。只有 `vm.activate` 这类写 CSR 的函数不能在主机上调用，测试也不会用到它们：Zig 只编译被用到的函数，所以这些文件里的 RISC-V 内联汇编不影响在主机上编译。
@@ -41,8 +41,9 @@ python3 tools/qemu_test.py --list         # 列出用例和它们覆盖的文件
 | 用例 | 做什么 | 覆盖的文件 |
 | --- | --- | --- |
 | `shell` | `help`、`uptime`、不认识的命令、`ebreak` | `src/shell.zig` |
-| `interrupts` | `spin` 在 U 模式死循环 0.5 秒，时钟中断至少来 10 次，Ctrl-C 能结束它；在 shell 里按的 Ctrl-C 不会误杀下一个程序 | `src/timer.zig`、`src/sbi.zig`、`src/plic.zig`、`src/proc.zig`、`user/spin.zig` |
+| `interrupts` | `spin` 在前台死循环 0.5 秒，时钟中断至少来 10 次，Ctrl-C 能结束它；在 shell 里按的 Ctrl-C 不会误杀下一个程序 | `src/timer.zig`、`src/sbi.zig`、`src/plic.zig`、`src/proc.zig`、`user/spin.zig` |
 | `user` | `hello`（系统调用、拒绝内核指针）、`fault`（读内核内存被杀）、`t_panic`、`t_time` | `src/proc.zig`、`src/syscall.zig`、`src/abi.zig`、`user/` 的运行时和程序 |
+| `sched` | 两个后台 `spin` 死循环时，前台的 `hello`、`t_sleep` 照样跑完；0.5 秒里两个 `spin` 各自至少拿到 5 个 tick（`ps` 的 `TICKS`）；Ctrl-C 只结束前台进程；后台的 `ticker` 在 `ps` 里是 `sleeping`；`kill` 正常的、不存在的、缺参数的 pid；开满 8 个进程后再 `run` 报 `too many processes` | `src/proc.zig`、`src/shell.zig`、`src/syscall.zig`、`src/abi.zig`、`src/timer.zig`、`user/sys.zig`、`user/spin.zig`、`user/ticker.zig`、`user/hello.zig`、`user/tests/t_sleep.zig` |
 | `syscall` | `t_sys`：`write` 的各种边界情况、不存在的调用号 | `src/syscall.zig`、`src/abi.zig`、`user/sys.zig` |
 | `protection` | `t_wx`、`t_stack`、`t_priv`、`t_fp`、`t_noperm`：硬件和加载器的各种保护 | `src/proc.zig`、`user/linker.ld`、对应的测试程序 |
 | `panic` | `crash` 之后检查 panic 信息，并检查停机后 1 秒内 QEMU 用掉的 CPU 时间不超过一半（读 `/proc`，只能在 Linux 上运行） | 只由核心文件触发 |
@@ -74,6 +75,7 @@ FAIL  safe   shell       4 checks
 | `t_priv` | U 模式执行 `csrr sstatus` | `illegal_instruction`，进程被杀 |
 | `t_fp` | U 模式执行浮点指令 `fmv.d.x f1, a0`（手工编码） | `illegal_instruction`，`stval=0xf20500d3`（`sstatus.FS = Off`） |
 | `t_panic` | 整数溢出 | Debug/safe：`panic: integer overflow`，退出码 255；fast/small 没有检查，回绕成 4 |
+| `t_sleep` | `sleep(200)` 前后的 `uptime()`；`sleep(0)`、`yield()` | 睡了 200..1000 ms（按 tick 算至少 200）；之后打印 `yield ok`，退出码 0 |
 | `t_time` | U 模式执行 `rdtime` | 正常返回（`scounteren` 允许，见 [user-programs.md](user-programs.md#写一个新程序)） |
 | `t_noperm` | 数据段 `FLAGS(0)` 的 ELF（用 `user/tests/noperm.ld` 链接） | `run: cannot load t_noperm: BadElf` |
 
@@ -118,7 +120,7 @@ gdb-multiarch -q -ex 'set architecture riscv:rv64' -ex 'file zig-out/bin/kernel'
 之后就是普通的 GDB。实际用过的命令：
 
 ```
-(gdb) break vm.init                 # Zig 的函数名是“文件名.函数名”：main.kmain、vm.init、proc.switchToUser、syscall.dispatch
+(gdb) break vm.init                 # Zig 的函数名是“文件名.函数名”：main.kmain、vm.init、proc.schedule、syscall.dispatch
 (gdb) continue
 (gdb) bt 3
 #0  vm.init (memory=...) at src/vm.zig:73
@@ -167,7 +169,7 @@ dtc -I dtb -O dts virt.dtb
 | 症状 | 可能的原因 | 怎么查 |
 | --- | --- | --- |
 | `run` 一个程序就 `killed: instruction_page_fault at 0x0, stval=0x0` | 用户 ELF 的入口是 0：`_start` 没有导出（release 模式下尤其要注意） | `llvm-readelf -h` 看 `Entry point`；`_start` 必须在根文件 `user/start.zig` 里 |
-| 进程结束后 `KERNEL PANIC: page.free: 0x.. was not handed out by the page allocator` | `switchBack` 回到 `run` 之后状态不对：典型的是调用 `switchToUser` 之后的代码被优化掉了 | 只在 release 模式出现时，怀疑 `noreturn`、clobber、`volatile`；对照 `llvm-objdump -d` 看 `proc.run` |
+| 进程结束后 `KERNEL PANIC: page.free: 0x.. was not handed out by the page allocator` | 切回主循环之后状态不对：典型的是调用 `switchContext` 之后的代码被优化掉了（单进程版本出过一次） | 只在 release 模式出现时，怀疑 `noreturn`、clobber、`volatile`；对照 `llvm-objdump -d` 看 `proc.schedule` |
 | 内核 `store_page_fault`，`stval` 在内核的代码或只读数据里 | 往只读段写了数据（W^X 生效了） | 用 `llvm-nm` 查 `stval` 落在哪个符号 |
 | 内核 `load_page_fault`，`stval` 很小或是 0 | 空指针解引用（`crash` 命令就是这样） | `sepc` 对应的源码行：GDB 里 `info line *0x...` |
 | 内核 `load/store_page_fault`，`stval` 在 `0x4000_0000..0x8000_0000` | 内核直接解引用了用户指针（`SUM` 是 0） | 改成 `vm.copyFromUser` |

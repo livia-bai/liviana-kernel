@@ -84,7 +84,7 @@ const UserProgram = struct {
     dir: []const u8 = "user",
     linker_script: []const u8 = "user/linker.ld",
 };
-const user_programs = [_]UserProgram{ .{ .name = "hello" }, .{ .name = "fault" }, .{ .name = "spin" } };
+const user_programs = [_]UserProgram{ .{ .name = "hello" }, .{ .name = "fault" }, .{ .name = "spin" }, .{ .name = "ticker" } };
 const test_programs = [_]UserProgram{
     .{ .name = "t_sys", .dir = "user/tests" },
     // ……
@@ -95,7 +95,7 @@ const all_programs = user_programs ++ test_programs;
 const programs: []const UserProgram = if (with_tests) &all_programs else &user_programs;
 ```
 
-`-Dtest-programs=true` 时，`user/tests/` 里的回归测试程序也编进内核，`tools/qemu_test.py` 会自动加上这个选项（[testing.md](testing.md#回归测试程序)）；平时不加，`run` 列表里只有三个演示程序。
+`-Dtest-programs=true` 时，`user/tests/` 里的回归测试程序也编进内核，`tools/qemu_test.py` 会自动加上这个选项（[testing.md](testing.md#回归测试程序)）；平时不加，`run` 列表里只有四个演示程序。
 
 对每个程序的构建代码：
 
@@ -166,6 +166,7 @@ pub const user_programs: []const []const u8 = &[_][]const u8{
     "hello",
     "fault",
     "spin",
+    "ticker",
 };
 ```
 

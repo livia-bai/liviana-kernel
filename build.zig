@@ -36,7 +36,7 @@ pub fn build(b: *std.Build) void {
         dir: []const u8 = "user",
         linker_script: []const u8 = "user/linker.ld",
     };
-    const user_programs = [_]UserProgram{ .{ .name = "hello" }, .{ .name = "fault" }, .{ .name = "spin" } };
+    const user_programs = [_]UserProgram{ .{ .name = "hello" }, .{ .name = "fault" }, .{ .name = "spin" }, .{ .name = "ticker" } };
     const test_programs = [_]UserProgram{
         .{ .name = "t_sys", .dir = "user/tests" },
         .{ .name = "t_wx", .dir = "user/tests" },
@@ -45,6 +45,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "t_panic", .dir = "user/tests" },
         .{ .name = "t_time", .dir = "user/tests" },
         .{ .name = "t_fp", .dir = "user/tests" },
+        .{ .name = "t_sleep", .dir = "user/tests" },
         // 数据段没有任何权限，用来验证 ELF 加载器会拒绝它
         .{ .name = "t_noperm", .dir = "user/tests", .linker_script = "user/tests/noperm.ld" },
     };

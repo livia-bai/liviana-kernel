@@ -10,7 +10,7 @@ liviana-kernel 的详细文档，按功能组织，讲这个用 Zig 写的 RISC-
 | --- | --- |
 | [architecture.md](architecture.md) | 总体结构：特权级、物理内存布局、虚拟地址空间、模块关系、主要控制流、全局不变量 |
 | [build.md](build.md) | 构建系统：目标平台、优化模式、用户程序的编译和嵌入、QEMU 运行步骤 |
-| [boot.md](boot.md) | 启动流程：OpenSBI 交接、链接脚本、`_start`、`kmain` 的初始化顺序、主循环、panic 处理 |
+| [boot.md](boot.md) | 启动流程：OpenSBI 交接、链接脚本、`_start`、`kmain` 的初始化顺序、主循环（兼调度器）、panic 处理 |
 | [riscv-sbi.md](riscv-sbi.md) | CSR 访问和 SBI 调用 |
 | [trap.md](trap.md) | 陷阱处理：异常委托、`TrapFrame`、`sscratch` 约定、入口/出口汇编、分发 |
 | [devices.md](devices.md) | 串口（含输入缓冲区和 Ctrl-C）、PLIC、定时器 |
@@ -18,9 +18,9 @@ liviana-kernel 的详细文档，按功能组织，讲这个用 Zig 写的 RISC-
 | [page-allocator.md](page-allocator.md) | 物理页分配器 |
 | [paging.md](paging.md) | Sv39 分页：页表格式、建立映射、内核页表、用户地址空间 |
 | [user-programs.md](user-programs.md) | 用户程序：运行时（`start.zig`、`sys.zig`）、示例程序、怎么写新程序 |
-| [process.md](process.md) | 进程：ELF 加载器、进出 U 模式、结束进程、Ctrl-C |
+| [process.md](process.md) | 进程：进程表、ELF 加载器、调度、切换上下文、结束进程、Ctrl-C |
 | [syscalls.md](syscalls.md) | 系统调用：调用约定、调用列表、访问用户内存、怎么加新调用 |
-| [shell.md](shell.md) | shell：输入处理、命令 |
+| [shell.md](shell.md) | shell：输入处理、前台和后台进程、命令 |
 | [testing.md](testing.md) | 测试与调试：单元测试、QEMU 测试（`tools/qemu_test.py`）、回归测试程序、QEMU 日志、GDB、症状速查 |
 | [zig-0.17.md](zig-0.17.md) | Zig 0.17 和旧版本的差别，以及这个项目里踩过的坑 |
 
@@ -30,7 +30,7 @@ liviana-kernel 的详细文档，按功能组织，讲这个用 Zig 写的 RISC-
 | --- | --- | --- |
 | `build.zig` | [build.md](build.md) | [user-programs.md](user-programs.md) |
 | `linker.ld` | [boot.md](boot.md#链接脚本) | [paging.md](paging.md#内核页表) |
-| `src/main.zig` | [boot.md](boot.md) | |
+| `src/main.zig` | [boot.md](boot.md) | [process.md](process.md#调度) |
 | `src/riscv.zig` | [riscv-sbi.md](riscv-sbi.md) | |
 | `src/sbi.zig` | [riscv-sbi.md](riscv-sbi.md#sbi-调用sbizig) | [devices.md](devices.md#定时器timerzig) |
 | `src/trap.zig` | [trap.md](trap.md) | [process.md](process.md)、[syscalls.md](syscalls.md) |
@@ -47,7 +47,7 @@ liviana-kernel 的详细文档，按功能组织，讲这个用 Zig 写的 RISC-
 | `user/start.zig` | [user-programs.md](user-programs.md#startzig) | |
 | `user/sys.zig` | [user-programs.md](user-programs.md#syszig) | [syscalls.md](syscalls.md#用户态封装) |
 | `user/linker.ld` | [build.md](build.md#用户程序的链接脚本) | [process.md](process.md#elf-加载器) |
-| `user/hello.zig`、`user/fault.zig`、`user/spin.zig` | [user-programs.md](user-programs.md#示例程序) | |
+| `user/hello.zig`、`user/fault.zig`、`user/spin.zig`、`user/ticker.zig` | [user-programs.md](user-programs.md#示例程序) | |
 | `user/tests/*.zig`、`user/tests/noperm.ld` | [testing.md](testing.md#回归测试程序) | [build.md](build.md#用户程序) |
 | `src/tests.zig` | [testing.md](testing.md#单元测试zig-build-test) | [build.md](build.md#单元测试) |
 | `tools/qemu_test.py` | [testing.md](testing.md#qemu-测试toolsqemu_testpy) | |

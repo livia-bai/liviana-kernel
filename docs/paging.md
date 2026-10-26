@@ -157,7 +157,7 @@ pub fn activate(root: *PageTable) void {
 - `satp` = MODE（最高 4 位，8 = Sv39）| ASID（第 44..59 位，这里一直是 0）| 根页表的物理页号。
 - 规范规定写 `satp` 本身不保证之前对页表的修改已经生效，也不会作废 TLB。所以写之前和之后各执行一次 `sfence.vma`：之前的那次保证页表的写入对页表遍历可见，之后的那次作废旧地址空间留在 TLB 里的翻译。
 - 没有使用 ASID，所有地址空间都是 ASID 0，所以每次切换都要作废整个 TLB。内核映射带 G 位，规范允许实现保留它们，但不带参数的 `sfence.vma` 会连全局项一起作废，这里也没有依赖这个优化。
-- `vm.init` 最后调用 `activate(kernel_root)` 打开分页；`proc.run` 在进入用户程序前切到进程的地址空间，进程结束后切回 `kernel_root`。
+- `vm.init` 最后调用 `activate(kernel_root)` 打开分页；`proc.schedule` 每次切到进程前切到它的地址空间，进程让出 CPU 后切回 `kernel_root`（回收进程的页表之前必须先切走）。
 
 ## 用户地址空间
 

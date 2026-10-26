@@ -1,5 +1,9 @@
-//! 用户进程。一次只运行一个：shell 的 run 命令调用 run()，它把程序装进一个新的地址空间，
-//! 切到 U 模式执行，直到程序调用 exit、出了异常或者被 Ctrl-C 打断，再回到 shell。
+//! 用户进程和调度。进程表里最多 max_procs 个进程，每个有自己的地址空间、内核栈和保存的内核上下文。
+//!
+//! 调度器就是内核的主循环（main.zig），它在启动栈上运行，每一轮调用 schedule() 挑一个就绪的进程
+//! 切过去。进程在 U 模式运行，直到下一次中断（时钟每 10 ms 一次，所以时间片是一个 tick）、
+//! 调用 yield/sleep、exit，或者出了异常，再切回主循环。主循环在两个时间片之间处理键盘输入，
+//! 所以有进程在跑时 shell 照样能用。
 //!
 //! 用户地址空间（都在 vm.user_base..vm.user_end 之内）：
 //!   0x4000_0000 起    程序的各个段（user/linker.ld），按段设置 R/W/X，都带 U 位
@@ -15,6 +19,7 @@ const uart = @import("uart.zig");
 const page = @import("page.zig");
 const vm = @import("vm.zig");
 const trap = @import("trap.zig");
+const timer = @import("timer.zig");
 
 pub const Program = struct {
     name: []const u8,
@@ -40,21 +45,44 @@ const stack_size = 16 * 1024;
 const stack_top = vm.user_end;
 const stack_bottom = stack_top - stack_size;
 
-pub const Process = struct {
-    pid: usize,
-    name: []const u8,
-    space: *vm.PageTable,
+pub const max_procs = 8;
+
+pub const State = enum {
+    unused,
+    /// 等着被调度
+    ready,
+    /// 正在 CPU 上运行（current 指向它）
+    running,
+    /// 调用了 sleep，timer.ticks 到 wake_tick 之后回到 ready
+    sleeping,
+    /// 调用了 exit 或者被杀，等调度器回收
+    exited,
 };
 
-/// 正在运行的进程，没有时为 null。
-pub var current: ?Process = null;
+pub const Process = struct {
+    state: State = .unused,
+    pid: usize = 0,
+    name: []const u8 = "",
+    space: *vm.PageTable = undefined,
+    /// 不在运行时，它的内核上下文保存在这里（见 switchContext）
+    context: Context = undefined,
+    wake_tick: u64 = 0,
+    /// 在 U 模式运行期间来过的时钟中断数，大致就是用掉的 CPU 时间（单位 10 ms）
+    ticks: u64 = 0,
+};
+
+/// 进程表。槽位 i 的进程用 kernel_stacks[i] 作内核栈。
+pub var table: [max_procs]Process = @splat(.{});
+
+/// 正在运行的进程。在主循环里（调度器、shell）时为 null。
+pub var current: ?*Process = null;
 var next_pid: usize = 1;
 
-/// 进程陷入内核时用的栈。一次只有一个进程，一块静态的栈就够了。
+/// 每个进程陷入内核时用的栈，静态分配：页分配器只能一页一页地给，给不出连续的 16 KiB。
 /// 实测最深的路径（Debug 模式下杀进程时格式化输出）用了不到 4 KiB。
-var kernel_stack: [16 * 1024]u8 align(16) = undefined;
+var kernel_stacks: [max_procs][16 * 1024]u8 align(16) = undefined;
 
-/// 进入 U 模式前保存的内核上下文。按 C 调用约定，跨函数调用需要保持不变的只有
+/// 切换时保存的内核上下文。按 C 调用约定，跨函数调用需要保持不变的只有
 /// ra、sp 和 s0..s11，其他寄存器调用方本来就不指望它们保持原值。
 const Context = extern struct {
     ra: usize,
@@ -62,77 +90,156 @@ const Context = extern struct {
     s: [12]usize,
 };
 
-/// 进程结束时从这里恢复，回到 run() 里。
-var shell_context: Context = undefined;
+/// 调度器（主循环）切到进程时保存的上下文，进程让出 CPU 时切回这里。
+var scheduler_context: Context = undefined;
+/// 上一次运行的槽位，下一次从它后面开始找，这样就绪的进程轮流运行。
+var last_slot: usize = max_procs - 1;
 
-/// 加载并运行一个用户程序，等它结束后返回。
-pub fn run(program: *const Program) void {
-    const space = vm.createUserSpace() catch {
-        uart.write("run: out of memory\n");
-        return;
-    };
-    defer vm.destroyUserSpace(space);
-    const entry = load(space, program.image) catch |err| {
-        uart.print("run: cannot load {s}: {s}\n", .{ program.name, @errorName(err) });
-        return;
-    };
+pub const SpawnError = error{ TooManyProcesses, OutOfMemory, BadElf };
 
-    current = .{ .pid = next_pid, .name = program.name, .space = space };
-    next_pid += 1;
-    defer current = null;
+/// 加载一个用户程序，放进进程表，状态为 ready，返回 pid。由 shell 调用，真正开始运行要等主循环调度到它。
+pub fn spawn(program: *const Program) SpawnError!usize {
+    const slot = for (&table, 0..) |*p, i| {
+        if (p.state == .unused) break i;
+    } else return error.TooManyProcesses;
+    const space = try vm.createUserSpace();
+    errdefer vm.destroyUserSpace(space);
+    const entry = try load(space, program.image);
 
     // 进入 U 模式的初始状态：除了 sp 以外寄存器全为 0，从 ELF 的入口地址开始执行。
     // trapExit 要求 TrapFrame 正好在内核栈顶下面（见 trap.trapExit）。
-    const frame: *trap.TrapFrame = @ptrCast(@alignCast(kernel_stack[kernel_stack.len - @sizeOf(trap.TrapFrame) ..]));
-    frame.* = .{ .regs = @splat(0), .sepc = entry, .sstatus = undefined };
+    const stack = &kernel_stacks[slot];
+    const frame: *trap.TrapFrame = @ptrCast(@alignCast(stack[stack.len - @sizeOf(trap.TrapFrame) ..]));
+    frame.* = .{
+        .regs = @splat(0),
+        .sepc = entry,
+        // SPP = 0：sret 回到 U 模式；SPIE = 1：回到 U 模式后打开中断，时钟和键盘照常工作。
+        // SIE 必须清掉：shell 是开着中断调用这里的，trapExit 一开始就写回 sstatus，
+        // SIE = 1 的话恢复寄存器的途中就可能被中断打断
+        .sstatus = (riscv.read(.sstatus) & ~(riscv.sstatus_spp | riscv.sstatus_sie)) | riscv.sstatus_spie,
+    };
     frame.regs[2] = stack_top;
 
-    // 切换期间不能被中断打断：中断处理程序会看到一半新一半旧的 sscratch 和 sstatus
-    const interrupts_were_on = riscv.read(.sstatus) & riscv.sstatus_sie != 0;
-    riscv.disableInterrupts();
-    // SPP = 0：sret 回到 U 模式；SPIE = 1：回到 U 模式后打开中断，时钟和键盘照常工作
-    frame.sstatus = (riscv.read(.sstatus) & ~riscv.sstatus_spp) | riscv.sstatus_spie;
-    _ = uart.takeCtrlC(); // 忽略运行之前按下的 Ctrl-C
+    // 第一次被调度时，switchContext 恢复这个上下文后 ret 到 trapExit，sp 正指向初始 TrapFrame
+    table[slot] = .{
+        .state = .ready,
+        .pid = next_pid,
+        .name = program.name,
+        .space = space,
+        .context = .{ .ra = @intFromPtr(&trap.trapExit), .sp = @intFromPtr(frame), .s = @splat(0) },
+    };
+    next_pid += 1;
+    return table[slot].pid;
+}
 
-    vm.activate(space);
-    switchToUser(frame); // 进程结束后才从这里返回
+/// 调度一次：挑一个就绪的进程，切到它的地址空间运行，等它让出 CPU、睡眠或者结束再返回 true。
+/// 没有就绪的进程时返回 false。只由主循环调用，调用时中断必须是关着的。
+pub fn schedule() bool {
+    std.debug.assert(current == null);
+    const slot = pickNext(&table, last_slot, timer.ticks) orelse return false;
+    last_slot = slot;
+    const p = &table[slot];
+    p.state = .running;
+    current = p;
+    vm.activate(p.space);
+    switchContext(&scheduler_context, &p.context);
+    // 进程让出了 CPU。先切回内核页表，回收进程时才能释放它的页表
     vm.activate(vm.kernel_root);
+    current = null;
+    if (p.state == .exited) release(p);
+    return true;
+}
 
-    if (interrupts_were_on) riscv.enableInterrupts();
+/// 从 last 的下一个槽位开始轮着找，返回第一个就绪的进程的槽位。睡够了的进程先改回 ready。
+fn pickNext(procs: []Process, last: usize, now: u64) ?usize {
+    for (procs) |*p| {
+        if (p.state == .sleeping and now >= p.wake_tick) p.state = .ready;
+    }
+    for (1..procs.len + 1) |k| {
+        const i = (last + k) % procs.len;
+        if (procs[i].state == .ready) return i;
+    }
+    return null;
+}
+
+/// 当前进程让出 CPU，回到调度器；下次轮到它时从这里返回。由陷阱处理程序调用（关着中断）。
+pub fn yield() void {
+    const p = current.?;
+    p.state = .ready;
+    switchContext(&p.context, &scheduler_context);
+}
+
+/// 当前进程睡 ms 毫秒（按 tick 向上取整），期间不会被调度。
+pub fn sleep(ms: u64) void {
+    const p = current.?;
+    p.wake_tick = timer.ticks +| (ms *| timer.tick_hz +| 999) / 1000;
+    p.state = .sleeping;
+    switchContext(&p.context, &scheduler_context);
 }
 
 /// 当前进程调用了 exit。由系统调用处理程序调用，不返回。
 pub fn exit(code: u8) noreturn {
     const p = current.?;
     uart.print("[proc] pid {d} ({s}) exited with code {d}\n", .{ p.pid, p.name, code });
-    switchBack(&shell_context);
+    finish(p);
 }
 
 /// 强行结束当前进程。由陷阱处理程序调用，不返回。
-pub fn kill(comptime reason: []const u8, args: anytype) noreturn {
+pub fn killCurrent(comptime reason: []const u8, args: anytype) noreturn {
     const p = current.?;
     uart.print("[proc] pid {d} ({s}) killed: " ++ reason ++ "\n", .{ p.pid, p.name } ++ args);
-    switchBack(&shell_context);
+    finish(p);
 }
 
-/// 保存当前的内核上下文到 shell_context，然后用 frame 进入 U 模式。进程结束时
-/// switchBack 恢复这里保存的上下文，于是看起来就像这个函数刚刚返回。
+/// 回到调度器，由它回收这个进程。进程正在用自己的内核栈和地址空间，不能自己释放。
+fn finish(p: *Process) noreturn {
+    p.state = .exited;
+    switchContext(&p.context, &scheduler_context);
+    unreachable; // 调度器不会再切回已经结束的进程
+}
+
+/// 结束进程 pid。由 shell 调用：这时 CPU 在主循环里，没有进程在运行，
+/// 它停在内核栈上的状态直接丢掉就行。找不到这个进程时返回 false。
+pub fn kill(pid: usize, comptime reason: []const u8) bool {
+    std.debug.assert(current == null);
+    const p = findPid(pid) orelse return false;
+    uart.print("[proc] pid {d} ({s}) killed: " ++ reason ++ "\n", .{ p.pid, p.name });
+    release(p);
+    return true;
+}
+
+pub fn findPid(pid: usize) ?*Process {
+    for (&table) |*p| {
+        if (p.state != .unused and p.pid == pid) return p;
+    }
+    return null;
+}
+
+/// 释放进程的地址空间（所有用户页和页表），腾出槽位。内核栈是静态的，留给下一个用这个槽位的进程。
+fn release(p: *Process) void {
+    vm.destroyUserSpace(p.space);
+    p.* = .{};
+}
+
+/// 把当前的内核上下文保存到 from，再恢复 to 里保存的上下文：恢复出来的 ra、sp 是别处
+/// 调用 switchContext 时留下的，所以执行从那次调用之后继续。对这里的调用者来说，
+/// 要等到别人切回 from 时，这个函数才“返回”。
 ///
-/// 实际的切换在裸函数 switchToUserNaked 里。Zig 不允许直接调用裸函数，这里在内联汇编里
+/// 实际的切换在裸函数 switchNaked 里。Zig 不允许直接调用裸函数，这里在内联汇编里
 /// call 它：对编译器来说这只是一段会破坏若干寄存器的汇编，它不会对裸函数做任何假设。
 /// （如果转成函数指针来调，签名就必须写对：这个调用是会返回的，声明成 noreturn 的话，
 /// 编译器会把调用之后的代码全部删掉，release 模式下就出过这个问题。）
 /// 按 C 调用约定，调用者保存的寄存器在调用前后可能变化，所以都声明为被破坏；
-/// ra、sp、s0..s11 由 switchToUserNaked 保存、switchBack 恢复，保持不变。
-fn switchToUser(frame: *trap.TrapFrame) void {
+/// ra、sp、s0..s11 由 switchNaked 保存和恢复，保持不变。
+fn switchContext(from: *Context, to: *const Context) void {
     asm volatile (
-        \\mv a0, %[frame]
-        \\mv a1, %[ctx]
-        \\call %[switchToUserNaked]
+        \\mv a0, %[from]
+        \\mv a1, %[to]
+        \\call %[switchNaked]
         :
-        : [frame] "r" (frame),
-          [ctx] "r" (&shell_context),
-          [switchToUserNaked] "X" (&switchToUserNaked),
+        : [from] "r" (from),
+          [to] "r" (to),
+          [switchNaked] "X" (&switchNaked),
         : .{
           .ra = true,
           .t0 = true,
@@ -154,25 +261,10 @@ fn switchToUser(frame: *trap.TrapFrame) void {
         });
 }
 
-/// a0 = frame，a1 = ctx。最后跳进 trapExit，自己的函数体不会走到结尾，所以是 noreturn；
-/// 只从 switchToUser 的内联汇编里调用。
-fn switchToUserNaked() callconv(.naked) noreturn {
-    asm volatile (contextAsm("sd", "a1") ++
-            \\mv sp, a0
-            \\tail %[trapExit]
-        :
-        : [trapExit] "X" (&trap.trapExit),
-    );
-}
-
-/// 恢复 switchToUser 保存的内核上下文，从 switchToUser 里的 call 之后继续执行。
-/// 进程陷入内核以来用过的那段内核栈直接丢弃。
-fn switchBack(ctx: *const Context) noreturn {
-    asm volatile (contextAsm("ld", "a0") ++ "ret\n"
-        :
-        : [ctx] "{a0}" (ctx),
-    );
-    unreachable;
+/// a0 = from，a1 = to。最后的 ret 跳到恢复出来的 ra，不会走到函数体结尾，所以是 noreturn；
+/// 只从 switchContext 的内联汇编里调用。
+fn switchNaked() callconv(.naked) noreturn {
+    asm volatile (contextAsm("sd", "a0") ++ contextAsm("ld", "a1") ++ "ret\n");
 }
 
 /// 在编译期生成保存/恢复 Context 里 14 个寄存器的指令，base 是存放 Context 地址的寄存器。
@@ -292,4 +384,29 @@ test "ELF 加载器拒绝坏文件" {
     try std.testing.expectError(error.BadElf, testLoad(image));
     // 数据段 R/W/X 全为 0（用 user/tests/noperm.ld 链接的）
     try std.testing.expectError(error.BadElf, testLoad(@embedFile("t_noperm")));
+}
+
+test "调度器轮流挑就绪的进程，睡够了的进程醒来" {
+    const expectEqual = std.testing.expectEqual;
+    var procs: [4]Process = @splat(.{});
+    procs[0].state = .ready;
+    procs[1].state = .sleeping;
+    procs[1].wake_tick = 10;
+    procs[3].state = .ready;
+
+    // 从上次运行的槽位后面开始找，跳过空槽位和还在睡的进程，绕回开头
+    try expectEqual(3, pickNext(&procs, 0, 5));
+    try expectEqual(0, pickNext(&procs, 3, 5));
+    try expectEqual(.sleeping, procs[1].state);
+    // 到了 wake_tick，1 号醒来，紧跟在 0 号后面被选中
+    try expectEqual(1, pickNext(&procs, 0, 10));
+    try expectEqual(.ready, procs[1].state);
+
+    // 只有一个就绪的进程时总是选它（包括刚运行完的那个）；没有就绪的返回 null
+    procs[0].state = .unused;
+    procs[1].state = .exited;
+    try expectEqual(3, pickNext(&procs, 3, 10));
+    procs[3].state = .sleeping;
+    procs[3].wake_tick = std.math.maxInt(u64);
+    try expectEqual(null, pickNext(&procs, 3, 1000));
 }

@@ -106,7 +106,7 @@ fn trapEntry() align(4) callconv(.naked) noreturn {
 }
 
 /// 按 sp 指向的 TrapFrame 恢复上下文，执行 sret 回到被打断的地方。
-/// 除了陷阱返回，proc.switchToUser 也从这里第一次进入 U 模式。
+/// 除了陷阱返回，新进程第一次被调度时也从这里进入 U 模式（见 proc.spawn）。
 ///
 /// 先写回 sstatus：其中 SIE 为 0，之后不会再被中断打断；SPP 决定 sret 回到哪个特权级。
 /// 如果要回到 U 模式，把这个 TrapFrame 的上沿（也就是内核栈顶）存进 sscratch，
@@ -141,17 +141,19 @@ fn handleTrap(frame: *TrapFrame) callconv(.c) void {
     if (is_interrupt) {
         const interrupt: Interrupt = @fromBackingInt(code);
         switch (interrupt) {
-            .supervisor_timer => timer.onInterrupt(),
+            .supervisor_timer => {
+                timer.onInterrupt();
+                if (from_user) proc.current.?.ticks += 1;
+            },
             .supervisor_external => handleExternal(),
             else => std.debug.panic("unexpected interrupt {d}", .{code}),
         }
-        // 用户程序就算在 U 模式里死循环，时钟和串口中断也会把 CPU 交回内核，
-        // 这时检查用户有没有按 Ctrl-C。（运行用户程序期间，内核代码都是关着中断执行的，
-        // 所以中断只可能打断 U 模式。）
-        if (from_user and uart.takeCtrlC()) {
-            uart.write("^C\n");
-            proc.kill("interrupted by Ctrl-C", .{});
-        }
+        // 用户程序就算在 U 模式里死循环，时钟和串口中断也会把 CPU 交回内核。打断的是用户程序时，
+        // 让它让出 CPU 回到主循环：时钟中断说明时间片用完了，该轮到别的进程；串口中断说明有输入，
+        // 主循环要把它交给 shell、检查 Ctrl-C。下次轮到它时 yield 返回，经 trapExit 回到 U 模式。
+        // （进程运行期间，内核代码都是关着中断执行的，所以中断打断的要么是 U 模式，要么是主循环。）
+        // 放在中断处理（包括 PLIC 的 complete）全部完成之后：yield 可能很久以后才返回。
+        if (from_user) proc.yield();
     } else if (from_user) {
         const exception: Exception = @fromBackingInt(code);
         switch (exception) {
@@ -162,7 +164,7 @@ fn handleTrap(frame: *TrapFrame) callconv(.c) void {
             },
             // 其他异常都是用户程序自己的错：访问了没有映射或没有权限的地址、执行了非法指令等等。
             // 结束这个进程，内核照常运行。
-            else => proc.kill("{s} at 0x{x}, stval=0x{x}", .{
+            else => proc.killCurrent("{s} at 0x{x}, stval=0x{x}", .{
                 std.enums.tagName(Exception, exception) orelse "unknown exception",
                 frame.sepc,
                 riscv.read(.stval),

@@ -37,6 +37,16 @@ pub fn uptime() u64 {
     return syscall(.uptime, 0, 0);
 }
 
+/// 让出 CPU，让别的进程先运行。
+pub fn yield() void {
+    _ = syscall(.yield, 0, 0);
+}
+
+/// 睡至少 ms 毫秒（精度 10 ms），期间不占 CPU。
+pub fn sleep(ms: u64) void {
+    _ = syscall(.sleep, ms, 0);
+}
+
 // 和内核的 uart.zig 一样，接入 std.Io.Writer，用标准库做格式化，输出走 write 系统调用
 var writer: std.Io.Writer = .{
     .vtable = &.{ .drain = drain },

@@ -25,6 +25,8 @@ pub const Syscall = enum(usize) {
     write = 1,
     getpid = 2,
     uptime = 3,
+    yield = 4,
+    sleep = 5,
     _,
 };
 
@@ -46,10 +48,12 @@ pub fn errnoOf(ret: usize) ?Errno      // 返回值在 [-4095, -1] 内时取出�
 
 | 号 | 调用 | 参数 | 返回 | 说明 |
 | --- | --- | --- | --- | --- |
-| 0 | `exit` | `a0` = 退出码 | 不返回 | 只取低 8 位（`@truncate` 成 `u8`）。打印 `[proc] pid N (NAME) exited with code C`，回到 shell |
+| 0 | `exit` | `a0` = 退出码 | 不返回 | 只取低 8 位（`@truncate` 成 `u8`）。打印 `[proc] pid N (NAME) exited with code C`，进程被回收（[process.md](process.md#结束进程)） |
 | 1 | `write` | `a0` = 用户缓冲区地址，`a1` = 长度 | 写出的字节数，或 `-14` | 把用户内存里的字节输出到串口，详见下文 |
-| 2 | `getpid` | 无 | 进程号 | 从 1 开始，每次 `run` 加 1 |
+| 2 | `getpid` | 无 | 进程号 | 从 1 开始，每启动一个进程加 1，不复用 |
 | 3 | `uptime` | 无 | 开机以来的毫秒数 | `timer.uptimeMs()`，精度 10 ms（一个时钟 tick） |
+| 4 | `yield` | 无 | 0 | 让出 CPU：回到主循环，别的就绪进程先运行，轮到它时返回。没有别的就绪进程时很快就会返回 |
+| 5 | `sleep` | `a0` = 毫秒数 | 0 | 睡至少 `a0` 毫秒（按 10 ms 的 tick 向上取整），期间不被调度、不占 CPU。`0` 相当于 `yield` |
 | 其他 | | | `-38`（ENOSYS） | |
 
 ### 分发
@@ -63,12 +67,14 @@ pub fn dispatch(frame: *TrapFrame) usize {
         .write => write(args[0], args[1]),
         .getpid => proc.current.?.pid,
         .uptime => timer.uptimeMs(),
+        .yield => yield(),
+        .sleep => sleep(args[0]),
         _ => abi.fail(.nosys),
     };
 }
 ```
 
-`proc.exit` 是 `noreturn`，可以直接放在 `switch` 表达式里。
+`proc.exit` 是 `noreturn`，可以直接放在 `switch` 表达式里。`yield()`、`sleep(ms)` 是两个小函数：调用 `proc.yield()` / `proc.sleep(ms)`，返回 0。它们在里面切回主循环，等这个进程再被调度时才返回（[process.md](process.md#调度)），然后 `handleTrap` 照常把 0 写进 `a0`、回到 U 模式。
 
 ## write
 
@@ -127,13 +133,16 @@ pub fn exit(code: u8) noreturn
 pub fn write(bytes: []const u8) error{ BadAddress, Unexpected }!usize
 pub fn getpid() usize
 pub fn uptime() u64
+pub fn yield() void
+pub fn sleep(ms: u64) void
 pub fn print(comptime fmt: []const u8, args: anytype) void   // 通过 write 做格式化输出
 ```
 
 ## 执行环境
 
-- 系统调用在陷阱处理程序里执行，**全程关着中断**，所以每个调用都要短。一个很长的 `write` 会在输出期间挡住时钟中断（计时会少几个 tick），但不会丢失中断：挂起的中断在 `sret` 回到 U 模式后立刻被处理。
-- 运行在进程内核栈上（16 KiB），系统调用里不要放大的局部数组。
+- 系统调用在陷阱处理程序里执行，**全程关着中断**，所以每个调用都要短。一个很长的 `write` 会在输出期间挡住时钟中断，但不会丢失中断：挂起的中断在 `sret` 回到 U 模式后立刻被处理（这时进程马上让出 CPU），计时也不会少，`timer` 按预约时刻补上错过的 tick（[devices.md](devices.md#定时器timerzig)）。
+- `yield` 和 `sleep` 不在里面开中断等待，而是切回主循环，由主循环开着中断去处理别的事。
+- 运行在当前进程自己的内核栈上（16 KiB），系统调用里不要放大的局部数组。
 - `exit` 不返回；其他调用返回后，用户程序从 `ecall` 的下一条指令继续执行，除 `a0` 以外的寄存器都不变。
 
 ## 新增一个系统调用
@@ -141,6 +150,6 @@ pub fn print(comptime fmt: []const u8, args: anytype) void   // 通过 write 做
 1. `src/abi.zig`：在 `Syscall` 里加一个编号（需要新错误码就在 `Errno` 里加，沿用 Linux 的编号）。
 2. `src/syscall.zig`：在 `dispatch` 的 `switch` 里加分支。参数是 `args[0..6]`，返回 `usize`；失败时返回 `abi.fail(...)`。
 3. 涉及用户指针的，一律通过 `vm.copyFromUser`（或新写的 `copyToUser`）访问，不要打开 `SUM`。
-4. 要阻塞等待的（比如等键盘输入），要在里面打开中断再 `wfi`。这时会出现嵌套的陷阱（来自 S 模式，压在当前的进程内核栈上），先读 [trap.md](trap.md#中断开关不变量) 再动手。
+4. 要阻塞等待的（比如等键盘输入），照 `sleep` 的办法：给进程加一个状态，切回主循环，条件满足时由主循环（`proc.pickNext`）把它改回 `ready`。不要在系统调用里开中断 `wfi`（[trap.md](trap.md#中断开关不变量)）。
 5. `user/sys.zig`：加一个封装函数。
 6. 更新本文的调用列表，在 [changes.md](changes.md) 里加一行。

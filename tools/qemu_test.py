@@ -37,6 +37,8 @@ MAX_HALT_CPU = 0.5  # 停机期间 QEMU 最多占用一个核的多少（忙等�
 # 用户地址空间里栈下面那一页保护页（src/proc.zig）
 GUARD_PAGE = (0x7FFFB000, 0x7FFFC000)
 USER_SPACE = (0x40000000, 0x80000000)
+MAX_PROCS = 8  # src/proc.zig 的 max_procs
+SPIN_STARTED = re.compile(r"pid (\d+) spinning in U-mode")
 
 
 class Failure(Exception):
@@ -181,14 +183,7 @@ def case_interrupts(q, c, mode):
     # spin 在 U 模式里死循环。这段时间里内核只能靠中断拿回 CPU，
     # 所以前后两次 uptime 的差说明时钟中断在 U 模式下照常发生；Ctrl-C 靠串口中断送进来
     before = uptime_ticks(q, c)
-    start = len(q.text())
-    prompts = q.text().count(PROMPT)
-    q.send("run spin\r")
-    q.wait_for(lambda t: "press Ctrl-C to stop" in t[start:], COMMAND_TIMEOUT, "spin to start")
-    time.sleep(SPIN_SECONDS)
-    q.send("\x03")
-    out = q.wait_for(lambda t: t.count(PROMPT) > prompts, COMMAND_TIMEOUT, "the prompt after Ctrl-C")[start:]
-    c.contains(out, r"\^C\n\[proc\] pid \d+ \(spin\) killed: interrupted by Ctrl-C", "run spin + Ctrl-C")
+    run_and_interrupt(q, c, SPIN_SECONDS)
     after = uptime_ticks(q, c)
     if before is not None and after is not None:
         c.expect(after - before >= MIN_SPIN_TICKS,
@@ -196,6 +191,20 @@ def case_interrupts(q, c, mode):
     # 在 shell 里按的 Ctrl-C 不应该影响之后运行的程序
     q.send("\x03")
     exited(c, q.command("run hello"), "hello", 0)
+
+
+def run_and_interrupt(q, c, seconds):
+    """在前台运行 spin，等它开始转，seconds 秒后按 Ctrl-C，检查它被结束。返回它的 pid。"""
+    start = len(q.text())
+    prompts = q.text().count(PROMPT)
+    q.send("run spin\r")
+    q.wait_for(lambda t: SPIN_STARTED.search(t[start:]), COMMAND_TIMEOUT, "spin to start")
+    pid = int(SPIN_STARTED.search(q.text()[start:]).group(1))
+    time.sleep(seconds)
+    q.send("\x03")
+    out = q.wait_for(lambda t: t.count(PROMPT) > prompts, COMMAND_TIMEOUT, "the prompt after Ctrl-C")[start:]
+    c.contains(out, rf"\^C\n\[proc\] pid {pid} \(spin\) killed: interrupted by Ctrl-C", "run spin + Ctrl-C")
+    return pid
 
 
 def uptime_ticks(q, c):
@@ -220,6 +229,80 @@ def case_user(q, c, mode):
     if m:
         c.expect(int(m.group(1)) > 0, "run t_time: time CSR read as 0")
     exited(c, out, "t_time", 0)
+
+
+def start_background(q, c, name):
+    """后台运行 name，返回 pid；是 spin 的话还要等它打印出第一行，免得这行混进下一条命令的输出。"""
+    start = len(q.text())
+    m = c.contains(q.command(f"run {name} &"), rf"\[proc\] pid (\d+) \({name}\) started in the background",
+                   f"run {name} &")
+    if not m:
+        return None
+    pid = int(m.group(1))
+    if name == "spin":
+        q.wait_for(lambda t: f"pid {pid} spinning" in t[start:], COMMAND_TIMEOUT, f"spin (pid {pid}) to start")
+    return pid
+
+
+def ps_table(q, c):
+    """运行 ps，返回 {pid: (状态, ticks, 名字)}。"""
+    out = q.command("ps")
+    c.contains(out, r"PID STATE +TICKS NAME", "ps")
+    return {int(m.group(1)): (m.group(2), int(m.group(3)), m.group(4))
+            for m in re.finditer(r"^ *(\d+) (\w+) +(\d+) (\w+)$", out, re.M)}
+
+
+def case_sched(q, c, mode):
+    # 两个后台进程死循环，前台程序和 shell 照样能运行
+    spinners = [start_background(q, c, "spin") for _ in range(2)]
+    if None in spinners:
+        return
+    exited(c, q.command("run hello"), "hello", 0)
+    out = q.command("run t_sleep")
+    m = c.contains(out, r"slept (\d+) ms", "run t_sleep")
+    if m:
+        c.expect(200 <= int(m.group(1)) < 1000, f"run t_sleep: slept {m.group(1)} ms, expected 200..1000")
+    c.contains(out, r"yield ok", "run t_sleep")
+    exited(c, out, "t_sleep", 0)
+
+    # 两个后台进程都分到了 CPU：时间片轮转，0.5 秒里各自至少拿到几个 tick
+    before = ps_table(q, c)
+    time.sleep(SPIN_SECONDS)
+    after = ps_table(q, c)
+    for pid in spinners:
+        c.expect(after.get(pid, ("", 0, ""))[0] == "ready", f"ps: spin (pid {pid}) not listed as ready: {after}")
+        got = after.get(pid, ("", 0, ""))[1] - before.get(pid, ("", 0, ""))[1]
+        c.expect(got >= MIN_SPIN_TICKS // 2, f"ps: spin (pid {pid}) got only {got} ticks in {SPIN_SECONDS}s")
+
+    # Ctrl-C 只结束前台进程，后台的还在
+    fg = run_and_interrupt(q, c, 0.2)
+    table = ps_table(q, c)
+    c.expect(fg not in table and all(pid in table for pid in spinners), f"ps after Ctrl-C: {table}")
+
+    # sleep 的进程不占 CPU。刚启动时它还是 ready（键盘输入比调度优先，紧接着的 ps 可能抢在它第一次运行之前），
+    # 所以多看几次
+    ticker = start_background(q, c, "ticker")
+    for _ in range(10):
+        table = ps_table(q, c)
+        if table.get(ticker, ("",))[0] == "sleeping":
+            break
+        time.sleep(0.05)
+    c.expect(table.get(ticker, ("",))[0] == "sleeping", f"ps: ticker (pid {ticker}) not sleeping: {table}")
+
+    # kill
+    for pid in spinners + [ticker]:
+        c.contains(q.command(f"kill {pid}"), rf"\[proc\] pid {pid} \(\w+\) killed: kill command", "kill")
+    c.contains(q.command("kill 9999"), r"kill: no such process: 9999", "kill 9999")
+    c.contains(q.command("kill"), r"usage: kill PID", "kill")
+    c.expect(ps_table(q, c) == {}, "ps: processes left after killing all of them")
+
+    # 进程表满了
+    full = [start_background(q, c, "spin") for _ in range(MAX_PROCS)]
+    c.contains(q.command("run hello"), rf"run: too many processes \(at most {MAX_PROCS}\)", "run with a full table")
+    for pid in full:
+        if pid is not None:
+            q.command(f"kill {pid}")
+    c.expect(ps_table(q, c) == {}, "ps: processes left after killing all of them")
 
 
 def case_syscall(q, c, mode):
@@ -272,6 +355,9 @@ CASES = {
     "user": (case_user, ["src/proc.zig", "src/syscall.zig", "src/abi.zig", "user/start.zig", "user/sys.zig",
                          "user/linker.ld", "user/hello.zig", "user/fault.zig", "user/tests/t_panic.zig",
                          "user/tests/t_time.zig"], False),
+    "sched": (case_sched, ["src/proc.zig", "src/shell.zig", "src/syscall.zig", "src/abi.zig", "src/timer.zig",
+                           "user/sys.zig", "user/spin.zig", "user/ticker.zig", "user/hello.zig",
+                           "user/tests/t_sleep.zig"], False),
     "syscall": (case_syscall, ["src/syscall.zig", "src/abi.zig", "user/sys.zig", "user/tests/t_sys.zig"], False),
     "protection": (case_protection, ["src/proc.zig", "user/linker.ld", "user/tests/t_wx.zig", "user/tests/t_stack.zig",
                                      "user/tests/t_priv.zig", "user/tests/t_fp.zig", "user/tests/t_noperm.zig",
