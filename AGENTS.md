@@ -105,7 +105,7 @@ python3 tools/check_links.py           # 检查文档里的相对链接和锚点
 ## 提交与推送
 
 - 仓库只有一位维护者：提交直接推到 `main`，不开分支，也不开 PR。
-- 提交的作者和提交者都用维护者本人（照 `git log` 里已有提交的作者设置 `git config user.name` / `user.email`），提交信息末尾保留 `Co-Authored-By: Claude ...` 一行。
+- 提交的**作者**用维护者本人，**提交者**用 Claude：在仓库里设置 `git config author.name` / `author.email`（照 `git log` 里最近提交的作者），提交者沿用环境默认的 `Claude <noreply@anthropic.com>`，不要在仓库里设置 `user.name` / `user.email` 把它覆盖掉。原因：这个环境会自动用 Claude 的密钥给提交签名，GitHub 只在签名属于提交者时显示 Verified。提交前用 `git var GIT_AUTHOR_IDENT` 和 `git var GIT_COMMITTER_IDENT` 确认。提交信息末尾保留 `Co-Authored-By: Claude ...` 一行。
 - 提交信息里不要带 session 链接（`Claude-Session:` 之类的行）。
 - 推送前按“如何验证改动”的表格做完对应的检查；涉及内核的改动，修改记录已经写好。
 
