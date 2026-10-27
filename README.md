@@ -4,12 +4,14 @@
 
 功能：
 
-- 串口输出和键盘（串口中断）输入，一个能执行几条命令的小 shell
+- 串口输出和键盘（串口中断）输入
 - 陷阱处理：异常和中断，时钟中断
 - 解析设备树，得到内存范围和时钟频率
 - 物理页分配器，Sv39 分页，内核按段设置权限（代码只读可执行，数据不可执行）
-- U 模式用户程序：独立编译的 ELF 嵌进内核，由内核加载；六个系统调用；用户程序出错或按 Ctrl-C 只结束进程，内核照常运行
-- 多进程：最多 8 个进程，照 xv6 的结构做的时间片轮转调度（调度器循环、`sleep`/`wakeup`、`kill` 只做标记）；shell 是内核线程，程序可以在后台运行，`sleep` 的进程不占 CPU
+- U 模式用户程序：独立编译的 ELF 嵌进内核，由内核加载；用户程序出错或按 Ctrl-C 只结束进程，内核照常运行
+- 多进程，照 xv6 的结构：时间片轮转调度（调度器循环、`sleep`/`wakeup`、`kill` 只做标记）；`fork`/`exec`/`wait`、父子进程、zombie 和孤儿回收；最多 8 个进程
+- 17 个系统调用，包括阻塞读键盘的 `read`
+- 用户态的 init 和 shell：init 启动 shell，shell 用 `fork` + `exec` 运行程序，程序可以在后台运行
 
 ```
 Hello from a Zig kernel on RISC-V!
@@ -17,32 +19,33 @@ SBI: OpenSBI, spec v1.0 | hart 0 | device tree at 0x87e00000
 [ok] trap vector installed
 [trap] breakpoint at 0x80215d56, skipping it
 [ok] device tree: 128 MiB RAM at 0x80000000, timebase 10000000 Hz
-[ok] page allocator: 31999 free pages (127996 KiB)
+[ok] page allocator: 31948 free pages (127792 KiB)
 [ok] Sv39 paging enabled: kernel mapped 1:1, text r-x, rodata r--, data rw-
 [ok] interrupts enabled: timer at 100 Hz, keyboard via UART + PLIC
 Type 'help' for commands.
 > run hello
-Hello from U-mode! I am pid 2, the kernel has been up for 500 ms.
+Hello from U-mode! I am pid 3, the kernel has been up for 510 ms.
 write() refused a kernel pointer: BadAddress
-[proc] pid 2 (hello) exited with code 0
+[proc] pid 3 (hello) exited with code 0
 > run spin &
-[proc] pid 3 (spin) started in the background
-> pid 3 spinning in U-mode without making syscalls
+[proc] pid 4 (spin) started in the background
+> pid 4 spinning in U-mode without making syscalls
 run ticker &
-[proc] pid 4 (ticker) started in the background
-> [ticker pid 4] tick 1 at 2330 ms
+[proc] pid 5 (ticker) started in the background
+> [ticker pid 5] tick 1 at 2340 ms
 ps
-  PID STATE     TICKS NAME
-    1 running       0 shell
-    3 runnable    202 spin
-    4 sleeping      0 ticker
+  PID  PPID STATE     TICKS NAME
+    1     0 sleeping      0 init
+    2     1 running       1 sh
+    4     2 runnable    202 spin
+    5     2 sleeping      0 ticker
 > run spin
-pid 5 spinning in U-mode without making syscalls
-[ticker pid 4] tick 2 at 3330 ms
+pid 6 spinning in U-mode without making syscalls
+[ticker pid 5] tick 2 at 3340 ms
 ^C
-[proc] pid 5 (spin) killed: interrupted by Ctrl-C
-> kill 3
-[proc] pid 3 (spin) killed: kill command
+[proc] pid 6 (spin) killed: interrupted by Ctrl-C
+> kill 4
+[proc] pid 4 (spin) killed: kill()
 ```
 
 ## 运行
@@ -51,7 +54,7 @@ pid 5 spinning in U-mode without making syscalls
 
 ```sh
 zig build run                     # 编译并在 QEMU 中启动（Debug 模式）
-zig build run -Doptimize=small    # 体积优化，内核代码段约 12.8 KB
+zig build run -Doptimize=small    # 体积优化，内核代码段约 14.6 KB
 ```
 
 退出 QEMU：先按 `Ctrl-A`，再按 `X`；或者在 shell 里输入 `shutdown`。
@@ -66,17 +69,17 @@ python3 tools/qemu_test.py            # QEMU 测试：全部用例
 
 ## shell 命令
 
+shell 是用户程序（`user/sh.zig`），由 init 启动。
+
 | 命令 | 作用 |
 | --- | --- |
 | `help` | 列出命令 |
-| `uptime` | 开机时长，由时钟中断计数得出 |
+| `uptime` | 开机时长，精度 10 ms |
 | `mem` | 物理页的使用情况 |
-| `run NAME` | 在 U 模式运行用户程序 `NAME`（`hello`、`fault`、`spin`、`ticker`），等它结束，Ctrl-C 结束它；不带参数时列出所有程序 |
+| `run NAME` | 用 `fork` + `exec` 运行用户程序 `NAME`（`hello`、`fault`、`spin`、`ticker`），等它结束，Ctrl-C 结束它；不带参数时列出所有程序 |
 | `run NAME &` | 在后台运行，马上回到提示符 |
-| `ps` | 列出进程：pid、状态、用掉的时钟 tick 数 |
-| `kill PID` | 结束进程 |
-| `ebreak` | 触发断点异常，处理后恢复执行 |
-| `crash` | 读地址 0（没有映射），触发缺页异常，内核 panic |
+| `ps` | 列出进程：pid、父进程、状态、用掉的时钟 tick 数 |
+| `kill PID` | 结束进程（init 不能杀；杀掉 shell 的话 init 会重新启动一个） |
 | `shutdown` | 通过 SBI 关机，QEMU 随之退出 |
 
 ## 文档
@@ -84,8 +87,8 @@ python3 tools/qemu_test.py            # QEMU 测试：全部用例
 详细文档在 [docs/](docs/README.md)，按功能组织，每一篇都对应若干源码文件：
 
 - 整体：[总体结构](docs/architecture.md)、[构建系统](docs/build.md)、[启动流程](docs/boot.md)
-- 内核：[陷阱处理](docs/trap.md)、[串口 / PLIC / 定时器](docs/devices.md)、[CSR 和 SBI](docs/riscv-sbi.md)、[设备树](docs/devicetree.md)、[页分配器](docs/page-allocator.md)、[Sv39 分页](docs/paging.md)、[shell](docs/shell.md)
-- 用户态：[用户程序](docs/user-programs.md)、[进程](docs/process.md)、[系统调用](docs/syscalls.md)
+- 内核：[陷阱处理](docs/trap.md)、[串口 / PLIC / 定时器](docs/devices.md)、[CSR 和 SBI](docs/riscv-sbi.md)、[设备树](docs/devicetree.md)、[页分配器](docs/page-allocator.md)、[Sv39 分页](docs/paging.md)
+- 进程和用户态：[进程](docs/process.md)、[系统调用](docs/syscalls.md)、[用户程序](docs/user-programs.md)、[shell](docs/shell.md)
 - 开发：[测试与调试](docs/testing.md)、[Zig 0.17 笔记](docs/zig-0.17.md)
 - [修改记录](docs/changes.md)：每次改动新增了什么功能、修了什么 bug
 

@@ -84,7 +84,10 @@ const UserProgram = struct {
     dir: []const u8 = "user",
     linker_script: []const u8 = "user/linker.ld",
 };
-const user_programs = [_]UserProgram{ .{ .name = "hello" }, .{ .name = "fault" }, .{ .name = "spin" }, .{ .name = "ticker" } };
+const user_programs = [_]UserProgram{
+    .{ .name = "init" },  .{ .name = "sh" },   .{ .name = "hello" },
+    .{ .name = "fault" }, .{ .name = "spin" }, .{ .name = "ticker" },
+};
 const test_programs = [_]UserProgram{
     .{ .name = "t_sys", .dir = "user/tests" },
     // ……
@@ -163,6 +166,8 @@ kernel.root_module.addOptions("build_options", options);
 
 ```zig
 pub const user_programs: []const []const u8 = &[_][]const u8{
+    "init",
+    "sh",
     "hello",
     "fault",
     "spin",
@@ -187,10 +192,10 @@ pub const user_programs: []const []const u8 = &[_][]const u8{
 实测的段布局（Debug 版 `hello`，`llvm-readelf -l zig-out/user/hello`）：
 
 ```
-LOAD 0x40000000 filesz 0x125d4 R E    （代码，约 73 KiB）
+LOAD 0x40000000 filesz 0x127dc R E    （代码，约 74 KiB）
 LOAD 0x40013000 filesz 0x03e04 R      （只读数据）
-LOAD 0x40017000 filesz 0x00020 RW     （数据，只有 sys.zig 里的 writer）
-Entry point 0x40011426
+LOAD 0x40017000 filesz 0x00020 memsz 0x00120 RW   （数据：sys.zig 里的 writer；.bss：print 的 256 字节缓冲区）
+Entry point 0x400115dc
 ```
 
 small 模式下同一个程序的代码段只有 0x3bc 字节，ELF 文件约 13 KB（大部分是页对齐留下的空隙）。

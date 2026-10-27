@@ -14,7 +14,7 @@
 - 自定义 panic：在根文件写 `pub const panic = std.debug.FullPanic(fn)`。必须是 `pub`，因为 0.17 起 `@hasDecl` 只认公开声明，不写 `pub` 会悄悄用回默认的 panic。0.17.0 里 `std.debug.simple_panic` 有已知回归（#36986），编译不过，不要用。freestanding 下默认的 panic 是直接 `@trap()`。
 - `std.Io.Writer` 是新的输出接口：自己提供一个 `drain(w, data, splat)` 函数，就能用 `print` 做格式化输出（`uart.zig`、`user/sys.zig`）。`data` 是若干段字节，最后一段要重复 `splat` 次。
 - `std.SinglyLinkedList` 是**侵入式**的、不带类型参数：链表只认 `Node { next: ?*Node }`，节点嵌在哪里由使用者决定（`page.zig` 直接把节点放在空闲页的开头）。
-- `std.mem.indexOfScalar` 改名为 `std.mem.findScalar`（旧名是弃用的别名）；新增 `std.mem.cutScalar(T, s, c)`，返回分隔符前后两段（`shell.zig` 用它拆命令名和参数）。
+- `std.mem.indexOfScalar` 改名为 `std.mem.findScalar`（旧名是弃用的别名）；新增 `std.mem.cutScalar(T, s, c)`，返回分隔符前后两段（`user/sh.zig` 用它拆命令名和参数）。
 - `std.elf` 推荐用 `std.elf.Elf64.Ehdr` / `Elf64.Phdr`：字段名没有 `e_` / `p_` 前缀，类型是枚举（`type: ET`、`machine: EM`）和 packed struct（`flags: PF`，有 `.R`、`.W`、`.X` 字段）。旧的 `Elf64_Ehdr` 等已弃用。
 - 0.17.0 有一个 x86 软浮点下 compiler-rt 编译失败的回归（#37006），只影响 x86 目标，这里的 RISC-V 目标不受影响。
 
@@ -75,7 +75,7 @@ error: unused argument in '...'
 ### 指针转换
 
 - `@ptrCast` 不能提高对齐要求：`*[512]Pte`（8 字节对齐）转成 `*align(4096) [4096]u8` 会报 `@ptrCast increases pointer alignment`，要写成 `@ptrCast(@alignCast(p))`，`@alignCast` 在 Debug/safe 模式下会检查实际地址。
-- 普通指针不能为 0：`@ptrFromInt(0)` 转成普通指针，编译期已知时直接报错，运行时在安全模式下会 panic。确实要指向地址 0 时用 `*allowzero T`（`shell.zig` 的 `crash` 命令）。
+- 普通指针不能为 0：`@ptrFromInt(0)` 转成普通指针，编译期已知时直接报错，运行时在安全模式下会 panic。确实要指向地址 0 时用 `*allowzero T`（以前内核 shell 的 `crash` 命令就是这样读地址 0 的）。
 - 从字节数组里读结构体（ELF 头）用 `std.mem.bytesToValue(T, bytes[0..@sizeOf(T)])`，它复制一份，不要求对齐。
 
 ### 其他

@@ -2,6 +2,14 @@
 
 每次改了内核（`src/`、`user/`、`build.zig`、链接脚本），在最上面加几行：新增了什么功能，修了什么 bug。最新的在前面。
 
+## 2026-10-27 fork、exec、wait；init 和 shell 搬到用户态
+
+- 新增：系统调用 `read`（阻塞读键盘，不回显）、`fork`、`exec`、`wait`、`kill`、`getppid`、`setfg`、`procinfo`、`meminfo`、`listprog`、`shutdown`，照 xv6 实现。进程有了父进程；`fork` 逐页复制地址空间（`vm.cloneUserSpace`）和 `TrapFrame`；`exec` 加载成功后才换掉旧的地址空间；`exit` 之后进程变成 zombie，由父进程 `wait` 取走结束状态（退出码，或者被杀时的 `0x100`）并回收，父进程先结束的子进程交给 init。新增 `vm.copyToUser`、`vm.checkUser`，写用户内存时要求页可写。
+- 改动：内核启动时只创建第一个进程 init（`user/init.zig`，pid 1），它启动 shell 并回收孤儿，shell 结束了就重新启动一个；init 结束内核就 panic。shell 变成用户程序 `user/sh.zig`（pid 2），通过系统调用实现原来的命令，删掉了内核里的 `src/shell.zig` 和内核线程。`ps` 多了父进程一列；`uptime` 只显示秒；`kill` 的原因显示为 `kill()`。
+- 删除：shell 的 `ebreak`、`crash` 命令和 QEMU 测试的 `panic` 用例（用户态触发不了内核异常）。
+- 修复：用户程序的 `print` 每一段格式化输出都是一次 `write`，时钟中断落在两次 `write` 之间时，别的进程的输出会插进一行的中间（后台进程的第一行插进了 shell 的 `started in the background`）。现在 `print` 先攒进 256 字节的缓冲区，最后一次 `write` 写出。
+- 新增：回归测试 `t_fork`（fork、exec、wait、kill 等的边界情况）、`t_read`，QEMU 测试用例 `fork`；`wait`、`reparent`、`copyToUser`、`checkUser`、`cloneUserSpace` 的单元测试。
+
 ## 2026-10-27 照 xv6 改写进程调度
 
 - 改动：调度器 `proc.scheduler()` 从内核主循环里独立出来，照 xv6 的 `scheduler()`：在启动栈上永远循环，每一轮开一下中断再关上，依次扫描进程表、运行每个 `runnable` 的进程，一个都没有就 `wfi`。进程只通过 `proc.sched()` 切回调度器（`yield`、`sleep`、`exit`）。去掉了 `schedule`、`pickNext` 和 `last_slot`。

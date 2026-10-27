@@ -1,8 +1,8 @@
 # 用户程序
 
-涉及文件：`user/start.zig`、`user/sys.zig`、`user/linker.ld`、`user/hello.zig`、`user/fault.zig`、`user/spin.zig`、`user/ticker.zig`
+涉及文件：`user/start.zig`、`user/sys.zig`、`user/linker.ld`、`user/init.zig`、`user/sh.zig`、`user/hello.zig`、`user/fault.zig`、`user/spin.zig`、`user/ticker.zig`
 
-用户程序运行在 U 模式，只能访问自己地址空间里的页，要输出文字、查询时间、退出都要通过系统调用（[syscalls.md](syscalls.md)）。它们在构建时编译成独立的 ELF 并嵌进内核（[build.md](build.md#用户程序)），运行时由 shell 的 `run` 命令加载（[process.md](process.md)）。
+用户程序运行在 U 模式，只能访问自己地址空间里的页，要输出文字、读键盘、创建进程、退出都要通过系统调用（[syscalls.md](syscalls.md)）。它们在构建时编译成独立的 ELF 并嵌进内核（[build.md](build.md#用户程序)）。内核启动时只加载 `init`，其他程序都是由已有的进程 `fork` 再 `exec` 出来的（[process.md](process.md#创建进程)）：init 启动 shell（`sh`），shell 的 `run` 命令再启动别的程序。
 
 ## 目录结构
 
@@ -41,38 +41,78 @@ fn panicImpl(msg: []const u8, first_trace_addr: ?usize) noreturn {
 ## sys.zig
 
 ```zig
+pub const abi = @import("abi");          // 系统调用号、错误码、ProcInfo 等，和内核共用
+pub fn syscall(n: abi.Syscall, arg0: usize, arg1: usize, arg2: usize) usize
+
 pub fn exit(code: u8) noreturn
-pub const WriteError = error{ BadAddress, Unexpected };
 pub fn write(bytes: []const u8) WriteError!usize
+pub fn read(buf: []u8) ReadError!usize   // 读键盘，没有输入时阻塞，不回显
 pub fn getpid() usize
+pub fn getppid() usize
 pub fn uptime() u64                      // 开机以来的毫秒数
 pub fn yield() void                      // 让出 CPU
 pub fn sleep(ms: u64) void               // 睡至少 ms 毫秒，精度 10 ms
+pub fn fork() ForkError!usize            // 父进程得到子进程的 pid，子进程得到 0
+pub fn exec(name: []const u8) ExecError!noreturn
+pub fn wait(pid: ?usize, nohang: bool) WaitError!?WaitResult
+pub fn kill(pid: usize) KillError!void
+pub fn setfg(pid: ?usize) error{ NoSuchProcess, Unexpected }!void
+pub fn procinfo(buf: []abi.ProcInfo) usize
+pub fn meminfo() abi.MemInfo
+pub fn listprog(index: usize, buf: []u8) ?[]u8
+pub fn shutdown() noreturn
 pub fn print(comptime fmt: []const u8, args: anytype) void
 ```
 
-所有调用都通过一个内部函数：
+每个函数的语义和错误见 [syscalls.md](syscalls.md#用户态封装)。所有调用都通过 `syscall`：
 
 ```zig
-fn syscall(n: abi.Syscall, arg0: usize, arg1: usize) usize {
+pub fn syscall(n: abi.Syscall, arg0: usize, arg1: usize, arg2: usize) usize {
     return asm volatile ("ecall"
         : [ret] "={a0}" (-> usize),
         : [n] "{a7}" (@backingInt(n)),
           [arg0] "{a0}" (arg0),
           [arg1] "{a1}" (arg1),
+          [arg2] "{a2}" (arg2),
         : .{ .memory = true });
 }
 ```
 
-- 调用号放 `a7`，参数放 `a0`、`a1`，返回值在 `a0`。内核会保存并恢复其他所有寄存器，所以不需要声明更多 clobber。memory clobber 是因为 `write` 要读用户内存，编译器必须在 `ecall` 之前把缓冲区真正写好。
-- `write` 把内核返回的错误码（`abi.errnoOf`）转换成 Zig 的错误：`EFAULT` → `error.BadAddress`，其他 → `error.Unexpected`。返回值可能小于 `bytes.len`（遇到坏地址时只写出了前一部分）。
+- 调用号放 `a7`，参数放 `a0`..`a2`，返回值在 `a0`。内核会保存并恢复其他所有寄存器，所以不需要声明更多 clobber。memory clobber 是因为 `write` 要读用户内存、`read` 等要写用户内存，编译器必须在 `ecall` 之前把缓冲区真正写好，之后重新读。
+- `syscall` 是 `pub` 的：回归测试用它传各种坏参数，直接看原始的返回值。
+- 封装函数把内核返回的错误码（`abi.errnoOf`）转换成 Zig 的错误，比如 `write` 的 `EFAULT` → `error.BadAddress`，其他 → `error.Unexpected`。`write` 的返回值可能小于 `bytes.len`（遇到坏地址时只写出了前一部分）。
 - `exit` 之后写的是 `unreachable`：内核保证 `exit` 不返回。
-- `print` 和内核的 `uart.print` 一样接入 `std.Io.Writer`，`buffer` 为空，所以格式化输出的**每一段**都是一次 `write` 系统调用（例如 `print("pid {d}\n", .{pid})` 是三次：`"pid "`、数字、`"\n"`）。用 QEMU 的 `-d int` 数过：`hello` 一共执行 12 次 `ecall`（两个 `print` 共 8 次 `write`，加上 `getpid`、`uptime`、故意失败的那次 `write` 和 `exit`）。简单，但系统调用次数多；需要时可以给 Writer 一个缓冲区，在 `print` 结束时 flush。`drain` 里 `write` 失败就返回 `error.WriteFailed`，`print` 吞掉错误。
-- `writer` 是全局变量，放在程序的 `.data` 段里（各程序数据段里唯一的 32 字节就是它）。
+- `print` 和内核的 `uart.print` 一样接入 `std.Io.Writer`，但带一个 256 字节的缓冲区：格式化的各段先攒在缓冲区里，`print` 最后 `flush`，用**一次** `write` 系统调用写出去（超过 256 字节时，`drain` 先写出攒着的部分，再直接写剩下的，会多写几次）。`write` 在内核里关着中断整段输出，所以一次 `print` 的输出不会被别的进程的输出从中间打断。最初没有缓冲区，每一段都是一次 `write`（`print("pid {d}\n", .{pid})` 是三次），时钟中断可能落在两次 `write` 之间：后台进程刚启动时，它打印的一行插进了 shell 的 `[proc] pid 9 (spin) started in the background` 中间，fast 模式下的 QEMU 测试因此失败过。`drain` 里 `write` 失败就返回 `error.WriteFailed`，`print` 吞掉错误。
+- `writer` 是全局变量，放在程序的 `.data` 段里（实测 Debug 版 `hello` 的 `.data` 只有 32 字节，就是它），缓冲区在 `.bss` 里（256 字节）。`fork` 出来的子进程有自己的一份；`print` 每次都清空缓冲区，所以 `fork` 时缓冲区总是空的。
 
 ## 链接脚本
 
 `user/linker.ld`：从 `0x4000_0000`（`vm.user_base`）开始，用 `PHDRS` 声明 text（R+X）、rodata（R）、data（R+W，含 `.bss`）三个段，每个段从新的一页开始。内核的 ELF 加载器要求每个段页对齐、可读、在用户区内（[process.md](process.md#elf-加载器)）。详细的段布局见 [build.md](build.md#用户程序的链接脚本)。
+
+## init 和 sh
+
+这两个程序必须有（`build.zig` 的 `user_programs` 里排在最前面），整个系统靠它们运转，结构和 xv6 的 `user/init.c`、`user/sh.c` 一样。
+
+**init**（`user/init.zig`）是内核启动时创建的第一个进程，pid 1（`proc.userinit`）：
+
+```zig
+pub fn main() u8 {
+    while (true) {
+        const sh = startShell();          // fork，子进程 exec("sh")
+        while (true) {
+            const child = (sys.wait(null, false) catch break) orelse continue;
+            if (child.pid == sh) break;
+        }
+        sys.print("init: sh exited, restarting it\n", .{});
+    }
+}
+```
+
+- 启动 shell，然后一直 `wait` 任意一个子进程。父进程先结束的进程会被内核交给 init（[process.md](process.md#exit变成-zombie)），它们结束后变成 zombie，靠 init 的 `wait` 回收。
+- 等到的是 shell 的话（shell 被 `kill` 了），打印一行，再启动一个新的。
+- init 不能结束：它一结束内核就 panic（`init exited`），`kill` 也不允许杀它。`fork` 失败时打印原因，睡一秒再试。
+
+**sh**（`user/sh.zig`）是 shell，详见 [shell.md](shell.md)。它的父进程是 init，`run` 启动的程序都是它的子进程。
 
 ## 示例程序
 
@@ -97,9 +137,9 @@ pub fn main() u8 {
 
 ```
 > run hello
-Hello from U-mode! I am pid 2, the kernel has been up for 5120 ms.
+Hello from U-mode! I am pid 3, the kernel has been up for 30 ms.
 write() refused a kernel pointer: BadAddress
-[proc] pid 2 (hello) exited with code 0
+[proc] pid 3 (hello) exited with code 0
 ```
 
 ### fault
@@ -119,7 +159,7 @@ pub fn main() u8 {
 ```
 > run fault
 reading kernel memory at 0x80200000 from U-mode...
-[proc] pid 2 (fault) killed: load_page_fault at 0x40011454, stval=0x80200000
+[proc] pid 6 (fault) killed: load_page_fault at 0x40011462, stval=0x80200000
 ```
 
 （`at` 后面是出错指令的地址，随优化模式变化；`stval` 是被访问的地址。）
@@ -133,13 +173,13 @@ pub fn main() u8 {
 }
 ```
 
-进入死循环，不再做任何系统调用。时钟中断每 10 ms 打断它一次，串口中断在收到字符时打断它，每次打断它都要让出 CPU，别的进程和 shell 照样运行。证明用户程序没法霸占 CPU。前台运行时按 Ctrl-C 结束它；后台运行时用 `kill` 结束它，`ps` 能看到它的 `TICKS` 一直在涨。
+进入死循环，不再做任何系统调用。时钟中断每 10 ms 打断它一次，让它让出 CPU，别的进程和 shell 照样运行。证明用户程序没法霸占 CPU。前台运行时按 Ctrl-C 结束它；后台运行时用 `kill` 结束它，`ps` 能看到它的 `TICKS` 一直在涨。
 
 ```
 > run spin
-pid 3 spinning in U-mode without making syscalls
+pid 4 spinning in U-mode without making syscalls
 ^C
-[proc] pid 3 (spin) killed: interrupted by Ctrl-C
+[proc] pid 4 (spin) killed: interrupted by Ctrl-C
 ```
 
 ### ticker
@@ -159,9 +199,9 @@ pub fn main() u8 {
 
 ```
 > run ticker &
-[proc] pid 3 (ticker) started in the background
-> [ticker pid 3] tick 1 at 2580 ms
-[ticker pid 3] tick 2 at 3590 ms
+[proc] pid 4 (ticker) started in the background
+> [ticker pid 4] tick 1 at 2330 ms
+[ticker pid 4] tick 2 at 3330 ms
 ```
 
 ## 写一个新程序
@@ -186,7 +226,7 @@ pub fn main() u8 {
 不能用或要注意的：
 
 - 没有堆：没有分配内存的系统调用，`std.heap.page_allocator` 等依赖操作系统的分配器不可用。需要内存就用全局数组或者栈（可以用 `std.heap.FixedBufferAllocator` 包一个全局数组）。
-- 系统调用只有 `exit`、`write`、`getpid`、`uptime`、`yield`、`sleep` 六个：没有读键盘、文件、线程，也没有命令行参数。
+- 系统调用见 [syscalls.md](syscalls.md#调用列表)：可以读键盘、`fork`/`exec`/`wait`，但没有文件、管道、线程，也没有命令行参数。`exec` 只能运行嵌在内核里的程序。
 - 不能用浮点指令：浮点运算由 compiler_rt 软件实现，慢而且让程序变大。浮点单元被内核关掉了（`sstatus.FS = Off`），手写的浮点指令会触发 `illegal_instruction` 被结束（回归测试 `t_fp`）。
 - 栈只有 16 KiB，下面是不映射的保护页：栈溢出时触发 `store_page_fault`（`stval` 落在 `0x7fffb000..0x7fffc000`），进程被结束。
 - 不能执行特权指令、不能访问 S 模式的 CSR（比如 `csrr sstatus`），否则触发 `illegal_instruction` 被结束。例外是 `cycle`、`time`、`instret` 三个计数器：OpenSBI 启动时把 `scounteren` 设成了 7（内核进入时实测，内核没有改它），所以用户程序可以直接用 `rdtime` 等指令读，实测 `rdtime` 在 U 模式下正常返回。

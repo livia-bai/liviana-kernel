@@ -55,22 +55,22 @@ pub fn print(comptime fmt: []const u8, args: anytype) void
 
   `data` 是若干段字节，最后一段要重复输出 `splat` 次（格式化填充对齐时会用到），返回实际写出的字节数。这里全部写完，返回总长度。
 - `print` 吞掉格式化错误（串口写不会失败）。
-- 输出不加锁，因为不会有两个执行流同时打印。时钟和串口的中断处理程序本身不打印（只有“意外的外部中断”和 panic 这种出错路径会打印）；陷阱处理程序里的其他打印（断点、进程退出或被杀、Ctrl-C 的 `^C`）发生在关着中断的内核代码里，同一时刻只有一个执行流在跑，不会和 shell 的输出交错在一行里。
+- 输出不加锁，因为不会有两个执行流同时打印。时钟和串口的中断处理程序本身不打印（只有“意外的外部中断”和 panic 这种出错路径会打印）；陷阱处理程序里的其他打印（断点、进程退出或被杀、Ctrl-C 的 `^C`）发生在关着中断的内核代码里，同一时刻只有一个执行流在跑，不会和别的内核输出交错在一行里（用户程序的 `write` 每次也是关着中断整段输出，但两个进程的多次 `write` 之间可能交错）。
 
 ### 输入：环形缓冲区
 
 ```zig
 var rx_buf: [256]u8 = undefined;
 var rx_head: u8 = 0;  // 中断处理程序写入的位置
-var rx_tail: u8 = 0;  // shell 读出的位置
+var rx_tail: u8 = 0;  // read 系统调用读出的位置
 
 pub const rx_chan: *const anyopaque = &rx_buf;  // 等输入的进程睡在这个通道上
 ```
 
 - 索引是 `u8`，`+%` 回绕正好对应 256 字节的缓冲区，不需要取模。
 - `head == tail` 表示空；`head + 1 == tail` 表示满（留一个空位区分空和满，实际容量 255）。满了之后新来的字符被丢弃。
-- **单生产者单消费者**：只有中断处理程序（`onInterrupt`）改 `head`，只有 shell（`read`）改 `tail`。`read` 要求调用时中断是关着的，这样它执行期间不会有 `onInterrupt` 插进来；shell 全程关着中断运行，满足。
-- 缓冲区为空时 shell `proc.sleep(rx_chan)`；`trap.handleExternal` 在 `onInterrupt` 之后 `proc.wakeup(rx_chan)` 叫醒它（[process.md](process.md#sleepwakeup)）。驱动本身不知道进程的存在。
+- **单生产者单消费者**：只有中断处理程序（`onInterrupt`）改 `head`，只有 `read` 系统调用（`uart.hasInput`、`uart.read`）改 `tail`。它们要求调用时中断是关着的，这样执行期间不会有 `onInterrupt` 插进来；系统调用全程关着中断，满足。
+- 缓冲区为空时 `read` 系统调用 `proc.sleep(rx_chan)`；`trap.handleExternal` 在 `onInterrupt` 之后 `proc.wakeup(rx_chan)` 叫醒它（[syscalls.md](syscalls.md#read)）。驱动本身不知道进程的存在。
 
 ```zig
 pub fn onInterrupt() void {
@@ -93,8 +93,8 @@ Ctrl-C（ASCII `0x03`）不进缓冲区，只把 `ctrl_c_pressed` 置为 `true`�
 pub fn takeCtrlC() bool   // 返回上次调用以来是否按过 Ctrl-C，并清除标志
 ```
 
-- `trap.handleExternal` 在 `onInterrupt` 之后马上调用 `takeCtrlC()`（同一个中断里），按过就交给 `shell.interrupt()`，由它杀掉前台进程（[process.md](process.md#ctrl-c)）。用户程序就算在 U 模式死循环、从不做系统调用，串口中断也照样会打断它，这次中断返回之前它就结束了。
-- 没有前台进程时按的 Ctrl-C 也在这里被取走、什么都不做，所以不会留到下一个程序一启动就把它杀掉。Ctrl-C 不进缓冲区，shell 看不到它。
+- `trap.handleExternal` 在 `onInterrupt` 之后马上调用 `takeCtrlC()`（同一个中断里），按过就交给 `proc.interruptForeground()`，由它杀掉前台进程（[process.md](process.md#ctrl-c)）。用户程序就算在 U 模式死循环、从不做系统调用，串口中断也照样会打断它，这次中断返回之前它就结束了。
+- 没有前台进程时按的 Ctrl-C 也在这里被取走、什么都不做，所以不会留到下一个程序一启动就把它杀掉。Ctrl-C 不进缓冲区，`read` 读不到它。
 - 管道测试里用 `printf '\003'` 发送 Ctrl-C。QEMU `-nographic` 会把 Ctrl-C 原样交给客户机串口，不会结束 QEMU 自己（结束 QEMU 是 Ctrl-A X）。
 
 ## PLIC（`plic.zig`）
@@ -151,7 +151,7 @@ pub var ticks: u64 = 0;
 - **预约**：`arm()` 把 `deadline` 加上一个周期 `timebase_hz / tick_hz`（10 MHz 下是 100000 个计数），通过 `sbi.setTimer(deadline)` 让 OpenSBI 在那时产生 S 模式时钟中断。下一次的预约时刻以**上一次的预约时刻**为基准，而不是以“现在”为基准，原因见下面的“为什么”。
 - **初始化**：`init(hz)` 记下频率，把 `deadline` 设成当前的 `time`，预约第一次（一个周期之后），再打开 `sie.STIE`。
 - **中断处理**：`onInterrupt()` 让 `ticks` 加 1，再预约下一次。`setTimer` 同时清除了当前挂起的时钟中断，不预约的话处理程序返回后会立刻再次进来。
-- **计时**：`ticks` 从打开时钟中断开始计数，shell 的 `uptime` 命令显示 `ticks / tick_hz` 秒；`uptimeMs()` 返回 `ticks * 1000 / tick_hz` 毫秒，是 `uptime` 系统调用的返回值。误差在一个 tick（10 ms）以内，不随时间累积。
+- **计时**：`ticks` 从打开时钟中断开始计数，`uptimeMs()` 返回 `ticks * 1000 / tick_hz` 毫秒，是 `uptime` 系统调用的返回值，shell 的 `uptime` 命令显示它。误差在一个 tick（10 ms）以内，不随时间累积。
 - **为什么以上一次的预约时刻为基准**：中断从到期到被处理总有一段延迟。以前 `arm()` 按“处理中断时读到的 `time` + 一个周期”预约，每个 tick 都把这段延迟丢掉，误差越积越多。实测 `uptime` 比 `time` 慢 2%～3%，shell 空闲 20 秒就慢了 543 ms。现在每个周期的边界是固定的，延迟不累积，同样空闲 20 秒只差 4 ms。
 - **处理晚了超过一个周期时**：新的预约时刻已经过去。按 SBI 规范，这时中断会立刻挂起，连续来几次之后 `ticks` 就追上了。这种情况没有实测过。
 

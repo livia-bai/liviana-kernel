@@ -49,7 +49,7 @@ python3 tools/qemu_test.py --list      # 列出 QEMU 测试的用例和它们覆
 绑在一起、改一边就要同步改另一边的：
 
 - `trap.TrapFrame` 的布局 ↔ `trap.trapEntry`、`trap.trapExit` 的汇编 ↔ `proc.spawn` 构造初始 `TrapFrame` ↔ `syscall.dispatch` 读参数的下标（[docs/trap.md](docs/trap.md#trapframe)）。
-- `proc.Context` ↔ `proc.contextAsm`（[docs/process.md](docs/process.md#进出-u-模式)）。
+- `proc.Context` ↔ `proc.contextAsm`（[docs/process.md](docs/process.md#保存的上下文)）。
 - `linker.ld` 里各段的 4 KiB 对齐和 `__text_start`、`__rodata_start`、`__data_start`、`__kernel_end` ↔ `vm.init` 设置的页权限（[docs/boot.md](docs/boot.md#链接脚本)）。
 - `user/linker.ld` 的页对齐、可读的段 ↔ `proc.loadSegment` 的检查。
 - `src/abi.zig` 同时被内核和用户程序使用：新增系统调用时 `abi.zig`、`syscall.zig`、`user/sys.zig`、[docs/syscalls.md](docs/syscalls.md) 一起改。
@@ -58,15 +58,17 @@ python3 tools/qemu_test.py --list      # 列出 QEMU 测试的用例和它们覆
 
 - `sscratch`：在 U 模式运行时存进程内核栈顶，在内核里为 0（[docs/trap.md](docs/trap.md#sscratch-约定)）。
 - `sstatus.FS` 保持 Off：`kmain` 一开始就清掉 OpenSBI 留下的 Dirty，进入 U 模式的 `sstatus` 从内核当前的值派生，所以用户程序也不能用浮点（[docs/riscv-sbi.md](docs/riscv-sbi.md#位定义)）。
-- 内核代码（陷阱处理、系统调用、shell 内核线程、调度器扫描进程表）全程关中断执行；只有调度器每一轮开头开一下中断（[docs/trap.md](docs/trap.md#中断开关不变量)）。
+- 内核代码（陷阱处理、系统调用、调度器扫描进程表）全程关中断执行；只有调度器每一轮开头开一下中断（[docs/trap.md](docs/trap.md#中断开关不变量)）。
 - 调度器先关中断再扫描进程表、再 `wfi`，下一轮开头才开中断（[docs/process.md](docs/process.md#调度器)）。
-- 进程切换只在关中断时进行，并且总是调度器 ↔ 进程：`proc.scheduler` 切到进程，进程改掉自己的状态后只通过 `proc.sched`（`yield`/`sleep`/`finish`）切回（[docs/process.md](docs/process.md#切换上下文)）。新进程初始 `TrapFrame` 的 `sstatus` 必须清掉 `SIE`。
+- 进程切换只在关中断时进行，并且总是调度器 ↔ 进程：`proc.scheduler` 切到进程，进程改掉自己的状态后只通过 `proc.sched`（`yield`/`sleep`/`finish`）切回（[docs/process.md](docs/process.md#切换上下文)）。`startFrame` 构造的 `TrapFrame`（init、`exec`）的 `sstatus` 必须清掉 `SIE`。
+- 进程的 `TrapFrame` 总在它内核栈的最顶端（`proc.frameOf`）：`trapEntry`、`trapExit` 设 `sscratch`、`fork` 复制父进程的 `TrapFrame` 都依赖这一点。
+- 结束的进程只由父进程 `wait` 回收（`proc.reap`），父进程先结束的交给 init；init（pid 1）不能结束，结束内核就 panic（[docs/process.md](docs/process.md#结束进程)）。
 - 等待用 `proc.sleep(chan)` / `proc.wakeup(chan)`，醒来后在循环里重新检查条件；`proc.kill` 只做标记，被杀的进程在回到 U 模式之前（`handleTrap` 末尾、`forkret`）由 `checkKilled` 结束（[docs/process.md](docs/process.md#结束进程)）。
 - 用户地址空间只能用 Sv39 根页表的第 1 项（`vm.user_base..vm.user_end`），内核映射不能放进这个范围（[docs/paging.md](docs/paging.md#用户地址空间)）。
 - 内核碰用户内存只能通过 `vm.copyFromUser` 这类先查页表的函数，不要打开 `sstatus.SUM` 直接解引用用户指针（[docs/syscalls.md](docs/syscalls.md#访问用户内存)）。
 - 页表叶子必须可读或可执行，可写必须可读；ELF 加载器拒绝不可读的段（[docs/process.md](docs/process.md#elf-加载器)）。
 
-用户程序：放在 `user/<名字>.zig`，提供 `pub fn main() u8`，用 `@import("sys")`（不是 `"sys.zig"`），再在 `build.zig` 的 `user_programs` 里加一项（[docs/user-programs.md](docs/user-programs.md#写一个新程序)）。回归测试程序放在 `user/tests/`，加到 `test_programs` 里，并在 `tools/qemu_test.py` 里加上检查（[docs/testing.md](docs/testing.md#加一个回归测试)）。
+用户程序：`init`（第一个进程）和 `sh`（shell）必须有，shell 的命令写在 `user/sh.zig` 里（[docs/shell.md](docs/shell.md)）。新程序放在 `user/<名字>.zig`，提供 `pub fn main() u8`，用 `@import("sys")`（不是 `"sys.zig"`），再在 `build.zig` 的 `user_programs` 里加一项（[docs/user-programs.md](docs/user-programs.md#写一个新程序)）。回归测试程序放在 `user/tests/`，加到 `test_programs` 里，并在 `tools/qemu_test.py` 里加上检查（[docs/testing.md](docs/testing.md#加一个回归测试)）。
 
 ## 文档
 

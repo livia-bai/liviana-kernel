@@ -1,6 +1,6 @@
 # 物理页分配器
 
-涉及文件：`src/page.zig`（调用方：`src/main.zig`、`src/vm.zig`、`src/shell.zig`）
+涉及文件：`src/page.zig`（调用方：`src/main.zig`、`src/vm.zig`、`src/syscall.zig`）
 
 把内核镜像之后的空闲内存切成 4 KiB 的页，一页一页地分配和释放。页表、用户程序的代码/数据/栈都从这里来。
 
@@ -89,16 +89,16 @@ pub fn free(page: *align(size) Page) void {
 | `vm.init` | 内核根页表、中间级页表（共 5 页） | 从不 |
 | `vm.walk` | 建映射时缺的中间级页表 | 用户区的页表在 `vm.destroyUserSpace` 时释放 |
 | `vm.createUserSpace` | 进程的根页表 | `vm.destroyUserSpace` |
-| `vm.allocUserPage` | 用户程序的代码、数据、栈 | `vm.destroyUserSpace` |
-| `shell` 的 `mem` 命令 | 只读 `free_pages`、`total_pages` | — |
+| `vm.allocUserPage` | 用户程序的代码、数据、栈（`exec` 加载时），`fork` 复制的每一页（`vm.cloneUserSpace`） | `vm.destroyUserSpace`（`exec` 换掉旧的地址空间时；父进程 `wait` 回收子进程时） |
+| `meminfo` 系统调用（shell 的 `mem` 命令） | 只读 `free_pages`、`total_pages` | — |
 
 一个用户程序运行时用多少页：根页表 1 + 第 1 级页表 1 + 第 0 级页表 2（各段所在的 `0x4000_0000..0x4020_0000` 一张，栈所在的 `0x7fe0_0000..0x8000_0000` 一张）+ 各段占的页 + 栈 4 页。以 Debug 版 `hello` 为例：代码 19 页 + 只读数据 4 页 + 数据 1 页，合计 4 + 24 + 4 = 32 页。用 GDB 在进程第一次进入 U 模式前停下读 `page.free_pages`，实测正好从 32052 降到 32020（单进程版本时测的，当时停在 `proc.switchToUser`；之后内核的 `.bss` 变大了，空闲页的绝对数会不同，差值不变）。
 
-程序结束后这些页全部还回来，`mem` 前后的数字应该一致；测试时就用这一点检查有没有漏页（[testing.md](testing.md)）。
+程序结束、被父进程回收后这些页全部还回来，`mem` 前后的数字应该一致（zombie 还没被回收时，它的页还占着）；测试时就用这一点检查有没有漏页（[testing.md](testing.md)）。
 
 ## 并发
 
-分配器没有锁，也不关中断。安全的前提是：它只在启动阶段和普通内核代码里调用（`kmain`、shell 的 `run` 命令），从不在中断处理程序里调用，而且只有一个 hart。以后如果中断处理程序需要分配内存，或者支持多核，就要加锁或者在分配时关中断。
+分配器没有锁，也不关中断。安全的前提是：它只在启动阶段和系统调用里调用（`kmain`、`fork`、`exec`、`wait`），从不在中断处理程序里调用，而且只有一个 hart。以后如果中断处理程序需要分配内存，或者支持多核，就要加锁或者在分配时关中断。
 
 ## 限制和以后可以做的
 

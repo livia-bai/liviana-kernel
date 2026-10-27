@@ -156,7 +156,7 @@ const from_user = frame.sstatus & riscv.sstatus_spp == 0;
 | 条件 | 处理 |
 | --- | --- |
 | 中断 5（时钟） | `timer.onInterrupt()`，`proc.wakeup(&timer.ticks)` 叫醒 `sleep` 系统调用里的进程；`from_user` 时当前进程的 `ticks` 加 1，然后 `proc.yield()`：时间片用完，让出 CPU，下次轮到这个进程时返回（[process.md](process.md#schedyield)） |
-| 中断 9（外部） | `handleExternal()`：PLIC claim → 串口（收字符；按过 Ctrl-C 就 `shell.interrupt()`；`proc.wakeup(uart.rx_chan)` 叫醒等输入的 shell）→ complete（[devices.md](devices.md#claim--complete)） |
+| 中断 9（外部） | `handleExternal()`：PLIC claim → 串口（收字符；按过 Ctrl-C 就 `proc.interruptForeground()`；`proc.wakeup(uart.rx_chan)` 叫醒在 `read` 里等输入的进程）→ complete（[devices.md](devices.md#claim--complete)） |
 | 其他中断 | `std.debug.panic("unexpected interrupt N")` |
 | 来自 U 模式的异常 8（`ecall`） | `frame.sepc += 4`，`frame.regs[10] = syscall.dispatch(frame)`（[syscalls.md](syscalls.md)） |
 | 来自 U 模式的其他异常 | `proc.killCurrent("<异常名> at <sepc>, stval=<stval>")`：结束进程，内核照常运行 |
@@ -181,8 +181,8 @@ const from_user = frame.sstatus & riscv.sstatus_spp == 0;
 
 - 不会有嵌套的陷阱，除非处理程序自己出了异常（那是内核 bug，会 panic）。
 - 系统调用都是关着中断执行的。会阻塞的系统调用（`sleep`）不在里面开中断等，而是 `proc.sleep(chan)` 切回调度器，由中断处理程序 `wakeup` 它。以后再加阻塞的调用也照这个办法做。
-- 进程切换（`proc.switchContext`）都发生在关中断时：调度器关着中断扫描进程表，进程这边是在陷阱处理程序里或者 shell 里调用 `proc.sched`。
-- 中断只可能打断 U 模式，或者调度器每一轮开头开中断的那一下。shell 也是关着中断运行的。
+- 进程切换（`proc.switchContext`）都发生在关中断时：调度器关着中断扫描进程表，进程这边是在陷阱处理程序里调用 `proc.sched`。
+- 中断只可能打断 U 模式，或者调度器每一轮开头开中断的那一下。
 
 ## 扩展
 

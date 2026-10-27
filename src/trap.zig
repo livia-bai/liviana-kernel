@@ -9,7 +9,6 @@ const plic = @import("plic.zig");
 const timer = @import("timer.zig");
 const proc = @import("proc.zig");
 const syscall = @import("syscall.zig");
-const shell = @import("shell.zig");
 
 /// 陷阱发生时被打断的上下文。regs[i] 就是寄存器 xi（x0 恒为 0，它的槽位不用）。
 /// 布局必须和 trapEntry、trapExit 里的汇编一致。
@@ -199,8 +198,8 @@ fn handleExternal() void {
         0 => return, // 没有待处理的中断
         plic.uart0_irq => {
             uart.onInterrupt();
-            // 和 xv6 的 consoleintr 一样在中断里直接处理：Ctrl-C 杀掉前台进程，叫醒等输入的 shell
-            if (uart.takeCtrlC()) shell.interrupt();
+            // 和 xv6 的 consoleintr 一样在中断里直接处理：Ctrl-C 杀掉前台进程，叫醒等输入的进程
+            if (uart.takeCtrlC()) proc.interruptForeground();
             proc.wakeup(uart.rx_chan);
         },
         else => uart.print("[trap] unexpected external interrupt {d}\n", .{irq}),

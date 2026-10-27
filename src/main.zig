@@ -8,7 +8,6 @@ const uart = @import("uart.zig");
 const trap = @import("trap.zig");
 const plic = @import("plic.zig");
 const timer = @import("timer.zig");
-const shell = @import("shell.zig");
 const dtb = @import("dtb.zig");
 const page = @import("page.zig");
 const vm = @import("vm.zig");
@@ -82,8 +81,8 @@ fn kmain(hartid: usize, dtb_addr: usize) callconv(.c) noreturn {
     riscv.enableInterrupts();
     uart.print("[ok] interrupts enabled: timer at {d} Hz, keyboard via UART + PLIC\n", .{timer.tick_hz});
 
-    uart.write("Type 'help' for commands.\n");
-    // 和 xv6 的 main 一样：建好第一个进程（这里是 shell 内核线程），然后启动栈就交给调度器，永远不回来
-    _ = proc.spawnKernel("shell", &shell.main) catch unreachable; // 进程表是空的
+    // 和 xv6 的 main 一样：建好第一个进程 init，然后启动栈就交给调度器，永远不回来。
+    // init 再启动 shell（user/init.zig、user/sh.zig）
+    proc.userinit() catch |err| std.debug.panic("cannot start init: {s}", .{@errorName(err)});
     proc.scheduler();
 }

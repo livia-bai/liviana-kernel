@@ -20,8 +20,8 @@ zig build test --summary all   # 显示通过了几个
 | --- | --- |
 | `src/dtb.zig` | 用测试里的 `TestFdt` 按 FDT 格式拼一份设备树，检查解析出的内存、时钟频率、保留区；截断、魔数不对、缺少时钟频率时返回错误 |
 | `src/page.zig` | 先分配低地址、分配时清零、跳过保留区、内存用完时报 `OutOfMemory` |
-| `src/vm.zig` | 能用大页时用大页（比较用掉的页表数）；`copyFromUser` 只读得到 U 模式可读的用户页；释放用户空间后不漏页 |
-| `src/proc.zig` | 加载真正的用户程序 `hello`（`build.zig` 把用户程序的 ELF 也交给了单元测试）；拒绝截断、魔数不对、不是 RISC-V、程序头越界、没有权限的段；`wakeup` 只叫醒睡在同一个通道上的进程；`kill` 只做标记、叫醒在睡的进程、只记第一次的原因、拒绝内核线程和不存在的 pid |
+| `src/vm.zig` | 能用大页时用大页（比较用掉的页表数）；`copyFromUser` 只读得到 U 模式可读的用户页，`copyToUser` 只写得进 U 模式可写的页，`checkUser` 检查整个范围（跨页、溢出、长度 0）；`cloneUserSpace` 复制内容和权限、两边互不影响；释放用户空间后不漏页 |
+| `src/proc.zig` | 加载真正的用户程序 `hello`（`build.zig` 把用户程序的 ELF 也交给了单元测试）；拒绝截断、魔数不对、不是 RISC-V、程序头越界、没有权限的段；`wakeup` 只叫醒睡在同一个通道上的进程；`kill` 只做标记、叫醒在睡的进程、只记第一次的原因、拒绝 init 和不存在的 pid；`wait` 只找自己的子进程、按 pid 挑；`reparent` 把子进程交给 init 并叫醒它 |
 | `src/abi.zig` | 系统调用返回值和错误码的互相转换 |
 
 为什么页表能在主机上测：内核对物理内存做了恒等映射，页表里的地址就是能直接用的指针。测试拿一块按 4 KiB 对齐的数组交给页分配器当作“物理内存”，页表就建在这块数组里，代码不用改。只有 `vm.activate` 这类写 CSR 的函数不能在主机上调用，测试也不会用到它们：Zig 只编译被用到的函数，所以这些文件里的 RISC-V 内联汇编不影响在主机上编译。
@@ -31,7 +31,7 @@ zig build test --summary all   # 显示通过了几个
 ```sh
 python3 tools/qemu_test.py --changed      # 只跑和还没提交的改动有关的用例（平时用这个）
 python3 tools/qemu_test.py                # 全部用例，safe 模式，约 5 秒
-python3 tools/qemu_test.py shell panic    # 只跑指定的用例
+python3 tools/qemu_test.py shell fork     # 只跑指定的用例
 python3 tools/qemu_test.py --all-modes    # debug、safe、fast、small 四种模式都跑
 python3 tools/qemu_test.py --list         # 列出用例和它们覆盖的文件
 ```
@@ -40,28 +40,34 @@ python3 tools/qemu_test.py --list         # 列出用例和它们覆盖的文件
 
 | 用例 | 做什么 | 覆盖的文件 |
 | --- | --- | --- |
-| `shell` | `help`、`uptime`、不认识的命令、`ebreak` | `src/shell.zig` |
-| `interrupts` | `spin` 在前台死循环 0.5 秒，时钟中断至少来 10 次，Ctrl-C 能结束它；在 shell 里按的 Ctrl-C 不会误杀下一个程序 | `src/timer.zig`、`src/sbi.zig`、`src/plic.zig`、`src/proc.zig`、`user/spin.zig` |
-| `user` | `hello`（系统调用、拒绝内核指针）、`fault`（读内核内存被杀）、`t_panic`、`t_time` | `src/proc.zig`、`src/syscall.zig`、`src/abi.zig`、`user/` 的运行时和程序 |
-| `sched` | 两个后台 `spin` 死循环时，前台的 `hello`、`t_sleep` 照样跑完；0.5 秒里两个 `spin` 各自至少拿到 5 个 tick（`ps` 的 `TICKS`）；Ctrl-C 只结束前台进程；后台的 `ticker` 在 `ps` 里是 `sleeping`；`kill` 正常的、不存在的、缺参数的 pid；开满 8 个进程后再 `run` 报 `too many processes` | `src/proc.zig`、`src/shell.zig`、`src/syscall.zig`、`src/abi.zig`、`src/timer.zig`、`user/sys.zig`、`user/spin.zig`、`user/ticker.zig`、`user/hello.zig`、`user/tests/t_sleep.zig` |
-| `syscall` | `t_sys`：`write` 的各种边界情况、不存在的调用号 | `src/syscall.zig`、`src/abi.zig`、`user/sys.zig` |
-| `protection` | `t_wx`、`t_stack`、`t_priv`、`t_fp`、`t_noperm`：硬件和加载器的各种保护 | `src/proc.zig`、`user/linker.ld`、对应的测试程序 |
-| `panic` | `crash` 之后检查 panic 信息，并检查停机后 1 秒内 QEMU 用掉的 CPU 时间不超过一半（读 `/proc`，只能在 Linux 上运行） | 只由核心文件触发 |
+| `shell` | `help`、`uptime`、不认识的命令、`run` 不带参数和找不到的程序 | 只由核心文件触发 |
+| `interrupts` | `spin` 在前台死循环 0.5 秒，时钟中断至少来 10 次（`uptime` 的差），Ctrl-C 能结束它；在 shell 里按的 Ctrl-C 不会误杀下一个程序 | `src/timer.zig`、`src/sbi.zig`、`src/plic.zig`、`user/spin.zig` |
+| `user` | `hello`（系统调用、拒绝内核指针）、`fault`（读内核内存被杀）、`t_panic`、`t_time` | `user/linker.ld` 和这几个程序 |
+| `sched` | 两个后台 `spin` 死循环时，前台的 `hello`、`t_sleep` 照样跑完；0.5 秒里两个 `spin` 各自至少拿到 5 个 tick（`ps` 的 `TICKS`）；`ps` 里 init 是 pid 1、在睡，sh 是它的子进程、在运行；Ctrl-C 只结束前台进程，也能结束睡在 `sleep` 里的前台进程；后台的 `ticker` 在 `ps` 里是 `sleeping`；`kill` 正常的、不存在的、缺参数的 pid 和 init；开满进程表后再 `run` 报 `too many processes` | `src/timer.zig`、`user/spin.zig`、`user/ticker.zig`、`user/hello.zig`、`user/tests/t_sleep.zig` |
+| `syscall` | `t_sys`：`write` 的各种边界情况、不存在的调用号 | `user/tests/t_sys.zig` |
+| `fork` | `t_fork`（自己检查 37 项，见下文）；`t_read` 分几次读完一行，睡在 `read` 里时按 Ctrl-C 能结束它；杀掉 shell 后 init 重新启动一个 | `user/hello.zig`、`user/tests/t_fork.zig`、`user/tests/t_read.zig` |
+| `protection` | `t_wx`、`t_stack`、`t_priv`、`t_fp`、`t_noperm`：硬件和加载器的各种保护 | `user/linker.ld`、对应的测试程序 |
 
-`build.zig`、链接脚本、`src/main.zig`、`riscv.zig`、`trap.zig`、`vm.zig`、`page.zig`、`dtb.zig`、`uart.zig` 是核心文件，改了它们就跑全部用例；没登记过的内核文件也一样。只改了文档时，`--changed` 什么都不跑。
+`build.zig`、链接脚本、`src/` 下的 `main.zig`、`riscv.zig`、`trap.zig`、`vm.zig`、`page.zig`、`dtb.zig`、`uart.zig`、`proc.zig`、`syscall.zig`、`abi.zig`，以及 `user/` 下的 `start.zig`、`sys.zig`、`init.zig`、`sh.zig` 是核心文件：所有用例都要经过 init、shell 和系统调用，改了它们就跑全部用例；没登记过的内核文件也一样。只改了文档时，`--changed` 什么都不跑。
 
 优化模式默认只用 safe：既有安全检查（整数溢出、越界），也开了优化。改了内联汇编、MMIO、中断、页表、进出 U 模式的代码时，再加 `--all-modes`：release 模式下编译器会更激进地利用类型系统的承诺，漏写的 `volatile`、clobber，写错的 `noreturn`，往往只在 release 模式下出问题。
 
-失败时会列出没通过的检查，以及串口日志的位置（`zig-out/qemu-test/<模式>/serial.log`，`panic` 用例是 `panic.log`）：
+失败时会列出没通过的检查，以及串口日志的位置（`zig-out/qemu-test/<模式>/serial.log`）：
 
 ```
-FAIL  safe   shell       4 checks
-    - unknown command: expected /unknown command: nope/ in output:
-      | nope
-      | unknwon command: nope (try 'help')
+FAIL  safe   fork        14 checks
+    - run t_fork: expected /\d+ checks, 0 failed/ in output:
+      ...
+      | FAIL: procinfo total 4 (init, sh, t_fork)
+      | 36 checks, 1 failed
+      | [proc] pid 3 (t_fork) exited with code 1
       | > 
     serial log: zig-out/qemu-test/safe/serial.log
 ```
+
+（这是故意去掉 `proc.finish` 里的 `reparent` 时的输出：孤儿没有交给 init，结束后没人回收，一直占着进程表。）
+
+内核 panic 之后停机的行为（停机后不能忙等）没有自动测试：触发内核 panic 的 shell 命令随着 shell 搬到用户态一起去掉了。
 
 ## 回归测试程序
 
@@ -78,6 +84,8 @@ FAIL  safe   shell       4 checks
 | `t_sleep` | `sleep(200)` 前后的 `uptime()`；`sleep(0)`、`yield()` | 睡了 200..1000 ms（按 tick 算至少 200）；之后打印 `yield ok`，退出码 0 |
 | `t_time` | U 模式执行 `rdtime` | 正常返回（`scounteren` 允许，见 [user-programs.md](user-programs.md#写一个新程序)） |
 | `t_noperm` | 数据段 `FLAGS(0)` 的 ELF（用 `user/tests/noperm.ld` 链接） | `run: cannot load t_noperm: BadElf` |
+| `t_fork` | `fork` 的返回值和地址空间复制；`wait` 的退出码、nohang、没有子进程、别人的子进程、坏的 options、写不进状态时不回收；`kill` 睡着的子进程、init、不存在的 pid；`setfg` 不存在的 pid；`exec` 不存在的程序、太长的名字、坏 ELF、坏指针，成功后 pid 不变；孤儿交给 init（孙进程的 `getppid()` 变成 1）；`fork` 到进程表满（`EAGAIN`）再全部回收；`procinfo`、`meminfo`、`listprog`、`read` 的坏参数和边界 | 每项失败打印 `FAIL: ...`；最后 `N checks, 0 failed`，退出码 0 |
+| `t_read` | 每次最多 `read` 3 个字节，读到回车为止 | 输入 `hello world` 回车：`got "hello world" in N reads`，N ≥ 4 |
 
 ### 加一个回归测试
 
@@ -171,16 +179,17 @@ dtc -I dtb -O dts virt.dtb
 | `run` 一个程序就 `killed: instruction_page_fault at 0x0, stval=0x0` | 用户 ELF 的入口是 0：`_start` 没有导出（release 模式下尤其要注意） | `llvm-readelf -h` 看 `Entry point`；`_start` 必须在根文件 `user/start.zig` 里 |
 | 进程结束后 `KERNEL PANIC: page.free: 0x.. was not handed out by the page allocator` | 切回调度器之后状态不对：典型的是调用 `switchContext` 之后的代码被优化掉了（单进程版本出过一次） | 只在 release 模式出现时，怀疑 `noreturn`、clobber、`volatile`；对照 `llvm-objdump -d` 看 `proc.scheduler` |
 | 内核 `store_page_fault`，`stval` 在内核的代码或只读数据里 | 往只读段写了数据（W^X 生效了） | 用 `llvm-nm` 查 `stval` 落在哪个符号 |
-| 内核 `load_page_fault`，`stval` 很小或是 0 | 空指针解引用（`crash` 命令就是这样） | `sepc` 对应的源码行：GDB 里 `info line *0x...` |
-| 内核 `load/store_page_fault`，`stval` 在 `0x4000_0000..0x8000_0000` | 内核直接解引用了用户指针（`SUM` 是 0） | 改成 `vm.copyFromUser` |
+| 内核 `load_page_fault`，`stval` 很小或是 0 | 空指针解引用 | `sepc` 对应的源码行：GDB 里 `info line *0x...` |
+| 内核 `load/store_page_fault`，`stval` 在 `0x4000_0000..0x8000_0000` | 内核直接解引用了用户指针（`SUM` 是 0） | 改成 `vm.copyFromUser` / `vm.copyToUser` |
 | 只有 OpenSBI 横幅，内核什么都没打印 | `_start` 不在 `0x8020_0000`，或者串口初始化之前就出错 | `llvm-readelf -S` 看 `.text` 起始；`-d int` 看第一个异常 |
 | `cannot parse device tree at 0x...: <错误>` | 设备树格式不对，或者解析器有 bug | [devicetree.md](devicetree.md#错误) 的错误表；导出设备树用 `dtc` 看 |
 | QEMU 卡住、`timeout` 返回 124 | 内核 panic 停机（看输出最后几行），或者死循环、陷阱风暴 | `-d int` 日志的最后几行 |
-| `run` 完一个程序 `mem` 的数字变小了 | 有页没释放 | 检查 `destroyUserSpace`、新加的分配路径 |
-| 内核 panic 停机后 QEMU 仍然占满一个 CPU 核 | `wfi` 被一直挂着的中断反复唤醒：停机前没有把 `sie` 清零 | `qemu_test.py panic` 会报 `busy-waiting?`；看 `kernelPanic` |
+| `run` 完一个程序 `mem` 的数字变小了 | 有页没释放；或者有结束了的进程没人 `wait`（`ps` 里是 `zombie`） | 检查 `destroyUserSpace`、新加的分配路径；看 `ps` |
+| `KERNEL PANIC: init exited` | init 结束了（被异常杀掉，或者 `main` 返回了） | 看 panic 前面打印的 `[proc] pid 1 (init) ...` |
+| 内核 panic 停机后 QEMU 仍然占满一个 CPU 核 | `wfi` 被一直挂着的中断反复唤醒：停机前没有把 `sie` 清零 | 看 `kernelPanic` |
 | `uptime` 比实际时间越走越慢 | 下一次时钟中断按“处理时的 `time` + 周期”预约，每个 tick 都丢掉了处理延迟 | 看 `timer.arm` |
 | 改了代码，运行结果却和改之前一样（或者出现早已修复的问题） | 这次构建失败了，手动运行的 QEMU 跑的是上一次的内核 | 看构建输出；手动运行时用 `zig build && qemu-system-riscv64 ...`，或者直接用 `qemu_test.py` |
-| 编译错误 `unable to call function with calling convention 'naked'` | 直接调用了裸函数 | 在内联汇编里 `call`（[process.md](process.md#switchtouser)） |
+| 编译错误 `unable to call function with calling convention 'naked'` | 直接调用了裸函数 | 在内联汇编里 `call`（[process.md](process.md#switchcontext)） |
 | 编译错误 `unused argument in '...'` | `std.fmt.comptimePrint` 的参数结构体里有格式串用不到的字段 | 删掉多余字段，或者改用汇编操作数（如 `"i"` 约束） |
 | 编译错误 `name shadows primitive 'u0'` | 变量名和原始类型重名：`u0`、`u1`、`i8` 这类“字母 u/i + 位宽”的名字都是整数类型 | 改名 |
 | 编译错误 `file exists in modules 'sys' and 'program'` | 用户程序按路径 `@import("sys.zig")` | 改成 `@import("sys")` |

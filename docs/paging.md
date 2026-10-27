@@ -141,7 +141,7 @@ pub fn init(memory: dtb.Region) MapError!void
 
 - **为什么是恒等映射**：写 `satp` 的那一刻 CPU 就开始翻译地址，正在执行的代码地址必须在新页表里映射到同一个物理地址，否则下一条指令就会取错。恒等映射一次性解决这个问题，也让页分配器给出的物理地址可以继续直接当指针用（分配页表、往用户页里复制数据都靠这一点）。
 - **按段设权限**带来的保护：往代码或只读数据里写会触发写缺页（`store_page_fault`），跳到数据或空闲内存里执行会触发取指缺页。这要求各段按页对齐，见 [boot.md](boot.md#链接脚本)。开发时用一段临时代码验证过：往 `kmain` 所在的代码页写一个字，得到 `store_page_fault`。
-- **不映射的地方**：内核之前的 `0x8000_0000..0x8020_0000`（其中 `0x8000_0000..0x8006_0000` 是 OpenSBI，PMP 本来就不让 S 模式访问；后面是空着的，内核用不到）；地址 0 附近（空指针解引用变成 `load_page_fault`，shell 的 `crash` 命令演示的就是这个）；设备树里的其他外设（virtio、RTC 等，内核不用）。
+- **不映射的地方**：内核之前的 `0x8000_0000..0x8020_0000`（其中 `0x8000_0000..0x8006_0000` 是 OpenSBI，PMP 本来就不让 S 模式访问；后面是空着的，内核用不到）；地址 0 附近（空指针解引用变成 `load_page_fault`）；设备树里的其他外设（virtio、RTC 等，内核不用）。
 - 开始映射前检查内核镜像是否完全在设备树报告的内存范围里，不在就 panic（`kernel image is outside of RAM`）。
 
 ## 切换地址空间
@@ -157,7 +157,7 @@ pub fn activate(root: *PageTable) void {
 - `satp` = MODE（最高 4 位，8 = Sv39）| ASID（第 44..59 位，这里一直是 0）| 根页表的物理页号。
 - 规范规定写 `satp` 本身不保证之前对页表的修改已经生效，也不会作废 TLB。所以写之前和之后各执行一次 `sfence.vma`：之前的那次保证页表的写入对页表遍历可见，之后的那次作废旧地址空间留在 TLB 里的翻译。
 - 没有使用 ASID，所有地址空间都是 ASID 0，所以每次切换都要作废整个 TLB。内核映射带 G 位，规范允许实现保留它们，但不带参数的 `sfence.vma` 会连全局项一起作废，这里也没有依赖这个优化。
-- `vm.init` 最后调用 `activate(kernel_root)` 打开分页；`proc.scheduler` 每次切到用户进程前切到它的地址空间，进程让出 CPU 后切回 `kernel_root`（回收进程的页表之前必须先切走）。内核线程（shell）没有自己的地址空间，一直用 `kernel_root`。
+- `vm.init` 最后调用 `activate(kernel_root)` 打开分页；`proc.scheduler` 每次切到用户进程前切到它的地址空间，进程让出 CPU 后切回 `kernel_root`（父进程回收它的页表之前必须先切走）；`proc.exec` 换地址空间时先切到新的，再释放旧的。
 
 ## 用户地址空间
 
@@ -197,11 +197,32 @@ pub fn destroyUserSpace(root: *PageTable) void
 释放用户区（根页表第 1 项）下面的所有东西：`freeTree` 递归地释放每个有效的叶子指向的物理页、每一张中间级页表，最后释放根页表本身。**调用前必须已经切换到别的地址空间**，否则正在使用的页表会被释放。`freeTree` 把叶子都当作 4 KiB 的页释放，这依赖于“用户映射只用 4 KiB 的页”。
 
 ```zig
-fn translateUser(root: *PageTable, va: usize) ?usize
+fn translateUser(root: *PageTable, va: usize, write: bool) ?usize
 pub fn copyFromUser(root: *PageTable, dst: []u8, src: usize) error{BadAddress}!void
+pub fn copyToUser(root: *PageTable, dst: usize, src: []const u8) error{BadAddress}!void
+pub fn checkUser(root: *PageTable, va: usize, len: usize, write: bool) error{BadAddress}!void
 ```
 
-`translateUser` 用软件走一遍页表，把用户虚拟地址翻译成物理地址；要求地址在用户区里，叶子有效、带 U 位、可读，否则返回 null。`copyFromUser` 在此基础上逐页翻译、逐页复制，是系统调用读取用户内存的唯一途径，详见 [syscalls.md](syscalls.md#访问用户内存)。
+`translateUser` 用软件走一遍页表，把用户虚拟地址翻译成物理地址；要求地址在用户区里，叶子有效、带 U 位、可读（`write` 为 true 时还要可写），否则返回 null。`copyFromUser` / `copyToUser` 在此基础上逐页翻译、逐页复制，是系统调用读写用户内存的唯一途径；`checkUser` 只检查整个范围、不复制。详见 [syscalls.md](syscalls.md#访问用户内存)。
+
+### 复制用户地址空间
+
+```zig
+pub fn cloneUserSpace(src: *PageTable) error{OutOfMemory}!*PageTable
+fn cloneTree(dst: *PageTable, pte: Pte, level: u2, va: usize) error{OutOfMemory}!void
+```
+
+`fork` 用它给子进程复制一份地址空间（[process.md](process.md#fork)）：
+
+1. `createUserSpace()` 新建一个根页表（内核部分照常共用）。
+2. 遍历 `src` 根页表的用户区（第 1 项），`cloneTree` 递归地往下走：遇到无效项跳过；遇到中间级页表就继续往下，同时算出这一项覆盖的虚拟地址；遇到叶子就用 `allocUserPage(dst, va, 原来的 R/W/X)` 分配一页新的物理内存映射到**同一个地址**，再把原来那一页的内容整页复制过去。
+3. 中途内存不够时，`errdefer destroyUserSpace(dst)` 把已经复制的部分全部释放。
+
+- 断言叶子都在第 0 级：用户映射只用 4 KiB 的页（`allocUserPage`），所以不会遇到大页。
+- `allocUserPage` 返回 `AlreadyMapped` 不可能发生（`dst` 是新的，按 `src` 的结构一页一页地映射），写成 `unreachable`。
+- 复制之后两边的物理页完全独立，各改各的。没有写时复制：`fork` 之后马上 `exec` 的话，复制的页马上就被释放了。现在的程序都只有几十 KiB，代价可以接受。
+
+单元测试（`vm.zig` 末尾）检查：内容复制过来了；改子进程那一份，父进程的不变；代码页仍然只读、栈页可写、没映射的仍然没映射；两边都释放后不漏页。
 
 ## 调试技巧
 

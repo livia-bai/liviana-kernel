@@ -4,13 +4,11 @@
 检查分成几个用例（--list 查看），每个用例写明它覆盖哪些源文件：
   python3 tools/qemu_test.py                  # 全部用例，safe 模式
   python3 tools/qemu_test.py --changed        # 只跑和未提交的改动有关的用例
-  python3 tools/qemu_test.py shell panic      # 只跑指定的用例
+  python3 tools/qemu_test.py shell fork       # 只跑指定的用例
   python3 tools/qemu_test.py --all-modes      # 四种优化模式都跑（改了汇编、中断、页表、进出 U 模式时用）
 
-每种模式只构建一次（带上 user/tests/ 里的测试程序），所有用例共用一次启动；
-panic 用例让内核停机，单独启动一次。启动日志每次都检查；结束时比较前后两次 mem 的空闲页数
-（不能漏页）、shutdown 后 QEMU 的退出码必须为 0、输出里不能有 KERNEL PANIC。
-panic 用例读 /proc/<pid>/stat 统计 QEMU 的 CPU 时间，只能在 Linux 上运行。
+每种模式只构建一次（带上 user/tests/ 里的测试程序），所有用例共用一次启动。启动日志每次都检查；
+结束时比较前后两次 mem 的空闲页数（不能漏页）、shutdown 后 QEMU 的退出码必须为 0、输出里不能有 KERNEL PANIC。
 """
 
 import argparse
@@ -31,14 +29,11 @@ PROMPT = "\n> "  # 串口把 \n 输出成 \r\n，比较前统一换成 \n
 SPIN_SECONDS = 0.5  # 让 spin 转多久再按 Ctrl-C
 MIN_SPIN_TICKS = 10  # 这段时间里至少要有多少次时钟中断（100 Hz 下理论上约 50 次）
 TIMEBASE_HZ = 10_000_000  # QEMU virt 的 time CSR 频率
-HALT_SECONDS = 1.0  # panic 停机后量多久 QEMU 的 CPU 时间
-MAX_HALT_CPU = 0.5  # 停机期间 QEMU 最多占用一个核的多少（忙等时接近 100%，正常接近 0）
 
 # 用户地址空间里栈下面那一页保护页（src/proc.zig）
 GUARD_PAGE = (0x7FFFB000, 0x7FFFC000)
 USER_SPACE = (0x40000000, 0x80000000)
-MAX_PROCS = 8  # src/proc.zig 的 max_procs，其中一个槽位是 shell 内核线程
-SHELL_PID = 1  # shell 是第一个进程（src/main.zig）
+MAX_PROCS = 8  # src/abi.zig 的 max_procs，其中两个槽位是 init 和 sh
 SPIN_STARTED = re.compile(r"pid (\d+) spinning in U-mode")
 
 
@@ -102,17 +97,6 @@ class Qemu:
         text = self.wait_for(lambda t: t.count(PROMPT) > prompts, COMMAND_TIMEOUT, f"the prompt after '{line}'")
         return text[start:]
 
-    def cpu_seconds(self):
-        """QEMU 进程（所有线程）到目前为止用掉的 CPU 时间，单位秒。读 /proc，只支持 Linux。"""
-        try:
-            with open(f"/proc/{self.proc.pid}/stat", encoding="ascii") as f:
-                # 第 2 项是括号里的进程名，可能含空格，所以从最后一个 ')' 之后开始数：
-                # 之后的第 0 项是第 3 项 state，utime、stime 是第 14、15 项
-                fields = f.read().rsplit(")", 1)[1].split()
-        except OSError as e:
-            raise Failure(f"cannot read QEMU's CPU time from /proc (Linux only): {e}")
-        return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
-
     def finish(self, timeout):
         """等 QEMU 自己退出，返回退出码；超时就杀掉并报错。"""
         try:
@@ -175,14 +159,15 @@ def exited(c, out, name, code):
 
 def case_shell(q, c, mode):
     c.contains(q.command("help"), r"run NAME", "help")
-    c.contains(q.command("uptime"), r"up \d+\.\d\ds \(\d+ timer interrupts\)", "uptime")
+    c.contains(q.command("uptime"), r"up \d+\.\d\ds\n", "uptime")
     c.contains(q.command("nope"), r"unknown command: nope", "unknown command")
-    c.contains(q.command("ebreak"), r"\[trap\] breakpoint at 0x[0-9a-f]+, skipping it", "ebreak")
+    c.contains(q.command("run"), r"programs: init sh hello", "run without a name")
+    c.contains(q.command("run nope"), r"no such program: nope\nprograms: ", "run nope")
 
 
 def case_interrupts(q, c, mode):
     # spin 在 U 模式里死循环。这段时间里内核只能靠中断拿回 CPU，
-    # 所以前后两次 uptime 的差说明时钟中断在 U 模式下照常发生；Ctrl-C 靠串口中断送进来
+    # 所以前后两次 uptime（精度是一个 tick，10 ms）的差说明时钟中断在 U 模式下照常发生；Ctrl-C 靠串口中断送进来
     before = uptime_ticks(q, c)
     run_and_interrupt(q, c, SPIN_SECONDS)
     after = uptime_ticks(q, c)
@@ -209,8 +194,9 @@ def run_and_interrupt(q, c, seconds):
 
 
 def uptime_ticks(q, c):
-    m = c.contains(q.command("uptime"), r"up \d+\.\d\ds \((\d+) timer interrupts\)", "uptime")
-    return int(m.group(1)) if m else None
+    """uptime 显示到 1/100 秒，正好是 tick 数。"""
+    m = c.contains(q.command("uptime"), r"up (\d+)\.(\d\d)s", "uptime")
+    return int(m.group(1)) * 100 + int(m.group(2)) if m else None
 
 
 def case_user(q, c, mode):
@@ -246,14 +232,16 @@ def start_background(q, c, name):
 
 
 def ps_table(q, c):
-    """运行 ps，返回 {pid: (状态, ticks, 名字)}，不含 shell 自己（检查它是正在运行的那一个）。"""
+    """运行 ps，返回 {pid: (状态, ticks, 名字)}，不含 init 和 sh（检查它们的父进程和状态）。"""
     out = q.command("ps")
-    c.contains(out, r"PID STATE +TICKS NAME", "ps")
-    table = {int(m.group(1)): (m.group(2), int(m.group(3)), m.group(4))
-             for m in re.finditer(r"^ *(\d+) (\w+) +(\d+) (\w+)$", out, re.M)}
-    shell = table.pop(SHELL_PID, None)
-    c.expect(shell == ("running", 0, "shell"), f"ps: expected pid {SHELL_PID} to be the running shell, got {shell}")
-    return table
+    c.contains(out, r"PID +PPID STATE +TICKS NAME", "ps")
+    rows = [(int(m.group(1)), int(m.group(2)), m.group(3), int(m.group(4)), m.group(5))
+            for m in re.finditer(r"^ *(\d+) +(\d+) (\w+) +(\d+) (\w+)$", out, re.M)]
+    init = [r for r in rows if r[4] == "init"]
+    sh = [r for r in rows if r[4] == "sh"]
+    c.expect([r[:3] for r in init] == [(1, 0, "sleeping")], f"ps: expected init as pid 1, sleeping: {rows}")
+    c.expect(len(sh) == 1 and sh[0][1:3] == (1, "running"), f"ps: expected one running sh, child of init: {rows}")
+    return {r[0]: (r[2], r[3], r[4]) for r in rows if r[4] not in ("init", "sh")}
 
 
 def case_sched(q, c, mode):
@@ -304,14 +292,14 @@ def case_sched(q, c, mode):
 
     # kill
     for pid in spinners + [ticker]:
-        c.contains(q.command(f"kill {pid}"), rf"\[proc\] pid {pid} \(\w+\) killed: kill command", "kill")
+        c.contains(q.command(f"kill {pid}"), rf"\[proc\] pid {pid} \(\w+\) killed: kill\(\)", "kill")
     c.contains(q.command("kill 9999"), r"kill: no such process: 9999", "kill 9999")
-    c.contains(q.command(f"kill {SHELL_PID}"), rf"kill: pid {SHELL_PID} is a kernel thread", "kill the shell")
+    c.contains(q.command("kill 1"), r"kill: cannot kill pid 1: permission denied", "kill init")
     c.contains(q.command("kill"), r"usage: kill PID", "kill")
     c.expect(ps_table(q, c) == {}, "ps: processes left after killing all of them")
 
-    # 进程表满了（shell 占着一个槽位）
-    full = [start_background(q, c, "spin") for _ in range(MAX_PROCS - 1)]
+    # 进程表满了（init 和 sh 占着两个槽位）
+    full = [start_background(q, c, "spin") for _ in range(MAX_PROCS - 2)]
     c.contains(q.command("run hello"), rf"run: too many processes \(at most {MAX_PROCS}\)", "run with a full table")
     for pid in full:
         if pid is not None:
@@ -344,40 +332,66 @@ def case_protection(q, c, mode):
     c.expect("should never run" not in out, "run t_noperm: the program ran")
 
 
-def case_panic(q, c, mode):
+def case_fork(q, c, mode):
+    # t_fork 自己检查 fork、exec、wait、kill 等的边界情况，失败的项打印 FAIL
+    out = q.command("run t_fork")
+    c.contains(out, r"\d+ checks, 0 failed", "run t_fork")
+    c.expect("FAIL" not in out, f"run t_fork:\n{indent(out)}")
+    m = c.contains(out, r"child pid (\d+) execs hello", "run t_fork")
+    if m:  # exec 之后 pid 不变
+        c.contains(out, rf"Hello from U-mode! I am pid {m.group(1)},", "run t_fork: exec keeps the pid")
+    c.contains(out, r"orphan's parent is pid 1\n", "run t_fork: orphans go to init")
+    c.contains(out, rf"forked {MAX_PROCS - 3} children before the table was full", "run t_fork")
+    exited(c, out, "t_fork", 0)
+
+    # read：一行分几次读完；之后对睡在 read 里的进程按 Ctrl-C
     start = len(q.text())
-    q.send("crash\r")
-    text = q.wait_for(lambda t: "system halted.\n" in t[start:], COMMAND_TIMEOUT, "the kernel to halt after 'crash'")
-    c.contains(text[start:], r"!!! KERNEL PANIC: unhandled exception: load_page_fault \(scause=13\), "
-               r"sepc=0x[0-9a-f]+, stval=0x0\n", "crash")
-    # 停机后 QEMU 应该几乎不占 CPU：时钟中断没人再预约，会一直挂着，wfi 如果还能被它唤醒就成了忙等
-    before = q.cpu_seconds()
-    time.sleep(HALT_SECONDS)
-    used = (q.cpu_seconds() - before) / HALT_SECONDS
-    c.expect(used <= MAX_HALT_CPU,
-             f"crash: QEMU used {used:.0%} of a CPU during {HALT_SECONDS}s after the kernel halted (busy-waiting?)")
+    prompts = q.text().count(PROMPT)
+    q.send("run t_read\r")
+    q.wait_for(lambda t: "reading\n" in t[start:], COMMAND_TIMEOUT, "t_read to start")
+    q.send("hello world\r")
+    out = q.wait_for(lambda t: t.count(PROMPT) > prompts, COMMAND_TIMEOUT, "the prompt after t_read")[start:]
+    m = c.contains(out, r'got "hello world" in (\d+) reads', "run t_read")
+    if m:
+        c.expect(int(m.group(1)) >= 4, f"run t_read: a 12-byte line in {m.group(1)} reads of at most 3 bytes")
+    exited(c, out, "t_read", 0)
+    start = len(q.text())
+    prompts = q.text().count(PROMPT)
+    q.send("run t_read\r")
+    q.wait_for(lambda t: "reading\n" in t[start:], COMMAND_TIMEOUT, "t_read to start")
+    q.send("\x03")
+    out = q.wait_for(lambda t: t.count(PROMPT) > prompts, COMMAND_TIMEOUT, "the prompt after Ctrl-C on t_read")[start:]
+    c.contains(out, r"\^C\n\[proc\] pid \d+ \(t_read\) killed: interrupted by Ctrl-C", "run t_read + Ctrl-C")
+
+    # shell 被杀之后 init 重新启动一个
+    out = q.command("ps")
+    m = re.search(r"^ *(\d+) +1 running +\d+ sh$", out, re.M)
+    c.expect(m is not None, f"ps: no running sh:\n{indent(out)}")
+    if m:
+        out = q.command(f"kill {m.group(1)}")
+        c.contains(out, rf"\[proc\] pid {m.group(1)} \(sh\) killed: kill\(\)\ninit: sh exited, restarting it\n"
+                   r"Type 'help' for commands\.", "kill sh")
+        exited(c, q.command("run hello"), "hello", 0)
 
 
 # 每个用例覆盖的文件。改了 CORE 里的文件（或者没列出的内核文件）就跑全部用例。
 CORE = ["build.zig", "linker.ld", "src/main.zig", "src/riscv.zig", "src/trap.zig", "src/vm.zig", "src/page.zig",
-        "src/dtb.zig", "src/uart.zig", "tools/qemu_test.py"]
+        "src/dtb.zig", "src/uart.zig", "src/proc.zig", "src/syscall.zig", "src/abi.zig", "user/start.zig",
+        "user/sys.zig", "user/init.zig", "user/sh.zig", "tools/qemu_test.py"]
 NOT_KERNEL = ["src/tests.zig"]  # 只在单元测试里用
 CASES = {
-    # 名字: (函数, 覆盖的文件, 是否以内核停机结束)
-    "shell": (case_shell, ["src/shell.zig"], False),
-    "interrupts": (case_interrupts, ["src/timer.zig", "src/sbi.zig", "src/plic.zig", "src/proc.zig", "user/spin.zig"], False),
-    "user": (case_user, ["src/proc.zig", "src/syscall.zig", "src/abi.zig", "user/start.zig", "user/sys.zig",
-                         "user/linker.ld", "user/hello.zig", "user/fault.zig", "user/tests/t_panic.zig",
-                         "user/tests/t_time.zig"], False),
-    "sched": (case_sched, ["src/proc.zig", "src/shell.zig", "src/syscall.zig", "src/abi.zig", "src/timer.zig",
-                           "user/sys.zig", "user/spin.zig", "user/ticker.zig", "user/hello.zig",
-                           "user/tests/t_sleep.zig"], False),
-    "syscall": (case_syscall, ["src/syscall.zig", "src/abi.zig", "user/sys.zig", "user/tests/t_sys.zig"], False),
-    "protection": (case_protection, ["src/proc.zig", "user/linker.ld", "user/tests/t_wx.zig", "user/tests/t_stack.zig",
+    # 名字: (函数, 覆盖的文件)
+    "shell": (case_shell, []),
+    "interrupts": (case_interrupts, ["src/timer.zig", "src/sbi.zig", "src/plic.zig", "user/spin.zig"]),
+    "user": (case_user, ["user/linker.ld", "user/hello.zig", "user/fault.zig", "user/tests/t_panic.zig",
+                         "user/tests/t_time.zig"]),
+    "sched": (case_sched, ["src/timer.zig", "user/spin.zig", "user/ticker.zig", "user/hello.zig",
+                           "user/tests/t_sleep.zig"]),
+    "syscall": (case_syscall, ["user/tests/t_sys.zig"]),
+    "fork": (case_fork, ["user/hello.zig", "user/tests/t_fork.zig", "user/tests/t_read.zig"]),
+    "protection": (case_protection, ["user/linker.ld", "user/tests/t_wx.zig", "user/tests/t_stack.zig",
                                      "user/tests/t_priv.zig", "user/tests/t_fp.zig", "user/tests/t_noperm.zig",
-                                     "user/tests/noperm.ld"], False),
-    # 要测的 kernelPanic 在 src/main.zig 里，属于 CORE
-    "panic": (case_panic, [], True),
+                                     "user/tests/noperm.ld"]),
 }
 
 
@@ -394,7 +408,7 @@ def cases_for(files):
     selected, notes = set(), []
     for f in files:
         kernel = f.startswith(("src/", "user/")) or f in CORE
-        hits = [name for name, (_, covers, _) in CASES.items() if f in covers]
+        hits = [name for name, (_, covers) in CASES.items() if f in covers]
         if f in NOT_KERNEL or not kernel:
             continue
         if f.startswith("user/tests/") and not os.path.exists(os.path.join(ROOT, f)):
@@ -430,7 +444,7 @@ def check_boot(q, c):
         c.contains(text, pattern, "boot log")
 
 
-def run_session(kernel, log_path, names, mode, halts):
+def run_session(kernel, log_path, names, mode):
     """启动一次 QEMU，依次运行 names 里的用例。返回 [(名字, Checks)]，第一项是启动和收尾的检查。"""
     session = Checks()
     results = [("boot", session)]
@@ -438,25 +452,24 @@ def run_session(kernel, log_path, names, mode, halts):
     q = Qemu(kernel)
     try:
         check_boot(q, session)
-        before = None if halts else free_pages(q.command("mem"))
+        before = free_pages(q.command("mem"))
         for name in names:
             current = Checks()
             results.append((name, current))
             CASES[name][0](q, current, mode)
         current = session  # 收尾的检查也记在 boot 上
-        if not halts:
-            after = free_pages(q.command("mem"))
-            session.expect(before is not None and before == after, f"mem: free pages changed from {before} to {after} (leak?)")
-            q.send("shutdown\r")
-            code = q.finish(COMMAND_TIMEOUT)
-            session.expect(code == 0, f"shutdown: QEMU exit code {code}, expected 0")
+        after = free_pages(q.command("mem"))
+        session.expect(before is not None and before == after, f"mem: free pages changed from {before} to {after} (leak?)")
+        q.send("shutdown\r")
+        code = q.finish(COMMAND_TIMEOUT)
+        session.expect(code == 0, f"shutdown: QEMU exit code {code}, expected 0")
     except Failure as e:
         current.failures.append(str(e))  # 之后的用例没有运行
     finally:
         q.kill()
         with open(log_path, "w", encoding="utf-8") as f:
             f.write(q.text())
-    if not halts and "KERNEL PANIC" in q.text():
+    if "KERNEL PANIC" in q.text():
         session.failures.append("KERNEL PANIC in the serial output")
     return results
 
@@ -468,21 +481,8 @@ def run_mode(mode, names):
     except Failure as e:
         return [("build", Checks(), str(e), None)]
     kernel = os.path.join(prefix, "bin", "kernel")
-    results = []
-    normal = [n for n in names if not CASES[n][2]]
-    if normal:
-        log = os.path.join(prefix, "serial.log")
-        results += [(n, c, None, log) for n, c in run_session(kernel, log, normal, mode, False)]
-    for n in names:
-        if CASES[n][2]:  # 以停机结束的用例各自启动一次，启动检查算在这个用例里
-            log = os.path.join(prefix, f"{n}.log")
-            session = run_session(kernel, log, [n], mode, True)
-            c = Checks()
-            for _, sc in session:
-                c.count += sc.count
-                c.failures += sc.failures
-            results.append((n, c, None, log))
-    return results
+    log = os.path.join(prefix, "serial.log")
+    return [(n, c, None, log) for n, c in run_session(kernel, log, names, mode)]
 
 
 def main():
@@ -496,7 +496,7 @@ def main():
 
     if args.list:
         print(f"{'(all)':<11} {' '.join(CORE)}")
-        for name, (_, covers, _) in CASES.items():
+        for name, (_, covers) in CASES.items():
             print(f"{name:<11} {' '.join(covers) or '(only the files above)'}")
         return 0
     unknown = [n for n in args.cases if n not in CASES]

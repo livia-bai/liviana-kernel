@@ -106,7 +106,7 @@ export fn _start() linksection(".text.boot") callconv(.naked) noreturn {
 | 7 | `vm.init(info.memory)` | `[ok] Sv39 paging enabled: ...` | 写 `satp` 打开分页。恒等映射保证这一刻前后地址不变 |
 | 8 | `plic.init(hartid)`、`timer.init(info.timebase_hz)` | — | 配置外部中断和第一次时钟中断，并在 `sie` 里打开对应的使能位 |
 | 9 | `riscv.enableInterrupts()` | `[ok] interrupts enabled: timer at 100 Hz, keyboard via UART + PLIC` | 最后才置 `sstatus.SIE`，之前的初始化都不会被中断打断 |
-| 10 | `proc.spawnKernel("shell", &shell.main)` + `proc.scheduler()` | `Type 'help' for commands.`、`> ` | 和 xv6 的 `main` 一样：建好第一个进程，启动栈交给调度器，`kmain` 不再返回。`> ` 是 shell 第一次被调度时打印的 |
+| 10 | `proc.userinit()` + `proc.scheduler()` | `Type 'help' for commands.`、`> ` | 和 xv6 的 `main` 一样：建好第一个进程 init，启动栈交给调度器，`kmain` 不再返回。之后的两行是 shell（init 启动的）打印的 |
 
 任何一步失败（设备树格式不对、建页表时内存不够）都会 `std.debug.panic`，打印原因后停机。
 
@@ -115,13 +115,13 @@ export fn _start() linksection(".text.boot") callconv(.naked) noreturn {
 `kmain` 的最后两行：
 
 ```zig
-_ = proc.spawnKernel("shell", &shell.main) catch unreachable; // 进程表是空的
+proc.userinit() catch |err| std.debug.panic("cannot start init: {s}", .{@errorName(err)});
 proc.scheduler();
 ```
 
-之后启动栈上永远运行着调度器：扫描进程表、切到 `runnable` 的进程、等它切回来，一个都没有就 `wfi`。它只管调度，不处理键盘输入：shell 是一个独立的内核线程，等输入时睡着，串口中断叫醒它（[shell.md](shell.md)）。调度器的代码和“为什么要先关中断再 `wfi`”见 [process.md](process.md#调度器)。
+之后启动栈上永远运行着调度器：扫描进程表、切到 `runnable` 的进程、等它切回来，一个都没有就 `wfi`。它只管调度，别的什么都不做。init 被调度后启动 shell（[user-programs.md](user-programs.md#init-和-sh)），之后的一切都由用户程序通过系统调用驱动。调度器的代码和“为什么要先关中断再 `wfi`”见 [process.md](process.md#调度器)。
 
-内核里只有两个地方开着中断：调度器每一轮开头开一下再关上，以及 `wfi` 被唤醒之后的下一轮开头。其余时间（初始化之后的所有内核代码：调度器扫描、shell、陷阱处理、系统调用）都关着中断；用户程序在 U 模式运行时中断是开着的。
+内核里只有两个地方开着中断：调度器每一轮开头开一下再关上，以及 `wfi` 被唤醒之后的下一轮开头。其余时间（初始化之后的所有内核代码：调度器扫描、陷阱处理、系统调用）都关着中断；用户程序在 U 模式运行时中断是开着的。
 
 ## panic 处理
 

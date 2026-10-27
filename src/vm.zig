@@ -196,8 +196,33 @@ pub fn allocUserPage(root: *PageTable, va: usize, perm: Perm) MapError!*align(pa
     return p;
 }
 
-/// 按页表把用户地址 va 翻译成物理地址。要求这一页是 U 模式可读的，否则返回 null。
-fn translateUser(root: *PageTable, va: usize) ?usize {
+/// 复制一个用户地址空间（fork 用）：新建一个地址空间，用户区里每一页都分配一页新的物理内存，
+/// 复制内容，按原来的权限映射到同一个地址。之后两边各改各的，互不影响。
+pub fn cloneUserSpace(src: *PageTable) error{OutOfMemory}!*PageTable {
+    const dst = try createUserSpace();
+    errdefer destroyUserSpace(dst);
+    for (vpn(user_base, 2)..vpn(user_end - 1, 2) + 1) |i| try cloneTree(dst, src[i], 2, i * levelSize(2));
+    return dst;
+}
+
+fn cloneTree(dst: *PageTable, pte: Pte, level: u2, va: usize) error{OutOfMemory}!void {
+    if (!pte.v) return;
+    if (pte.isLeaf()) {
+        std.debug.assert(level == 0); // 用户映射只用 4 KiB 的页（allocUserPage）
+        const p = allocUserPage(dst, va, .{ .r = pte.r, .w = pte.w, .x = pte.x }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.AlreadyMapped => unreachable, // dst 是新的，按 src 的结构逐页映射，不会重复
+        };
+        @memcpy(p, @as(*const page.Page, @ptrFromInt(pte.addr())));
+        return;
+    }
+    const table: *PageTable = @ptrFromInt(pte.addr());
+    for (table, 0..) |child, i| try cloneTree(dst, child, level - 1, va + i * levelSize(level - 1));
+}
+
+/// 按页表把用户地址 va 翻译成物理地址。要求这一页是 U 模式可读的（write 为 true 时还要可写），
+/// 否则返回 null。
+fn translateUser(root: *PageTable, va: usize, write: bool) ?usize {
     if (va < user_base or va >= user_end) return null;
     var table = root;
     var l: u2 = 2;
@@ -205,7 +230,7 @@ fn translateUser(root: *PageTable, va: usize) ?usize {
         const pte = table[vpn(va, l)];
         if (!pte.v) return null;
         if (pte.isLeaf()) {
-            if (!pte.u or !pte.r) return null;
+            if (!pte.u or !pte.r or (write and !pte.w)) return null;
             return pte.addr() + va % levelSize(l);
         }
         if (l == 0) return null; // 第 0 级必须是叶子
@@ -220,10 +245,37 @@ pub fn copyFromUser(root: *PageTable, dst: []u8, src: usize) error{BadAddress}!v
     var done: usize = 0;
     while (done < dst.len) {
         const va = std.math.add(usize, src, done) catch return error.BadAddress;
-        const pa = translateUser(root, va) orelse return error.BadAddress;
+        const pa = translateUser(root, va, false) orelse return error.BadAddress;
         const n = @min(dst.len - done, page.size - va % page.size);
         @memcpy(dst[done..][0..n], @as([*]const u8, @ptrFromInt(pa))[0..n]);
         done += n;
+    }
+}
+
+/// 把内核缓冲区 src 复制到用户地址 dst。每一页都要求 U 模式可读可写：
+/// 用户程序不能借系统调用改写内核的内存，也不能改写自己的只读页（比如代码段）。
+/// 中途失败时，前面的页已经写进去了；需要“要么全写、要么不写”的调用方先用 checkUser 检查。
+pub fn copyToUser(root: *PageTable, dst: usize, src: []const u8) error{BadAddress}!void {
+    var done: usize = 0;
+    while (done < src.len) {
+        const va = std.math.add(usize, dst, done) catch return error.BadAddress;
+        const pa = translateUser(root, va, true) orelse return error.BadAddress;
+        const n = @min(src.len - done, page.size - va % page.size);
+        @memcpy(@as([*]u8, @ptrFromInt(pa))[0..n], src[done..][0..n]);
+        done += n;
+    }
+}
+
+/// 检查用户地址 [va, va+len) 是否都是 U 模式可读的（write 为 true 时还要可写）。
+pub fn checkUser(root: *PageTable, va: usize, len: usize, write: bool) error{BadAddress}!void {
+    if (len == 0) return;
+    const last = std.math.add(usize, va, len - 1) catch return error.BadAddress;
+    var addr = va;
+    while (true) {
+        _ = translateUser(root, addr, write) orelse return error.BadAddress;
+        const next = std.mem.alignBackward(usize, addr, page.size) + page.size;
+        if (next > last) return;
+        addr = next;
     }
 }
 
@@ -276,4 +328,74 @@ test "copyFromUser 只读得到 U 模式可读的用户页，用户空间释放�
     // 释放的只是用户区的页和页表，和内核共用的页表不动
     destroyUserSpace(space);
     try std.testing.expectEqual(before, page.free_pages);
+}
+
+test "copyToUser 只写得进 U 模式可写的用户页，checkUser 检查整个范围" {
+    testInit();
+    kernel_root = @ptrCast(try page.alloc());
+    const before = page.free_pages;
+    const space = try createUserSpace();
+    defer {
+        destroyUserSpace(space);
+        std.testing.expectEqual(before, page.free_pages) catch @panic("leaked pages");
+    }
+    const p0 = try allocUserPage(space, user_base, .{ .r = true, .w = true });
+    const p1 = try allocUserPage(space, user_base + page.size, .{ .r = true, .w = true });
+    _ = try allocUserPage(space, user_base + 2 * page.size, .{ .r = true }); // 只读
+
+    try copyToUser(space, user_base + page.size - 2, "wxyz"); // 跨页
+    try std.testing.expectEqualStrings("wx", p0[page.size - 2 ..]);
+    try std.testing.expectEqualStrings("yz", p1[0..2]);
+    try std.testing.expectError(error.BadAddress, copyToUser(space, user_base + 2 * page.size, "a")); // 只读
+    try std.testing.expectError(error.BadAddress, copyToUser(space, user_base + 3 * page.size, "a")); // 没有映射
+
+    try checkUser(space, user_base, 2 * page.size, true);
+    try checkUser(space, user_base, 3 * page.size, false);
+    try checkUser(space, 0, 0, true); // 长度为 0：不检查地址
+    try std.testing.expectError(error.BadAddress, checkUser(space, user_base, 2 * page.size + 1, true));
+    try std.testing.expectError(error.BadAddress, checkUser(space, user_base + 1, 3 * page.size, false));
+    try std.testing.expectError(error.BadAddress, checkUser(space, user_base, std.math.maxInt(usize), false));
+}
+
+test "cloneUserSpace 复制每一页的内容和权限，两边互不影响，释放后不漏页" {
+    testInit();
+    kernel_root = @ptrCast(try page.alloc());
+    const before = page.free_pages;
+    const src = try createUserSpace();
+    const data = try allocUserPage(src, user_base, .{ .r = true, .w = true });
+    _ = try allocUserPage(src, user_base + page.size, .{ .r = true, .x = true });
+    _ = try allocUserPage(src, user_end - page.size, .{ .r = true, .w = true }); // 栈：另一张第 0 级页表
+    @memcpy(data[0..5], "hello");
+
+    const dst = try cloneUserSpace(src);
+    var buf: [5]u8 = undefined;
+    try copyFromUser(dst, &buf, user_base);
+    try std.testing.expectEqualStrings("hello", &buf);
+    // 改子进程的那一份，父进程的不变
+    try copyToUser(dst, user_base, "HELLO");
+    try copyFromUser(src, &buf, user_base);
+    try std.testing.expectEqualStrings("hello", &buf);
+    // 权限照搬：代码页可读不可写，栈页可写，没映射的还是没映射
+    try copyFromUser(dst, &buf, user_base + page.size);
+    try std.testing.expectError(error.BadAddress, copyToUser(dst, user_base + page.size, "a"));
+    try copyToUser(dst, user_end - 5, "stack");
+    try std.testing.expectError(error.BadAddress, copyFromUser(dst, &buf, user_base + 2 * page.size));
+
+    destroyUserSpace(dst);
+    destroyUserSpace(src);
+    try std.testing.expectEqual(before, page.free_pages);
+}
+
+test "cloneUserSpace 内存不够时不漏页" {
+    testInit();
+    kernel_root = @ptrCast(try page.alloc());
+    const src = try createUserSpace();
+    for (0..8) |i| _ = try allocUserPage(src, user_base + i * page.size, .{ .r = true, .w = true });
+    // 把剩下的页拿到只剩几页，复制到一半就会失败
+    var hoard: std.SinglyLinkedList = .{};
+    while (page.free_pages > 5) hoard.prepend(@ptrCast(try page.alloc()));
+    const before = page.free_pages;
+    try std.testing.expectError(error.OutOfMemory, cloneUserSpace(src));
+    try std.testing.expectEqual(before, page.free_pages);
+    destroyUserSpace(src);
 }

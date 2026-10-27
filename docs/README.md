@@ -18,9 +18,9 @@ liviana-kernel 的详细文档，按功能组织，讲这个用 Zig 写的 RISC-
 | [page-allocator.md](page-allocator.md) | 物理页分配器 |
 | [paging.md](paging.md) | Sv39 分页：页表格式、建立映射、内核页表、用户地址空间 |
 | [user-programs.md](user-programs.md) | 用户程序：运行时（`start.zig`、`sys.zig`）、示例程序、怎么写新程序 |
-| [process.md](process.md) | 进程：进程表、ELF 加载器、xv6 式调度（`scheduler`/`sched`/`sleep`/`wakeup`）、切换上下文、结束进程和 `kill`、Ctrl-C |
+| [process.md](process.md) | 进程：进程表、ELF 加载器、`userinit`/`fork`/`exec`、xv6 式调度（`scheduler`/`sched`/`sleep`/`wakeup`）、切换上下文、`exit`/`wait`/`kill`、Ctrl-C |
 | [syscalls.md](syscalls.md) | 系统调用：调用约定、调用列表、访问用户内存、怎么加新调用 |
-| [shell.md](shell.md) | shell：输入处理、前台和后台进程、命令 |
+| [shell.md](shell.md) | shell（用户程序）：输入处理、前台和后台进程、命令 |
 | [testing.md](testing.md) | 测试与调试：单元测试、QEMU 测试（`tools/qemu_test.py`）、回归测试程序、QEMU 日志、GDB、症状速查 |
 | [zig-0.17.md](zig-0.17.md) | Zig 0.17 和旧版本的差别，以及这个项目里踩过的坑 |
 
@@ -41,12 +41,13 @@ liviana-kernel 的详细文档，按功能组织，讲这个用 Zig 写的 RISC-
 | `src/page.zig` | [page-allocator.md](page-allocator.md) | |
 | `src/vm.zig` | [paging.md](paging.md) | [syscalls.md](syscalls.md#访问用户内存) |
 | `src/proc.zig` | [process.md](process.md) | |
-| `src/syscall.zig` | [syscalls.md](syscalls.md) | |
+| `src/syscall.zig` | [syscalls.md](syscalls.md) | [process.md](process.md) |
 | `src/abi.zig` | [syscalls.md](syscalls.md#abizig) | [build.md](build.md#用户程序) |
-| `src/shell.zig` | [shell.md](shell.md) | [process.md](process.md#创建进程) |
 | `user/start.zig` | [user-programs.md](user-programs.md#startzig) | |
 | `user/sys.zig` | [user-programs.md](user-programs.md#syszig) | [syscalls.md](syscalls.md#用户态封装) |
 | `user/linker.ld` | [build.md](build.md#用户程序的链接脚本) | [process.md](process.md#elf-加载器) |
+| `user/init.zig` | [user-programs.md](user-programs.md#init-和-sh) | [process.md](process.md#结束进程) |
+| `user/sh.zig` | [shell.md](shell.md) | [user-programs.md](user-programs.md#init-和-sh) |
 | `user/hello.zig`、`user/fault.zig`、`user/spin.zig`、`user/ticker.zig` | [user-programs.md](user-programs.md#示例程序) | |
 | `user/tests/*.zig`、`user/tests/noperm.ld` | [testing.md](testing.md#回归测试程序) | [build.md](build.md#用户程序) |
 | `src/tests.zig` | [testing.md](testing.md#单元测试zig-build-test) | [build.md](build.md#单元测试) |
