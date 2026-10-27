@@ -9,6 +9,7 @@ const plic = @import("plic.zig");
 const timer = @import("timer.zig");
 const proc = @import("proc.zig");
 const syscall = @import("syscall.zig");
+const shell = @import("shell.zig");
 
 /// 陷阱发生时被打断的上下文。regs[i] 就是寄存器 xi（x0 恒为 0，它的槽位不用）。
 /// 布局必须和 trapEntry、trapExit 里的汇编一致。
@@ -143,17 +144,19 @@ fn handleTrap(frame: *TrapFrame) callconv(.c) void {
         switch (interrupt) {
             .supervisor_timer => {
                 timer.onInterrupt();
-                if (from_user) proc.current.?.ticks += 1;
+                proc.wakeup(&timer.ticks); // 叫醒 sleep 系统调用里的进程，它们自己数时间到了没有
+                if (from_user) {
+                    proc.current.?.ticks += 1;
+                    // 时间片用完了，让出 CPU（xv6 的 usertrap 也是这样）。用户程序就算在 U 模式里死循环，
+                    // 时钟中断也会把 CPU 交回内核。下次轮到它时 yield 返回，经 trapExit 回到 U 模式。
+                    // 放在中断处理全部完成之后：yield 可能很久以后才返回。
+                    // （内核代码都是关着中断执行的，所以中断打断的要么是 U 模式，要么是调度器。）
+                    proc.yield();
+                }
             },
             .supervisor_external => handleExternal(),
             else => std.debug.panic("unexpected interrupt {d}", .{code}),
         }
-        // 用户程序就算在 U 模式里死循环，时钟和串口中断也会把 CPU 交回内核。打断的是用户程序时，
-        // 让它让出 CPU 回到主循环：时钟中断说明时间片用完了，该轮到别的进程；串口中断说明有输入，
-        // 主循环要把它交给 shell、检查 Ctrl-C。下次轮到它时 yield 返回，经 trapExit 回到 U 模式。
-        // （进程运行期间，内核代码都是关着中断执行的，所以中断打断的要么是 U 模式，要么是主循环。）
-        // 放在中断处理（包括 PLIC 的 complete）全部完成之后：yield 可能很久以后才返回。
-        if (from_user) proc.yield();
     } else if (from_user) {
         const exception: Exception = @fromBackingInt(code);
         switch (exception) {
@@ -186,13 +189,20 @@ fn handleTrap(frame: *TrapFrame) callconv(.c) void {
             }),
         }
     }
+    // 回到 U 模式之前：被 kill 了（比如在 yield、sleep 里等着的时候，或者刚才的串口中断是 Ctrl-C）就在这里结束
+    if (from_user) proc.checkKilled();
 }
 
 fn handleExternal() void {
     const irq = plic.claim();
     switch (irq) {
         0 => return, // 没有待处理的中断
-        plic.uart0_irq => uart.onInterrupt(),
+        plic.uart0_irq => {
+            uart.onInterrupt();
+            // 和 xv6 的 consoleintr 一样在中断里直接处理：Ctrl-C 杀掉前台进程，叫醒等输入的 shell
+            if (uart.takeCtrlC()) shell.interrupt();
+            proc.wakeup(uart.rx_chan);
+        },
         else => uart.print("[trap] unexpected external interrupt {d}\n", .{irq}),
     }
     plic.complete(irq);

@@ -21,7 +21,7 @@ zig build test --summary all   # 显示通过了几个
 | `src/dtb.zig` | 用测试里的 `TestFdt` 按 FDT 格式拼一份设备树，检查解析出的内存、时钟频率、保留区；截断、魔数不对、缺少时钟频率时返回错误 |
 | `src/page.zig` | 先分配低地址、分配时清零、跳过保留区、内存用完时报 `OutOfMemory` |
 | `src/vm.zig` | 能用大页时用大页（比较用掉的页表数）；`copyFromUser` 只读得到 U 模式可读的用户页；释放用户空间后不漏页 |
-| `src/proc.zig` | 加载真正的用户程序 `hello`（`build.zig` 把用户程序的 ELF 也交给了单元测试）；拒绝截断、魔数不对、不是 RISC-V、程序头越界、没有权限的段；调度器的 `pickNext` 轮流挑就绪的进程、跳过空槽位和没睡够的进程、到点唤醒 |
+| `src/proc.zig` | 加载真正的用户程序 `hello`（`build.zig` 把用户程序的 ELF 也交给了单元测试）；拒绝截断、魔数不对、不是 RISC-V、程序头越界、没有权限的段；`wakeup` 只叫醒睡在同一个通道上的进程；`kill` 只做标记、叫醒在睡的进程、只记第一次的原因、拒绝内核线程和不存在的 pid |
 | `src/abi.zig` | 系统调用返回值和错误码的互相转换 |
 
 为什么页表能在主机上测：内核对物理内存做了恒等映射，页表里的地址就是能直接用的指针。测试拿一块按 4 KiB 对齐的数组交给页分配器当作“物理内存”，页表就建在这块数组里，代码不用改。只有 `vm.activate` 这类写 CSR 的函数不能在主机上调用，测试也不会用到它们：Zig 只编译被用到的函数，所以这些文件里的 RISC-V 内联汇编不影响在主机上编译。
@@ -120,7 +120,7 @@ gdb-multiarch -q -ex 'set architecture riscv:rv64' -ex 'file zig-out/bin/kernel'
 之后就是普通的 GDB。实际用过的命令：
 
 ```
-(gdb) break vm.init                 # Zig 的函数名是“文件名.函数名”：main.kmain、vm.init、proc.schedule、syscall.dispatch
+(gdb) break vm.init                 # Zig 的函数名是“文件名.函数名”：main.kmain、vm.init、proc.scheduler、syscall.dispatch
 (gdb) continue
 (gdb) bt 3
 #0  vm.init (memory=...) at src/vm.zig:73
@@ -169,7 +169,7 @@ dtc -I dtb -O dts virt.dtb
 | 症状 | 可能的原因 | 怎么查 |
 | --- | --- | --- |
 | `run` 一个程序就 `killed: instruction_page_fault at 0x0, stval=0x0` | 用户 ELF 的入口是 0：`_start` 没有导出（release 模式下尤其要注意） | `llvm-readelf -h` 看 `Entry point`；`_start` 必须在根文件 `user/start.zig` 里 |
-| 进程结束后 `KERNEL PANIC: page.free: 0x.. was not handed out by the page allocator` | 切回主循环之后状态不对：典型的是调用 `switchContext` 之后的代码被优化掉了（单进程版本出过一次） | 只在 release 模式出现时，怀疑 `noreturn`、clobber、`volatile`；对照 `llvm-objdump -d` 看 `proc.schedule` |
+| 进程结束后 `KERNEL PANIC: page.free: 0x.. was not handed out by the page allocator` | 切回调度器之后状态不对：典型的是调用 `switchContext` 之后的代码被优化掉了（单进程版本出过一次） | 只在 release 模式出现时，怀疑 `noreturn`、clobber、`volatile`；对照 `llvm-objdump -d` 看 `proc.scheduler` |
 | 内核 `store_page_fault`，`stval` 在内核的代码或只读数据里 | 往只读段写了数据（W^X 生效了） | 用 `llvm-nm` 查 `stval` 落在哪个符号 |
 | 内核 `load_page_fault`，`stval` 很小或是 0 | 空指针解引用（`crash` 命令就是这样） | `sepc` 对应的源码行：GDB 里 `info line *0x...` |
 | 内核 `load/store_page_fault`，`stval` 在 `0x4000_0000..0x8000_0000` | 内核直接解引用了用户指针（`SUM` 是 0） | 改成 `vm.copyFromUser` |

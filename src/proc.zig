@@ -1,9 +1,12 @@
-//! 用户进程和调度。进程表里最多 max_procs 个进程，每个有自己的地址空间、内核栈和保存的内核上下文。
+//! 进程和调度，照 xv6 的结构写：
 //!
-//! 调度器就是内核的主循环（main.zig），它在启动栈上运行，每一轮调用 schedule() 挑一个就绪的进程
-//! 切过去。进程在 U 模式运行，直到下一次中断（时钟每 10 ms 一次，所以时间片是一个 tick）、
-//! 调用 yield/sleep、exit，或者出了异常，再切回主循环。主循环在两个时间片之间处理键盘输入，
-//! 所以有进程在跑时 shell 照样能用。
+//! - 调度器 scheduler() 在启动栈上永远循环，依次扫描进程表，遇到 runnable 的进程就切过去，
+//!   等它切回来再接着往下扫。它只管调度，别的什么都不做。
+//! - 进程（用户进程，以及 shell 这个内核线程）要让出 CPU 时，先改自己的状态，再调用 sched()
+//!   切回调度器：yield（时间片用完）、sleep（等某件事）、exit 都是这样。
+//! - 等待用 sleep(chan) / wakeup(chan)：chan 是任意一个地址，代表“在等什么”。等时钟的 sleep 系统调用
+//!   睡在 &timer.ticks 上，等键盘的 shell 睡在 uart.rx_chan 上，等前台进程结束的 shell 睡在那个进程上。
+//! - kill 只做标记、叫醒在睡的进程；被杀的进程回到 U 模式之前自己结束（checkKilled）。
 //!
 //! 用户地址空间（都在 vm.user_base..vm.user_end 之内）：
 //!   0x4000_0000 起    程序的各个段（user/linker.ld），按段设置 R/W/X，都带 U 位
@@ -19,7 +22,6 @@ const uart = @import("uart.zig");
 const page = @import("page.zig");
 const vm = @import("vm.zig");
 const trap = @import("trap.zig");
-const timer = @import("timer.zig");
 
 pub const Program = struct {
     name: []const u8,
@@ -49,24 +51,28 @@ pub const max_procs = 8;
 
 pub const State = enum {
     unused,
-    /// 等着被调度
-    ready,
+    /// 可以运行，等调度器挑到它
+    runnable,
     /// 正在 CPU 上运行（current 指向它）
     running,
-    /// 调用了 sleep，timer.ticks 到 wake_tick 之后回到 ready
+    /// 在 sleep(chan) 里等某件事，wakeup(chan) 把它改回 runnable
     sleeping,
-    /// 调用了 exit 或者被杀，等调度器回收
-    exited,
+    /// 已经结束，切回调度器之后马上被回收。别的代码看不到这个状态
+    zombie,
 };
 
 pub const Process = struct {
     state: State = .unused,
     pid: usize = 0,
     name: []const u8 = "",
-    space: *vm.PageTable = undefined,
+    /// 用户进程的根页表。内核线程没有自己的地址空间，为 null，运行时用内核页表
+    space: ?*vm.PageTable = null,
     /// 不在运行时，它的内核上下文保存在这里（见 switchContext）
     context: Context = undefined,
-    wake_tick: u64 = 0,
+    /// sleeping 时等的“通道”，wakeup 用同一个地址叫醒它
+    chan: ?*const anyopaque = null,
+    /// 被 kill 了的话是原因。进程回到 U 模式之前看到它就自己结束（见 checkKilled）
+    killed: ?[]const u8 = null,
     /// 在 U 模式运行期间来过的时钟中断数，大致就是用掉的 CPU 时间（单位 10 ms）
     ticks: u64 = 0,
 };
@@ -74,7 +80,7 @@ pub const Process = struct {
 /// 进程表。槽位 i 的进程用 kernel_stacks[i] 作内核栈。
 pub var table: [max_procs]Process = @splat(.{});
 
-/// 正在运行的进程。在主循环里（调度器、shell）时为 null。
+/// 正在运行的进程。在调度器里时为 null。
 pub var current: ?*Process = null;
 var next_pid: usize = 1;
 
@@ -90,18 +96,21 @@ const Context = extern struct {
     s: [12]usize,
 };
 
-/// 调度器（主循环）切到进程时保存的上下文，进程让出 CPU 时切回这里。
+/// 调度器切到进程时保存的上下文，进程调用 sched() 时切回这里。
 var scheduler_context: Context = undefined;
-/// 上一次运行的槽位，下一次从它后面开始找，这样就绪的进程轮流运行。
-var last_slot: usize = max_procs - 1;
 
 pub const SpawnError = error{ TooManyProcesses, OutOfMemory, BadElf };
 
-/// 加载一个用户程序，放进进程表，状态为 ready，返回 pid。由 shell 调用，真正开始运行要等主循环调度到它。
+fn allocSlot() error{TooManyProcesses}!usize {
+    for (&table, 0..) |*p, i| {
+        if (p.state == .unused) return i;
+    }
+    return error.TooManyProcesses;
+}
+
+/// 加载一个用户程序，放进进程表，状态为 runnable，返回 pid。由 shell 调用，真正开始运行要等调度器挑到它。
 pub fn spawn(program: *const Program) SpawnError!usize {
-    const slot = for (&table, 0..) |*p, i| {
-        if (p.state == .unused) break i;
-    } else return error.TooManyProcesses;
+    const slot = try allocSlot();
     const space = try vm.createUserSpace();
     errdefer vm.destroyUserSpace(space);
     const entry = try load(space, program.image);
@@ -114,67 +123,114 @@ pub fn spawn(program: *const Program) SpawnError!usize {
         .regs = @splat(0),
         .sepc = entry,
         // SPP = 0：sret 回到 U 模式；SPIE = 1：回到 U 模式后打开中断，时钟和键盘照常工作。
-        // SIE 必须清掉：shell 是开着中断调用这里的，trapExit 一开始就写回 sstatus，
-        // SIE = 1 的话恢复寄存器的途中就可能被中断打断
+        // SIE 必须清掉：trapExit 一开始就写回 sstatus，SIE = 1 的话恢复寄存器的途中就可能被中断打断。
+        // （现在 shell 是关着中断调用这里的，但不依赖这一点。）
         .sstatus = (riscv.read(.sstatus) & ~(riscv.sstatus_spp | riscv.sstatus_sie)) | riscv.sstatus_spie,
     };
     frame.regs[2] = stack_top;
 
-    // 第一次被调度时，switchContext 恢复这个上下文后 ret 到 trapExit，sp 正指向初始 TrapFrame
+    // 第一次被调度时，switchContext 恢复这个上下文后 ret 到 forkret，sp 正指向初始 TrapFrame
     table[slot] = .{
-        .state = .ready,
+        .state = .runnable,
         .pid = next_pid,
         .name = program.name,
         .space = space,
-        .context = .{ .ra = @intFromPtr(&trap.trapExit), .sp = @intFromPtr(frame), .s = @splat(0) },
+        .context = .{ .ra = @intFromPtr(&forkret), .sp = @intFromPtr(frame), .s = @splat(0) },
     };
     next_pid += 1;
     return table[slot].pid;
 }
 
-/// 调度一次：挑一个就绪的进程，切到它的地址空间运行，等它让出 CPU、睡眠或者结束再返回 true。
-/// 没有就绪的进程时返回 false。只由主循环调用，调用时中断必须是关着的。
-pub fn schedule() bool {
-    std.debug.assert(current == null);
-    const slot = pickNext(&table, last_slot, timer.ticks) orelse return false;
-    last_slot = slot;
-    const p = &table[slot];
-    p.state = .running;
-    current = p;
-    vm.activate(p.space);
-    switchContext(&scheduler_context, &p.context);
-    // 进程让出了 CPU。先切回内核页表，回收进程时才能释放它的页表
-    vm.activate(vm.kernel_root);
-    current = null;
-    if (p.state == .exited) release(p);
-    return true;
+/// 创建一个内核线程：在 S 模式运行 entry，用这个槽位的内核栈和内核页表，状态为 runnable。
+/// 它和用户进程一样由调度器调度，关着中断运行，要等待时调用 sleep 让出 CPU。现在只有 shell 一个。
+pub fn spawnKernel(name: []const u8, entry: *const fn () callconv(.c) noreturn) error{TooManyProcesses}!usize {
+    const slot = try allocSlot();
+    const stack = &kernel_stacks[slot];
+    // 第一次被调度时，switchContext 恢复这个上下文后 ret 到 entry，sp 是空的内核栈顶
+    table[slot] = .{
+        .state = .runnable,
+        .pid = next_pid,
+        .name = name,
+        .context = .{ .ra = @intFromPtr(entry), .sp = @intFromPtr(stack) + stack.len, .s = @splat(0) },
+    };
+    next_pid += 1;
+    return table[slot].pid;
 }
 
-/// 从 last 的下一个槽位开始轮着找，返回第一个就绪的进程的槽位。睡够了的进程先改回 ready。
-fn pickNext(procs: []Process, last: usize, now: u64) ?usize {
-    for (procs) |*p| {
-        if (p.state == .sleeping and now >= p.wake_tick) p.state = .ready;
-    }
-    for (1..procs.len + 1) |k| {
-        const i = (last + k) % procs.len;
-        if (procs[i].state == .ready) return i;
-    }
-    return null;
+/// 新的用户进程第一次被调度时从这里开始（对应 xv6 的 forkret），sp 指向 spawn 构造的初始 TrapFrame。
+/// 和陷阱返回一样，进入 U 模式之前先检查是不是已经被杀了，然后经 trapExit 进入 U 模式。
+/// checkKilled 是普通函数，只用 sp 以下的栈，不会碰到 TrapFrame。
+fn forkret() callconv(.naked) noreturn {
+    asm volatile (
+        \\call %[checkKilled]
+        \\tail %[trapExit]
+        :
+        : [checkKilled] "X" (&checkKilled),
+          [trapExit] "X" (&trap.trapExit),
+    );
 }
 
-/// 当前进程让出 CPU，回到调度器；下次轮到它时从这里返回。由陷阱处理程序调用（关着中断）。
+/// 调度器（对应 xv6 的 scheduler()）。kmain 初始化完之后调用，在启动栈上永远循环：
+/// 依次扫描进程表，遇到 runnable 的就切过去运行，等它调用 sched() 切回来，再接着往下扫。
+/// 所以每个 runnable 的进程每一圈运行一次，自然就是轮转。
+pub fn scheduler() noreturn {
+    while (true) {
+        // 进程和调度器都是关着中断运行的，中断只在这里打开一下：处理挂起的中断（它们可能叫醒进程），
+        // 再关上。关着中断扫描、wfi：扫完发现没有可运行的进程、正要 wfi 时来了中断的话，
+        // 中断保持挂起，wfi 立刻返回（wfi 只看 sie，不看 sstatus.SIE），不会白睡一觉。
+        riscv.enableInterrupts();
+        riscv.disableInterrupts();
+        var found = false;
+        for (&table) |*p| {
+            if (p.state != .runnable) continue;
+            p.state = .running;
+            current = p;
+            if (p.space) |space| vm.activate(space);
+            switchContext(&scheduler_context, &p.context);
+            // 进程让出了 CPU。先切回内核页表，回收进程时才能释放它的页表
+            if (p.space != null) vm.activate(vm.kernel_root);
+            current = null;
+            if (p.state == .zombie) release(p);
+            found = true;
+        }
+        if (!found) riscv.wfi();
+    }
+}
+
+/// 当前进程切回调度器（对应 xv6 的 sched()）。调用前要先把自己的状态改掉（不再是 running）。
+/// 等调度器下次挑中这个进程时，switchContext 才返回，从这里接着往下执行。
+fn sched() void {
+    const p = current.?;
+    std.debug.assert(p.state != .running);
+    std.debug.assert(riscv.read(.sstatus) & riscv.sstatus_sie == 0);
+    switchContext(&p.context, &scheduler_context);
+}
+
+/// 当前进程让出 CPU，别的 runnable 进程先运行，轮到它时返回。由陷阱处理程序调用（关着中断）。
 pub fn yield() void {
-    const p = current.?;
-    p.state = .ready;
-    switchContext(&p.context, &scheduler_context);
+    current.?.state = .runnable;
+    sched();
 }
 
-/// 当前进程睡 ms 毫秒（按 tick 向上取整），期间不会被调度。
-pub fn sleep(ms: u64) void {
+/// 当前进程睡在 chan 上，直到别人调用 wakeup(chan)。
+///
+/// 醒来不代表等的条件已经满足（同一个 chan 上可能有好几个进程在等不同的东西，也可能被 kill 叫醒），
+/// 所以调用方要在循环里检查条件：`while (!条件) sleep(chan);`。
+/// xv6 要传一把锁进来防止“检查完条件、还没睡下时 wakeup 已经发生”（lost wakeup）。这里只有一个 hart，
+/// 进程和调度器都关着中断运行，检查条件到睡下之间不会有中断处理程序插进来，所以不需要锁。
+pub fn sleep(chan: *const anyopaque) void {
     const p = current.?;
-    p.wake_tick = timer.ticks +| (ms *| timer.tick_hz +| 999) / 1000;
+    p.chan = chan;
     p.state = .sleeping;
-    switchContext(&p.context, &scheduler_context);
+    sched();
+    p.chan = null;
+}
+
+/// 叫醒所有睡在 chan 上的进程。只改状态，不切换，中断处理程序里也能调用。
+pub fn wakeup(chan: *const anyopaque) void {
+    for (&table) |*p| {
+        if (p.state == .sleeping and p.chan == chan) p.state = .runnable;
+    }
 }
 
 /// 当前进程调用了 exit。由系统调用处理程序调用，不返回。
@@ -191,21 +247,33 @@ pub fn killCurrent(comptime reason: []const u8, args: anytype) noreturn {
     finish(p);
 }
 
-/// 回到调度器，由它回收这个进程。进程正在用自己的内核栈和地址空间，不能自己释放。
+/// 当前进程被 kill 过的话就结束它，否则返回。陷阱处理程序回到 U 模式之前、新进程第一次进入 U 模式之前调用，
+/// 所以被杀的进程不会再执行一条用户指令。
+pub fn checkKilled() callconv(.c) void {
+    const p = current.?;
+    if (p.killed) |reason| killCurrent("{s}", .{reason});
+}
+
+/// 变成 zombie，叫醒等它结束的（shell），切回调度器，由调度器回收。
+/// 进程正在用自己的内核栈和地址空间，不能自己释放。
 fn finish(p: *Process) noreturn {
-    p.state = .exited;
-    switchContext(&p.context, &scheduler_context);
+    p.state = .zombie;
+    wakeup(p);
+    sched();
     unreachable; // 调度器不会再切回已经结束的进程
 }
 
-/// 结束进程 pid。由 shell 调用：这时 CPU 在主循环里，没有进程在运行，
-/// 它停在内核栈上的状态直接丢掉就行。找不到这个进程时返回 false。
-pub fn kill(pid: usize, comptime reason: []const u8) bool {
-    std.debug.assert(current == null);
-    const p = findPid(pid) orelse return false;
-    uart.print("[proc] pid {d} ({s}) killed: " ++ reason ++ "\n", .{ p.pid, p.name });
-    release(p);
-    return true;
+pub const KillError = error{ NoSuchProcess, KernelThread };
+
+/// 杀掉进程 pid（对应 xv6 的 kill()）：只记下原因，在睡的叫醒，不当场结束它——
+/// 它可能停在内核栈上的任何地方（sleep 里、yield 里），只有它自己知道怎么安全地收尾。
+/// 它下一次被调度、回到 U 模式之前会在 checkKilled 里结束。只改标志和状态，中断处理程序里也能调用（Ctrl-C）。
+/// 内核线程从不检查 killed，所以不能杀。
+pub fn kill(pid: usize, reason: []const u8) KillError!void {
+    const p = findPid(pid) orelse return error.NoSuchProcess;
+    if (p.space == null) return error.KernelThread;
+    if (p.killed == null) p.killed = reason;
+    if (p.state == .sleeping) p.state = .runnable;
 }
 
 pub fn findPid(pid: usize) ?*Process {
@@ -217,7 +285,7 @@ pub fn findPid(pid: usize) ?*Process {
 
 /// 释放进程的地址空间（所有用户页和页表），腾出槽位。内核栈是静态的，留给下一个用这个槽位的进程。
 fn release(p: *Process) void {
-    vm.destroyUserSpace(p.space);
+    if (p.space) |space| vm.destroyUserSpace(space);
     p.* = .{};
 }
 
@@ -386,27 +454,30 @@ test "ELF 加载器拒绝坏文件" {
     try std.testing.expectError(error.BadElf, testLoad(@embedFile("t_noperm")));
 }
 
-test "调度器轮流挑就绪的进程，睡够了的进程醒来" {
+test "wakeup 只叫醒睡在同一个通道上的进程；kill 只做标记，叫醒在睡的进程" {
     const expectEqual = std.testing.expectEqual;
-    var procs: [4]Process = @splat(.{});
-    procs[0].state = .ready;
-    procs[1].state = .sleeping;
-    procs[1].wake_tick = 10;
-    procs[3].state = .ready;
+    defer table = @splat(.{});
+    var space: vm.PageTable = undefined; // 只用来区分用户进程和内核线程，不会被访问
+    var a: u8 = 0;
+    var b: u8 = 0;
+    table[0] = .{ .state = .sleeping, .pid = 1, .chan = &a }; // 内核线程
+    table[1] = .{ .state = .sleeping, .pid = 2, .chan = &a, .space = &space };
+    table[2] = .{ .state = .sleeping, .pid = 3, .chan = &b, .space = &space };
+    table[3] = .{ .state = .runnable, .pid = 4, .space = &space };
 
-    // 从上次运行的槽位后面开始找，跳过空槽位和还在睡的进程，绕回开头
-    try expectEqual(3, pickNext(&procs, 0, 5));
-    try expectEqual(0, pickNext(&procs, 3, 5));
-    try expectEqual(.sleeping, procs[1].state);
-    // 到了 wake_tick，1 号醒来，紧跟在 0 号后面被选中
-    try expectEqual(1, pickNext(&procs, 0, 10));
-    try expectEqual(.ready, procs[1].state);
+    wakeup(&a);
+    try expectEqual(.runnable, table[0].state);
+    try expectEqual(.runnable, table[1].state);
+    try expectEqual(.sleeping, table[2].state);
 
-    // 只有一个就绪的进程时总是选它（包括刚运行完的那个）；没有就绪的返回 null
-    procs[0].state = .unused;
-    procs[1].state = .exited;
-    try expectEqual(3, pickNext(&procs, 3, 10));
-    procs[3].state = .sleeping;
-    procs[3].wake_tick = std.math.maxInt(u64);
-    try expectEqual(null, pickNext(&procs, 3, 1000));
+    // kill 叫醒在睡的进程，只记第一次的原因；runnable 的进程状态不变，等它自己结束
+    try kill(3, "first");
+    try kill(3, "second");
+    try expectEqual(.runnable, table[2].state);
+    try std.testing.expectEqualStrings("first", table[2].killed.?);
+    try kill(4, "x");
+    try expectEqual(.runnable, table[3].state);
+    try std.testing.expectError(error.KernelThread, kill(1, "x"));
+    try expectEqual(null, table[0].killed);
+    try std.testing.expectError(error.NoSuchProcess, kill(99, "x"));
 }

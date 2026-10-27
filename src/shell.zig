@@ -1,6 +1,9 @@
 //! 极简命令行：逐字符接收键盘输入并回显，回车后执行命令。
 //!
-//! `run NAME` 在前台运行程序：shell 等它结束才打印下一个提示符，这期间主循环不把键盘输入交给 shell，
+//! shell 是一个内核线程（kmain 用 proc.spawnKernel 创建），和用户进程一样由调度器调度，关着中断运行。
+//! 没有输入时睡在 uart.rx_chan 上，串口中断叫醒它。
+//!
+//! `run NAME` 在前台运行程序：shell 睡着等它结束才打印下一个提示符，这期间键盘输入留在缓冲区里，
 //! Ctrl-C 结束这个前台进程。`run NAME &` 在后台运行，马上回到提示符。
 
 const std = @import("std");
@@ -18,17 +21,30 @@ var len: usize = 0;
 /// 前台进程的 pid，没有时为 null。
 var foreground: ?usize = null;
 
-pub fn prompt() void {
+/// shell 内核线程的入口。
+pub fn main() callconv(.c) noreturn {
+    prompt();
+    while (true) {
+        // 关着中断检查、睡下，检查完到睡下之间来的字符不会丢：中断挂起着，到调度器开中断时才处理、叫醒 shell
+        const c = uart.read() orelse {
+            proc.sleep(uart.rx_chan);
+            continue;
+        };
+        feed(c);
+    }
+}
+
+fn prompt() void {
     uart.write("> ");
 }
 
-pub fn feed(c: u8) void {
+fn feed(c: u8) void {
     switch (c) {
         '\r', '\n' => {
             uart.putc('\n');
             execute(line[0..len]);
             len = 0;
-            if (foreground == null) prompt(); // 否则等前台进程结束，由 waiting() 打印
+            prompt();
         },
         // 退格：光标左移，用空格盖掉，再左移
         0x08, 0x7f => if (len > 0) {
@@ -44,21 +60,18 @@ pub fn feed(c: u8) void {
     }
 }
 
-/// 主循环每一轮调用（关着中断）。前台进程还在就返回 true，这时主循环不读键盘输入；
-/// 发现前台进程结束了就打印提示符，返回 false。
-pub fn waiting() bool {
-    const pid = foreground orelse return false;
-    if (proc.findPid(pid) != null) return true;
-    foreground = null;
-    prompt();
-    return false;
-}
-
-/// 用户按了 Ctrl-C：结束前台进程。没有前台进程时什么也不做。主循环调用（关着中断）。
+/// 用户按了 Ctrl-C：杀掉前台进程。没有前台进程时什么也不做。由串口的中断处理程序调用：
+/// proc.kill 只做标记，前台进程回到 U 模式之前自己结束，叫醒等着它的 shell。
 pub fn interrupt() void {
     const pid = foreground orelse return;
     uart.write("^C\n");
-    _ = proc.kill(pid, "interrupted by Ctrl-C");
+    proc.kill(pid, "interrupted by Ctrl-C") catch {};
+}
+
+/// 睡着等进程 pid 结束（它结束时 proc.finish 叫醒睡在它上面的进程）。
+/// 不用回收：结束的进程由调度器回收，醒来时 findPid 已经找不到它了。
+fn waitFor(pid: usize) void {
+    while (proc.findPid(pid)) |p| proc.sleep(p);
 }
 
 fn execute(input: []const u8) void {
@@ -128,6 +141,8 @@ fn run(arg: []const u8) void {
         uart.print("[proc] pid {d} ({s}) started in the background\n", .{ pid, name });
     } else {
         foreground = pid;
+        waitFor(pid);
+        foreground = null;
     }
 }
 
@@ -144,5 +159,13 @@ fn kill(arg: []const u8) void {
         uart.write("usage: kill PID\n");
         return;
     };
-    if (!proc.kill(pid, "kill command")) uart.print("kill: no such process: {d}\n", .{pid});
+    proc.kill(pid, "kill command") catch |err| {
+        switch (err) {
+            error.NoSuchProcess => uart.print("kill: no such process: {d}\n", .{pid}),
+            error.KernelThread => uart.print("kill: pid {d} is a kernel thread\n", .{pid}),
+        }
+        return;
+    };
+    // 等它真的结束（它要等下一次被调度才会结束自己），这样它的输出在下一个提示符之前
+    waitFor(pid);
 }

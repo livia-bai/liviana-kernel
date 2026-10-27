@@ -58,9 +58,10 @@ python3 tools/qemu_test.py --list      # 列出 QEMU 测试的用例和它们覆
 
 - `sscratch`：在 U 模式运行时存进程内核栈顶，在内核里为 0（[docs/trap.md](docs/trap.md#sscratch-约定)）。
 - `sstatus.FS` 保持 Off：`kmain` 一开始就清掉 OpenSBI 留下的 Dirty，进入 U 模式的 `sstatus` 从内核当前的值派生，所以用户程序也不能用浮点（[docs/riscv-sbi.md](docs/riscv-sbi.md#位定义)）。
-- 陷阱处理和系统调用全程关中断执行（[docs/trap.md](docs/trap.md#中断开关不变量)）。
-- 主循环检查输入缓冲区前要先关中断，再 `wfi`，然后开中断（[docs/boot.md](docs/boot.md#主循环)）。
-- 进程切换只在关中断时进行，并且总是主循环 ↔ 进程：主循环在关中断的那一段里调用 `proc.schedule`，进程在陷阱处理程序里通过 `proc.yield`/`sleep`/`exit` 切回（[docs/process.md](docs/process.md#切换上下文)）。新进程初始 `TrapFrame` 的 `sstatus` 必须清掉 `SIE`。
+- 内核代码（陷阱处理、系统调用、shell 内核线程、调度器扫描进程表）全程关中断执行；只有调度器每一轮开头开一下中断（[docs/trap.md](docs/trap.md#中断开关不变量)）。
+- 调度器先关中断再扫描进程表、再 `wfi`，下一轮开头才开中断（[docs/process.md](docs/process.md#调度器)）。
+- 进程切换只在关中断时进行，并且总是调度器 ↔ 进程：`proc.scheduler` 切到进程，进程改掉自己的状态后只通过 `proc.sched`（`yield`/`sleep`/`finish`）切回（[docs/process.md](docs/process.md#切换上下文)）。新进程初始 `TrapFrame` 的 `sstatus` 必须清掉 `SIE`。
+- 等待用 `proc.sleep(chan)` / `proc.wakeup(chan)`，醒来后在循环里重新检查条件；`proc.kill` 只做标记，被杀的进程在回到 U 模式之前（`handleTrap` 末尾、`forkret`）由 `checkKilled` 结束（[docs/process.md](docs/process.md#结束进程)）。
 - 用户地址空间只能用 Sv39 根页表的第 1 项（`vm.user_base..vm.user_end`），内核映射不能放进这个范围（[docs/paging.md](docs/paging.md#用户地址空间)）。
 - 内核碰用户内存只能通过 `vm.copyFromUser` 这类先查页表的函数，不要打开 `sstatus.SUM` 直接解引用用户指针（[docs/syscalls.md](docs/syscalls.md#访问用户内存)）。
 - 页表叶子必须可读或可执行，可写必须可读；ELF 加载器拒绝不可读的段（[docs/process.md](docs/process.md#elf-加载器)）。

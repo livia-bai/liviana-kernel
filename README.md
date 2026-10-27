@@ -9,7 +9,7 @@
 - 解析设备树，得到内存范围和时钟频率
 - 物理页分配器，Sv39 分页，内核按段设置权限（代码只读可执行，数据不可执行）
 - U 模式用户程序：独立编译的 ELF 嵌进内核，由内核加载；六个系统调用；用户程序出错或按 Ctrl-C 只结束进程，内核照常运行
-- 多进程：最多 8 个进程，时钟中断驱动的时间片轮转调度；程序可以在后台运行，`sleep` 的进程不占 CPU
+- 多进程：最多 8 个进程，照 xv6 的结构做的时间片轮转调度（调度器循环、`sleep`/`wakeup`、`kill` 只做标记）；shell 是内核线程，程序可以在后台运行，`sleep` 的进程不占 CPU
 
 ```
 Hello from a Zig kernel on RISC-V!
@@ -22,26 +22,27 @@ SBI: OpenSBI, spec v1.0 | hart 0 | device tree at 0x87e00000
 [ok] interrupts enabled: timer at 100 Hz, keyboard via UART + PLIC
 Type 'help' for commands.
 > run hello
-Hello from U-mode! I am pid 1, the kernel has been up for 780 ms.
+Hello from U-mode! I am pid 2, the kernel has been up for 500 ms.
 write() refused a kernel pointer: BadAddress
-[proc] pid 1 (hello) exited with code 0
+[proc] pid 2 (hello) exited with code 0
 > run spin &
-[proc] pid 2 (spin) started in the background
-> pid 2 spinning in U-mode without making syscalls
+[proc] pid 3 (spin) started in the background
+> pid 3 spinning in U-mode without making syscalls
 run ticker &
-[proc] pid 3 (ticker) started in the background
-> [ticker pid 3] tick 1 at 2580 ms
+[proc] pid 4 (ticker) started in the background
+> [ticker pid 4] tick 1 at 2330 ms
 ps
   PID STATE     TICKS NAME
-    2 ready       161 spin
-    3 sleeping      0 ticker
+    1 running       0 shell
+    3 runnable    202 spin
+    4 sleeping      0 ticker
 > run spin
-pid 4 spinning in U-mode without making syscalls
-[ticker pid 3] tick 2 at 3590 ms
+pid 5 spinning in U-mode without making syscalls
+[ticker pid 4] tick 2 at 3330 ms
 ^C
-[proc] pid 4 (spin) killed: interrupted by Ctrl-C
-> kill 2
-[proc] pid 2 (spin) killed: kill command
+[proc] pid 5 (spin) killed: interrupted by Ctrl-C
+> kill 3
+[proc] pid 3 (spin) killed: kill command
 ```
 
 ## 运行

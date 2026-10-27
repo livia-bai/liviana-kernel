@@ -97,9 +97,9 @@ pub fn main() u8 {
 
 ```
 > run hello
-Hello from U-mode! I am pid 1, the kernel has been up for 5120 ms.
+Hello from U-mode! I am pid 2, the kernel has been up for 5120 ms.
 write() refused a kernel pointer: BadAddress
-[proc] pid 1 (hello) exited with code 0
+[proc] pid 2 (hello) exited with code 0
 ```
 
 ### fault

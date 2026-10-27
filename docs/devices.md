@@ -55,19 +55,22 @@ pub fn print(comptime fmt: []const u8, args: anytype) void
 
   `data` 是若干段字节，最后一段要重复输出 `splat` 次（格式化填充对齐时会用到），返回实际写出的字节数。这里全部写完，返回总长度。
 - `print` 吞掉格式化错误（串口写不会失败）。
-- 输出不加锁，因为不会有两个执行流同时打印。时钟和串口的中断处理程序本身不打印（只有“意外的外部中断”和 panic 这种出错路径会打印）；陷阱处理程序里的其他打印（断点、进程退出或被杀）都是同步发生的，打印时 shell 正停在 `ebreak` 或 `run` 命令里。
+- 输出不加锁，因为不会有两个执行流同时打印。时钟和串口的中断处理程序本身不打印（只有“意外的外部中断”和 panic 这种出错路径会打印）；陷阱处理程序里的其他打印（断点、进程退出或被杀、Ctrl-C 的 `^C`）发生在关着中断的内核代码里，同一时刻只有一个执行流在跑，不会和 shell 的输出交错在一行里。
 
 ### 输入：环形缓冲区
 
 ```zig
 var rx_buf: [256]u8 = undefined;
 var rx_head: u8 = 0;  // 中断处理程序写入的位置
-var rx_tail: u8 = 0;  // 主循环读出的位置
+var rx_tail: u8 = 0;  // shell 读出的位置
+
+pub const rx_chan: *const anyopaque = &rx_buf;  // 等输入的进程睡在这个通道上
 ```
 
 - 索引是 `u8`，`+%` 回绕正好对应 256 字节的缓冲区，不需要取模。
 - `head == tail` 表示空；`head + 1 == tail` 表示满（留一个空位区分空和满，实际容量 255）。满了之后新来的字符被丢弃。
-- **单生产者单消费者**：只有中断处理程序（`onInterrupt`）改 `head`，只有主循环（`read`）改 `tail`。`read` 要求调用时中断是关着的，这样它执行期间不会有 `onInterrupt` 插进来。
+- **单生产者单消费者**：只有中断处理程序（`onInterrupt`）改 `head`，只有 shell（`read`）改 `tail`。`read` 要求调用时中断是关着的，这样它执行期间不会有 `onInterrupt` 插进来；shell 全程关着中断运行，满足。
+- 缓冲区为空时 shell `proc.sleep(rx_chan)`；`trap.handleExternal` 在 `onInterrupt` 之后 `proc.wakeup(rx_chan)` 叫醒它（[process.md](process.md#sleepwakeup)）。驱动本身不知道进程的存在。
 
 ```zig
 pub fn onInterrupt() void {
@@ -90,7 +93,7 @@ Ctrl-C（ASCII `0x03`）不进缓冲区，只把 `ctrl_c_pressed` 置为 `true`�
 pub fn takeCtrlC() bool   // 返回上次调用以来是否按过 Ctrl-C，并清除标志
 ```
 
-- 主循环每一轮先调用 `takeCtrlC()`（关着中断），按过就交给 `shell.interrupt()`，由它结束前台进程（[process.md](process.md#ctrl-c)）。用户程序就算在 U 模式死循环、从不做系统调用，串口中断也照样会打断它，陷阱处理程序让它让出 CPU，主循环马上就能看到这次 Ctrl-C。
+- `trap.handleExternal` 在 `onInterrupt` 之后马上调用 `takeCtrlC()`（同一个中断里），按过就交给 `shell.interrupt()`，由它杀掉前台进程（[process.md](process.md#ctrl-c)）。用户程序就算在 U 模式死循环、从不做系统调用，串口中断也照样会打断它，这次中断返回之前它就结束了。
 - 没有前台进程时按的 Ctrl-C 也在这里被取走、什么都不做，所以不会留到下一个程序一启动就把它杀掉。Ctrl-C 不进缓冲区，shell 看不到它。
 - 管道测试里用 `printf '\003'` 发送 Ctrl-C。QEMU `-nographic` 会把 Ctrl-C 原样交给客户机串口，不会结束 QEMU 自己（结束 QEMU 是 Ctrl-A X）。
 

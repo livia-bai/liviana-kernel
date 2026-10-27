@@ -106,38 +106,22 @@ export fn _start() linksection(".text.boot") callconv(.naked) noreturn {
 | 7 | `vm.init(info.memory)` | `[ok] Sv39 paging enabled: ...` | 写 `satp` 打开分页。恒等映射保证这一刻前后地址不变 |
 | 8 | `plic.init(hartid)`、`timer.init(info.timebase_hz)` | — | 配置外部中断和第一次时钟中断，并在 `sie` 里打开对应的使能位 |
 | 9 | `riscv.enableInterrupts()` | `[ok] interrupts enabled: timer at 100 Hz, keyboard via UART + PLIC` | 最后才置 `sstatus.SIE`，之前的初始化都不会被中断打断 |
-| 10 | `shell.prompt()` + 主循环 | `Type 'help' for commands.`、`> ` | |
+| 10 | `proc.spawnKernel("shell", &shell.main)` + `proc.scheduler()` | `Type 'help' for commands.`、`> ` | 和 xv6 的 `main` 一样：建好第一个进程，启动栈交给调度器，`kmain` 不再返回。`> ` 是 shell 第一次被调度时打印的 |
 
 任何一步失败（设备树格式不对、建页表时内存不够）都会 `std.debug.panic`，打印原因后停机。
 
-## 主循环
+## 调度器
 
-主循环同时是 shell 的输入循环和进程的调度器：
+`kmain` 的最后两行：
 
 ```zig
-while (true) {
-    riscv.disableInterrupts();
-    if (uart.takeCtrlC()) shell.interrupt();
-    const c = if (shell.waiting()) null else uart.read();
-    if (c == null and !proc.schedule()) riscv.wfi();
-    riscv.enableInterrupts(); // 挂起的中断在这里立刻被处理
-    if (c) |ch| shell.feed(ch);
-}
+_ = proc.spawnKernel("shell", &shell.main) catch unreachable; // 进程表是空的
+proc.scheduler();
 ```
 
-每一轮：
+之后启动栈上永远运行着调度器：扫描进程表、切到 `runnable` 的进程、等它切回来，一个都没有就 `wfi`。它只管调度，不处理键盘输入：shell 是一个独立的内核线程，等输入时睡着，串口中断叫醒它（[shell.md](shell.md)）。调度器的代码和“为什么要先关中断再 `wfi`”见 [process.md](process.md#调度器)。
 
-1. 关中断。
-2. 按过 Ctrl-C 就交给 shell，由它结束前台进程（没有前台进程时什么也不做）。
-3. `shell.waiting()`：有前台进程在运行时返回 `true`，这时不读键盘输入，字符留在缓冲区里，等前台进程结束再交给 shell；它发现前台进程刚结束时打印提示符（[shell.md](shell.md#前台和后台)）。
-4. 有字符就不调度，开中断后交给 shell。没有字符就调用 `proc.schedule()` 运行一个就绪进程的一个时间片（[process.md](process.md#调度)），它返回时又回到了这个循环、中断仍是关着的；一个就绪的进程都没有时 `wfi` 休眠。
-5. 开中断。
-
-**先关中断再检查、再 `wfi`，顺序不能改**，原因是一个经典的竞争：如果开着中断检查缓冲区，可能出现“检查时缓冲区为空 → 正要执行 `wfi` 时字符到了，中断处理程序把它放进缓冲区 → `wfi` 睡下去”，这个字符要等到下一个中断（最长 10 ms 后的时钟中断）才会被处理。同样的道理也适用于睡眠的进程到点、Ctrl-C。
-
-关中断后再检查就没有这个问题：字符在检查之后到达时，中断只是挂起（`sip.SEIP` 置位）而不会被处理；`wfi` 只看 `sie` 和 `sip`、不看 `sstatus.SIE`，有挂起的中断就立即返回；接着 `enableInterrupts()` 让挂起的中断马上被处理。
-
-`uart.read()`、`uart.takeCtrlC()` 要求调用时中断是关着的（它们和中断处理程序共用缓冲区的索引和标志），进程切换也必须关着中断，这个循环都满足。`shell.feed` 在开着中断时调用，执行命令期间时钟和键盘中断照常发生；`run` 只是把进程放进进程表就返回，不会停在里面。
+内核里只有两个地方开着中断：调度器每一轮开头开一下再关上，以及 `wfi` 被唤醒之后的下一轮开头。其余时间（初始化之后的所有内核代码：调度器扫描、shell、陷阱处理、系统调用）都关着中断；用户程序在 U 模式运行时中断是开着的。
 
 ## panic 处理
 

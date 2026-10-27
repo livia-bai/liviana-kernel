@@ -2,6 +2,15 @@
 
 每次改了内核（`src/`、`user/`、`build.zig`、链接脚本），在最上面加几行：新增了什么功能，修了什么 bug。最新的在前面。
 
+## 2026-10-27 照 xv6 改写进程调度
+
+- 改动：调度器 `proc.scheduler()` 从内核主循环里独立出来，照 xv6 的 `scheduler()`：在启动栈上永远循环，每一轮开一下中断再关上，依次扫描进程表、运行每个 `runnable` 的进程，一个都没有就 `wfi`。进程只通过 `proc.sched()` 切回调度器（`yield`、`sleep`、`exit`）。去掉了 `schedule`、`pickNext` 和 `last_slot`。
+- 新增：`proc.sleep(chan)` / `proc.wakeup(chan)`。`sleep` 系统调用改成 xv6 的 `sys_sleep` 的写法：睡在 `&timer.ticks` 上，每个时钟中断叫醒一次，自己数够 tick 再返回；去掉了 `wake_tick`。
+- 改动：shell 变成内核线程（pid 1，由新增的 `proc.spawnKernel` 创建），全程关着中断运行。没有输入时睡在 `uart.rx_chan` 上，串口中断叫醒它；`run` 前台程序时睡着等它结束。`ps` 里会列出它；它占一个槽位，所以同时最多 7 个用户进程，用户进程的 pid 从 2 开始。
+- 改动：`kill` 照 xv6 只做标记（`killed`）并叫醒在睡的进程，被杀的进程在回到 U 模式之前（`handleTrap` 末尾、新进程第一次运行时经过的 `forkret`）由 `checkKilled` 结束自己。Ctrl-C 在串口中断里直接处理。shell 的 `kill` 命令等目标进程真的结束才回到提示符；`kill 1` 打印 `kill: pid 1 is a kernel thread`。
+- 改动：只有时钟中断让 U 模式的进程让出 CPU，串口中断不再让出。状态改名为 xv6 的 `runnable`、`zombie`（原来的 `ready`、`exited`）。
+- 新增：`wakeup`、`kill` 的单元测试；QEMU 测试 `sched` 用例加了对睡在 `sleep` 里的前台进程按 Ctrl-C、`kill` shell 自己。
+
 ## 2026-10-26 多进程调度
 
 - 新增：进程表，最多 8 个进程，每个有自己的地址空间、16 KiB 内核栈和保存的内核上下文。内核主循环兼作调度器，按时间片轮转：进程被时钟中断（每 10 ms）或串口中断打断时让出 CPU，主循环处理键盘输入后再挑下一个就绪的进程。

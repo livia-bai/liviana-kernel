@@ -1,6 +1,6 @@
 //! 系统调用。用户程序执行 ecall 陷入内核后，handleTrap 把它交给 dispatch。
 //! 调用约定见 abi.zig。处理期间中断是关着的，系统调用都很短，不会长时间占着 CPU；
-//! yield 和 sleep 在里面切到别的进程，轮到这个进程时再从切走的地方返回。
+//! yield 和 sleep 在里面切回调度器，轮到这个进程时再从切走的地方返回。
 
 const abi = @import("abi.zig");
 const uart = @import("uart.zig");
@@ -30,8 +30,13 @@ fn yield() usize {
     return 0;
 }
 
+/// 睡至少 ms 毫秒，按 tick 向上取整（乘法和加法都是饱和的，ms 再大也不溢出）。
+/// 和 xv6 的 sys_sleep 一样：睡在 &timer.ticks 上，每个时钟中断都叫醒一次，醒来自己数够了没有。
+/// 被 kill 了就提前返回，回到陷阱处理程序后结束。
 fn sleep(ms: usize) usize {
-    proc.sleep(ms);
+    const n = (ms *| timer.tick_hz +| 999) / 1000;
+    const start = timer.ticks;
+    while (timer.ticks - start < n and proc.current.?.killed == null) proc.sleep(&timer.ticks);
     return 0;
 }
 
@@ -44,7 +49,7 @@ fn write(ptr: usize, len: usize) usize {
         // 每块都不跨页：一块失败就说明这一页整个不能读，前面的字节都已经写出去了
         const va = ptr + done;
         const chunk = buf[0..@min(buf.len, len - done, page.size - va % page.size)];
-        vm.copyFromUser(proc.current.?.space, chunk, va) catch {
+        vm.copyFromUser(proc.current.?.space.?, chunk, va) catch {
             return if (done == 0) abi.fail(.fault) else done;
         };
         uart.write(chunk);

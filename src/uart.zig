@@ -48,13 +48,16 @@ fn getc() ?u8 {
     return reg(.rbr_thr).*;
 }
 
-// 接收环形缓冲区：中断处理程序写入，主循环（关中断时）读出。
+// 接收环形缓冲区：中断处理程序写入，shell（关着中断）读出。
 // 索引用 u8，+% 回绕正好对应 256 字节的缓冲区。
 var rx_buf: [256]u8 = undefined;
 var rx_head: u8 = 0;
 var rx_tail: u8 = 0;
 
-/// Ctrl-C（ASCII 0x03）不进缓冲区，只记下来，陷阱处理程序据此结束正在运行的用户程序。
+/// 等键盘输入的进程睡在这个通道上（proc.sleep），收到字符后陷阱处理程序用它 proc.wakeup。
+pub const rx_chan: *const anyopaque = &rx_buf;
+
+/// Ctrl-C（ASCII 0x03）不进缓冲区，只记下来，陷阱处理程序据此结束前台进程。
 const ctrl_c = 0x03;
 var ctrl_c_pressed = false;
 

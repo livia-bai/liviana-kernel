@@ -37,7 +37,8 @@ MAX_HALT_CPU = 0.5  # 停机期间 QEMU 最多占用一个核的多少（忙等�
 # 用户地址空间里栈下面那一页保护页（src/proc.zig）
 GUARD_PAGE = (0x7FFFB000, 0x7FFFC000)
 USER_SPACE = (0x40000000, 0x80000000)
-MAX_PROCS = 8  # src/proc.zig 的 max_procs
+MAX_PROCS = 8  # src/proc.zig 的 max_procs，其中一个槽位是 shell 内核线程
+SHELL_PID = 1  # shell 是第一个进程（src/main.zig）
 SPIN_STARTED = re.compile(r"pid (\d+) spinning in U-mode")
 
 
@@ -245,11 +246,14 @@ def start_background(q, c, name):
 
 
 def ps_table(q, c):
-    """运行 ps，返回 {pid: (状态, ticks, 名字)}。"""
+    """运行 ps，返回 {pid: (状态, ticks, 名字)}，不含 shell 自己（检查它是正在运行的那一个）。"""
     out = q.command("ps")
     c.contains(out, r"PID STATE +TICKS NAME", "ps")
-    return {int(m.group(1)): (m.group(2), int(m.group(3)), m.group(4))
-            for m in re.finditer(r"^ *(\d+) (\w+) +(\d+) (\w+)$", out, re.M)}
+    table = {int(m.group(1)): (m.group(2), int(m.group(3)), m.group(4))
+             for m in re.finditer(r"^ *(\d+) (\w+) +(\d+) (\w+)$", out, re.M)}
+    shell = table.pop(SHELL_PID, None)
+    c.expect(shell == ("running", 0, "shell"), f"ps: expected pid {SHELL_PID} to be the running shell, got {shell}")
+    return table
 
 
 def case_sched(q, c, mode):
@@ -270,7 +274,7 @@ def case_sched(q, c, mode):
     time.sleep(SPIN_SECONDS)
     after = ps_table(q, c)
     for pid in spinners:
-        c.expect(after.get(pid, ("", 0, ""))[0] == "ready", f"ps: spin (pid {pid}) not listed as ready: {after}")
+        c.expect(after.get(pid, ("", 0, ""))[0] == "runnable", f"ps: spin (pid {pid}) not listed as runnable: {after}")
         got = after.get(pid, ("", 0, ""))[1] - before.get(pid, ("", 0, ""))[1]
         c.expect(got >= MIN_SPIN_TICKS // 2, f"ps: spin (pid {pid}) got only {got} ticks in {SPIN_SECONDS}s")
 
@@ -279,8 +283,17 @@ def case_sched(q, c, mode):
     table = ps_table(q, c)
     c.expect(fg not in table and all(pid in table for pid in spinners), f"ps after Ctrl-C: {table}")
 
-    # sleep 的进程不占 CPU。刚启动时它还是 ready（键盘输入比调度优先，紧接着的 ps 可能抢在它第一次运行之前），
-    # 所以多看几次
+    # 在 sleep 里睡着的前台进程，Ctrl-C 也要能叫醒它、结束它
+    start = len(q.text())
+    prompts = q.text().count(PROMPT)
+    q.send("run ticker\r")
+    time.sleep(0.2)
+    q.send("\x03")
+    out = q.wait_for(lambda t: t.count(PROMPT) > prompts, COMMAND_TIMEOUT, "the prompt after Ctrl-C on ticker")[start:]
+    c.contains(out, r"\^C\n\[proc\] pid \d+ \(ticker\) killed: interrupted by Ctrl-C", "run ticker + Ctrl-C")
+    c.expect("tick 1" not in out, f"run ticker + Ctrl-C: ticker kept running:\n{indent(out)}")
+
+    # sleep 的进程不占 CPU。刚启动时它还是 runnable（紧接着的 ps 可能抢在它第一次运行之前），所以多看几次
     ticker = start_background(q, c, "ticker")
     for _ in range(10):
         table = ps_table(q, c)
@@ -293,11 +306,12 @@ def case_sched(q, c, mode):
     for pid in spinners + [ticker]:
         c.contains(q.command(f"kill {pid}"), rf"\[proc\] pid {pid} \(\w+\) killed: kill command", "kill")
     c.contains(q.command("kill 9999"), r"kill: no such process: 9999", "kill 9999")
+    c.contains(q.command(f"kill {SHELL_PID}"), rf"kill: pid {SHELL_PID} is a kernel thread", "kill the shell")
     c.contains(q.command("kill"), r"usage: kill PID", "kill")
     c.expect(ps_table(q, c) == {}, "ps: processes left after killing all of them")
 
-    # 进程表满了
-    full = [start_background(q, c, "spin") for _ in range(MAX_PROCS)]
+    # 进程表满了（shell 占着一个槽位）
+    full = [start_background(q, c, "spin") for _ in range(MAX_PROCS - 1)]
     c.contains(q.command("run hello"), rf"run: too many processes \(at most {MAX_PROCS}\)", "run with a full table")
     for pid in full:
         if pid is not None:
