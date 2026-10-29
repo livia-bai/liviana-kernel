@@ -10,6 +10,8 @@
 //! - 进程之间有父子关系：fork 复制当前进程，exec 换掉地址空间，exit 之后变成 zombie，等父进程 wait 回收。
 //!   第一个进程 init（pid 1）由 kmain 创建，父进程先结束的孤儿交给它回收。
 //! - kill 只做标记、叫醒在睡的进程；被杀的进程回到 U 模式之前自己结束（checkKilled）。
+//!   正在别的 hart 上运行的，给那个 hart 发核间中断，让它马上进内核（ipi.zig）。
+//! - 有进程变成 runnable（wakeup、kill、fork）时，给一个在 wfi 里空等的 hart 发核间中断，让它马上来运行。
 //! - 每个进程有自己的 fd 表（files），指向全局文件表里的 File（file.zig）。fork 复制 fd 表，
 //!   exec 保留，结束时全部关掉。
 //!
@@ -21,7 +23,7 @@
 //!   0x8000_0000 往下  16 KiB 用户栈，可读写。最顶上放着 exec 传进来的命令行参数
 //!
 //! 锁（照 xv6 的 proc.c，详见 docs/process.md 的“锁”一节）：
-//! - 每个进程的 lock 保护它的 state、chan、killed、xstatus、pid、ticks、name。调度器拿着它切到进程，
+//! - 每个进程的 lock 保护它的 state、hart、chan、killed、xstatus、pid、ticks、name。调度器拿着它切到进程，
 //!   进程拿着它切回调度器，所以“改状态 + 切换”在别的 hart 看来是一步完成的。
 //! - wait_lock 保护所有进程的 parent，wait 拿着它睡在自己身上。加锁顺序：wait_lock 在前，进程锁在后；
 //!   别的锁（管道、串口、ticks）也都在进程锁前面拿，进程锁之后只会再拿页分配器、文件表这种不再往下拿锁的。
@@ -40,6 +42,7 @@ const trap = @import("trap.zig");
 const abi = @import("abi.zig");
 const file = @import("file.zig");
 const hart = @import("hart.zig");
+const ipi = @import("ipi.zig");
 const spinlock = @import("spinlock.zig");
 const Spinlock = spinlock.Spinlock;
 
@@ -79,6 +82,8 @@ pub const Process = struct {
     lock: Spinlock = .init("proc"),
     /// lock
     state: State = .unused,
+    /// lock。state 为 running 时，它在哪个 hart 上运行（kill 要给那个 hart 发核间中断）
+    hart: usize = 0,
     /// lock
     pid: usize = 0,
     /// lock（exec 会改，procinfo 要读）
@@ -258,6 +263,8 @@ pub fn fork() ForkError!usize {
         .heap_start = parent.heap_start,
         .brk = parent.brk,
     });
+    // 空闲的 hart 马上来运行子进程，不用等父进程让出 CPU
+    ipi.wakeIdle(1);
     return pid;
 }
 
@@ -377,16 +384,19 @@ pub fn scheduler() noreturn {
         // 进程和调度器都是关着中断运行的，中断只在这里打开一下：处理挂起的中断（它们可能叫醒进程），
         // 再关上。关着中断扫描、wfi：扫完发现没有可运行的进程、正要 wfi 时来了中断的话，
         // 中断保持挂起，wfi 立刻返回（wfi 只看 sie，不看 sstatus.SIE），不会白睡一觉。
-        // 别的 hart 叫醒了进程的话，这个 hart 要等到自己的下一个时钟中断（最多 10 ms）才会去看。
+        // 别的 hart 叫醒了进程的话，它会给登记为空闲的 hart 发核间中断，所以扫描之前先登记（见 ipi.setIdle）。
         riscv.enableInterrupts();
         riscv.disableInterrupts();
         hart.checkPanic();
+        ipi.setIdle(true);
         var found = false;
         for (&table) |*p| {
             p.lock.acquire();
             defer p.lock.release();
             if (p.state != .runnable) continue;
+            ipi.setIdle(false);
             p.state = .running;
+            p.hart = hart.id();
             c.proc = p;
             vm.activate(p.space);
             switchContext(&c.context, &p.context);
@@ -458,14 +468,20 @@ pub fn sleep(chan: *const anyopaque, lock: *Spinlock) void {
 
 /// 叫醒所有睡在 chan 上的进程。只改状态，不切换，中断处理程序里也能调用。
 /// 跳过当前进程：它在运行，不会在睡；调用方可能还拿着它的锁。
+/// 叫醒了几个，就给最多几个空闲的 hart 发核间中断，让它们马上来运行。
 pub fn wakeup(chan: *const anyopaque) void {
     const me = current();
+    var woken: usize = 0;
     for (&table) |*p| {
         if (p == me) continue;
         p.lock.acquire();
         defer p.lock.release();
-        if (p.state == .sleeping and p.chan == chan) p.state = .runnable;
+        if (p.state == .sleeping and p.chan == chan) {
+            p.state = .runnable;
+            woken += 1;
+        }
     }
+    ipi.wakeIdle(woken);
 }
 
 /// 当前进程调用了 exit。由系统调用处理程序调用，不返回。
@@ -596,7 +612,7 @@ pub const KillError = error{ NoSuchProcess, PermissionDenied };
 /// 杀掉进程 pid（对应 xv6 的 kill()）：只记下原因，在睡的叫醒，不当场结束它——
 /// 它可能停在内核栈上的任何地方（sleep 里、yield 里），也可能正在另一个 hart 上运行，
 /// 只有它自己知道怎么安全地收尾。它下一次回到 U 模式之前会在 checkKilled 里结束：
-/// 正在另一个 hart 的 U 模式里运行的，最晚等到那个 hart 的下一个时钟中断。
+/// 正在另一个 hart 的 U 模式里运行的，markKilled 给那个 hart 发核间中断，它马上进内核。
 /// 只改标志和状态，中断处理程序里也能调用。
 /// init 不能杀：它结束内核就 panic。已经结束的进程（zombie）照常返回成功，什么也不变。
 pub fn kill(pid: usize, reason: []const u8) KillError!void {
@@ -609,7 +625,17 @@ pub fn kill(pid: usize, reason: []const u8) KillError!void {
 /// 调用方拿着 p.lock。同一个进程被杀两次，保留第一次的原因。
 fn markKilled(p: *Process, reason: []const u8) void {
     if (p.killed == null) p.killed = reason;
-    if (p.state == .sleeping) p.state = .runnable;
+    switch (p.state) {
+        .sleeping => {
+            p.state = .runnable;
+            ipi.wakeIdle(1);
+        },
+        // 正在别的 hart 上运行：打断它。在 U 模式里的话马上陷入内核，回到 U 模式之前结束；
+        // 在内核里（中断关着）的话，中断挂着，它本来就会在回到 U 模式之前检查 killed，这个中断只是多余的一次。
+        // 拿着 p.lock，p.hart 不会变；它可能刚好在切走，那样别的进程会收到一个什么也不做的中断
+        .running => if (p.hart != hart.id()) ipi.send(p.hart),
+        else => {},
+    }
 }
 
 /// 设置前台进程（setfg 系统调用），pid 为 0 表示没有。

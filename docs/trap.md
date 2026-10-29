@@ -176,6 +176,7 @@ const from_user = frame.sstatus & riscv.sstatus_spp == 0;
 | --- | --- |
 | 中断 5（时钟） | `timer.onInterrupt()`：预约这个 hart 的下一次时钟中断；在启动 hart 上还给 `timer.ticks` 加 1、叫醒 `sleep` 系统调用里的进程（[devices.md](devices.md#定时器timerzig)）。`from_user` 时 `proc.yieldTimeslice()`：当前进程的 `ticks` 加 1，时间片用完，让出 CPU，下次轮到这个进程时（可能在别的 hart 上）返回（[process.md](process.md#schedyield)） |
 | 中断 9（外部） | `handleExternal()`：PLIC claim → 串口（收字符；按过 Ctrl-C 就 `proc.interruptForeground()`；`proc.wakeup(uart.rx_chan)` 叫醒在 `read` 里等输入的进程）→ complete（[devices.md](devices.md#claim--complete)）。串口中断发给所有 hart，claim 到 0 的 hart 什么也不做 |
+| 中断 1（软件中断） | 核间中断：`ipi.onInterrupt()` 清掉 `sip.SSIP`，别的什么都不做。它只是让这个 hart 进一次陷阱处理程序：空闲的调度器因此醒过来去扫进程表；被打断的 U 模式进程如果被杀了，末尾的 `checkKilled` 结束它（[process.md](process.md#核间中断)） |
 | 其他中断 | `std.debug.panic("unexpected interrupt N")` |
 | 来自 U 模式的异常 8（`ecall`） | `frame.sepc += 4`，`frame.regs[10] = syscall.dispatch(frame)`（[syscalls.md](syscalls.md)） |
 | 来自 U 模式的异常 15（`store_page_fault`） | `vm.breakCow(当前进程的地址空间, stval)`：写的是 `fork` 之后共用的写时复制页，就给这个进程复制一份能写的，不调整 `sepc`，回去重新执行这条写指令（[paging.md](paging.md#写时复制)）；复制时内存不够，`proc.killCurrent("out of memory (copy-on-write) at <sepc>, stval=<stval>")`；不是写时复制的页（只读的段、栈下面的保护页、没有映射的地址）和下一行一样处理 |

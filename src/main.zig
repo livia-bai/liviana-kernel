@@ -14,6 +14,7 @@ const page = @import("page.zig");
 const vm = @import("vm.zig");
 const proc = @import("proc.zig");
 const hart = @import("hart.zig");
+const ipi = @import("ipi.zig");
 
 /// 替换标准库默认的 panic 处理。@panic、std.debug.panic 以及
 /// Debug 模式下的安全检查失败（整数溢出、数组越界等）都会走到这里。
@@ -119,7 +120,8 @@ fn kmain(hartid: usize, dtb_addr: usize) callconv(.c) noreturn {
     plic.initHart();
     timer.init(info.timebase_hz);
     timer.initHart();
-    uart.print("[ok] interrupt sources enabled: timer at {d} Hz, keyboard via UART + PLIC\n", .{timer.tick_hz});
+    ipi.initHart();
+    uart.print("[ok] interrupt sources enabled: timer at {d} Hz, keyboard via UART + PLIC, IPIs\n", .{timer.tick_hz});
 
     startHarts(hartid, info.harts(), info.timebase_hz);
 
@@ -171,6 +173,7 @@ fn kmainSecondary() callconv(.c) noreturn {
     vm.initHart();
     plic.initHart();
     timer.initHart();
+    ipi.initHart();
     _ = harts_online.fetchAdd(1, .release);
     proc.scheduler();
 }

@@ -193,6 +193,6 @@ pub var ticks: u64 = 0;
 | --- | --- | --- | --- |
 | S 模式时钟中断 | 中断 5 | OpenSBI 按 `setTimer` 的预约触发，每个 hart 各自的 | `timer.onInterrupt()` |
 | S 模式外部中断 | 中断 9 | PLIC，目前只有串口（10 号源），送给所有 hart | `plic.claim()` → `uart.onInterrupt()` → `plic.complete()` |
-| S 模式软件中断 | 中断 1 | 核间中断（IPI）。内核不发，所以不会出现 | `sie.SSIE` 没有打开，不会被接收；万一收到就 panic（`unexpected interrupt 1`） |
+| S 模式软件中断 | 中断 1 | 核间中断（IPI）：别的 hart 通过 SBI 发来，叫醒空闲的 hart、打断运行着被杀进程的 hart | `ipi.onInterrupt()`：清掉 `sip.SSIP`（[process.md](process.md#核间中断)） |
 
 这三类都在 `mideleg` 里委托给了 S 模式（OpenSBI 设置的 `MIDELEG = 0x1666`）。陷阱分发的细节见 [trap.md](trap.md)。

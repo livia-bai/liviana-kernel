@@ -9,6 +9,7 @@ const plic = @import("plic.zig");
 const timer = @import("timer.zig");
 const proc = @import("proc.zig");
 const vm = @import("vm.zig");
+const ipi = @import("ipi.zig");
 const syscall = @import("syscall.zig");
 const spinlock = @import("spinlock.zig");
 
@@ -173,6 +174,8 @@ fn handleTrap(frame: *TrapFrame) callconv(.c) void {
                 }
             },
             .supervisor_external => handleExternal(),
+            // 核间中断：别的 hart 叫醒这个空闲的 hart，或者杀了正在这里运行的进程（末尾的 checkKilled 结束它）
+            .supervisor_software => ipi.onInterrupt(),
             else => std.debug.panic("unexpected interrupt {d}", .{code}),
         }
     } else if (from_user) {

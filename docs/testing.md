@@ -25,6 +25,7 @@ zig build test --summary all   # 显示通过了几个
 | `src/abi.zig` | 系统调用返回值和错误码的互相转换 |
 | `src/spinlock.zig` | 拿锁、放锁、`holding`、记录拿着几把锁 |
 | `src/pipe.zig` | 管道不需要等待的路径：环形缓冲区回绕、有多少读多少、坏地址时数据不动、写端关了读到结尾、读端关了写返回 `BrokenPipe`、两端都关了释放 |
+| `src/ipi.zig` | `wakeIdle` 每次用 `cmpxchg` 认领一个别的空闲 hart，不叫自己，没有空闲的就停下 |
 | `src/file.zig` | `dup` 加引用、最后一个 `close` 才关掉管道；文件表满了 `openPipe` 失败且不漏 |
 
 为什么页表能在主机上测：内核对物理内存做了恒等映射，页表里的地址就是能直接用的指针。测试拿一块按 4 KiB 对齐的数组交给页分配器当作“物理内存”，页表就建在这块数组里，代码不用改。只有 `vm.activate` 这类写 CSR 的函数不能在主机上调用，测试也不会用到它们：Zig 只编译被用到的函数，所以这些文件里的 RISC-V 内联汇编不影响在主机上编译。例外是被测的函数在不会走到的路径上调用了它们：管道的读写在等待时调用 `proc.sleep` → `proc.sched`（读 `sstatus`、切换上下文），测试只走不需要等待的路径，但 `sched` 照样要编译。所以 `sched` 开头在主机上直接 `@panic`（编译期判断，不是 RISC-V 时后面的汇编不会被编译），`Spinlock.acquire` 在主机上不检查 `sstatus`。
@@ -57,6 +58,7 @@ python3 tools/qemu_test.py --list         # 列出用例和它们覆盖的文件
 | `pipe` | `t_pipe`（自己检查 31 项）；shell 的管道：`echo \| wc`、`echo \| cat \| cat \| wc`、`t_args \| wc` 的结果，找不到的程序、空的一段、超过 4 个程序时报错；后台管道；对 `cat \| wc` 按 Ctrl-C 杀掉三个进程（组长、cat、wc），之后 `ps` 里没有剩下的；对 `cat \| wc` 输入 `abc` 再按 Ctrl-D，wc 打印 `0 1 3` | `src/pipe.zig`、`user/echo.zig`、`user/cat.zig`、`user/wc.zig`、`user/tests/t_pipe.zig`、`user/tests/t_args.zig` |
 | `sbrk` | `t_sbrk`（自己检查 25 项） | `user/tests/t_sbrk.zig` |
 | `cow` | `t_cow`（自己检查 15 项，见下文）；它打印的 `fork` 用掉的页数少于 16；最后一项里子进程被 `killed: out of memory (copy-on-write)` | `user/tests/t_cow.zig` |
+| `ipi` | `t_ipi`：打印 kill、wakeup 两个延迟的中位数；多核时要求 kill < 2000 µs、wakeup < 1000 µs（没有核间中断时实测 kill ≥ 4000 µs、wakeup ≥ 1100 µs，有了之后约 300～560 µs 和 200 µs） | `src/sbi.zig`、`user/tests/t_ipi.zig` |
 | `smp` | `t_smp`（自己检查 17 项，见下文）；至少 3 个 hart 时，两个后台 `spin` 0.5 秒里加起来拿到的 tick 要多于 65 个（一个 hart 最多给 50 个，所以它们一定是同时在两个 hart 上跑的。实测 4 核时约 100 个） | `src/timer.zig`、`src/plic.zig`、`src/pipe.zig`、`user/spin.zig`、`user/tests/t_smp.zig` |
 
 `build.zig`、链接脚本、`src/` 下的 `main.zig`、`riscv.zig`、`trap.zig`、`vm.zig`、`page.zig`、`dtb.zig`、`uart.zig`、`proc.zig`、`syscall.zig`、`abi.zig`、`spinlock.zig`、`hart.zig`、`file.zig`，以及 `user/` 下的 `start.zig`、`sys.zig`、`init.zig`、`sh.zig` 是核心文件：所有用例都要经过 init、shell 和系统调用，改了它们就跑全部用例；没登记过的内核文件也一样。只改了文档时，`--changed` 什么都不跑。
@@ -94,6 +96,7 @@ FAIL  safe   smp4   sched       61 checks
 | `t_read` | 每次最多 `read` 3 个字节，读到回车为止 | 输入 `hello world` 回车：`got "hello world" in N reads`，N ≥ 4 |
 | `t_args` | 不带 `check` 时打印 argc、每个参数、总字节数，退出码是 argc。`t_args check`：`argv` 在栈顶那一页、16 字节对齐；17 个参数、1026 字节的参数返回 `ArgsTooLong`；`argv` 指针、参数指针指向内核时 `EFAULT`；长度为 0 的参数不检查指针；正好 16 个参数、1024 字节；没有参数。要看子进程收到的参数时，把它的 stdout 接到管道上读回来比较 | 每项失败打印 `FAIL: ...`；最后 `N checks, 0 failed`，退出码 0 |
 | `t_pipe` | 基本读写、fd 编号最小；往读端写、从写端读是 `BadFd`；写端关了读到结尾；子进程写 5000 字节（比缓冲区大，要等）、父进程读完一字不差且读了至少 3 次；读的一方先睡下；读端关了写返回 `BrokenPipe`；写满之后读端才关，睡着的写者被叫醒、只写出一部分；睡在管道读、写里时被 kill；坏的 fd、坏指针；`dup` 到 fd 表满、`pipe` 在只剩一个空位时失败且不漏；`fork` 继承 fd、子进程关 stdout 不影响父进程 | 同上 |
+| `t_ipi` | 核间中断的延迟，用 U 模式的 `rdtime` 计时，各测 15 次取中位数：杀掉一个在 U 模式里死循环的子进程（多核时在另一个 hart 上），从 `kill` 到 `wait` 返回；父进程写管道之后自己在 U 模式里忙 20 ms，睡在 `read` 里的子进程多久之后醒来 | `ipi latency (median of 15): kill N us, wakeup M us`，退出码 0 |
 | `t_smp` | 6 个工作进程同时（多核时在不同的 hart 上）各做 30 次 `fork`/`exit`/`wait`、各往同一个管道写 30 × 64 字节（父进程读完，按字节数对账）、各做 30 次 `sbrk` 长 3 页再缩回去，最后各留下一个交给 init 的孤儿；然后杀掉 3 个在 U 模式死循环的子进程（多核时它们正在别的 hart 上跑），`wait` 拿到的都是被杀的状态 | 每项失败打印 `FAIL: ...`；最后 `N checks, 0 failed`，退出码 0；前后 `mem` 一样 |
 | `t_cow` | 写时复制的 `fork`：带着 64 页堆的进程 `fork` 只多用了几页；父子进程各改各的（堆、全局变量，先写的、后写的都看不到对方的）；内核替子进程往共用的页里写（`read`、`pipe`、`meminfo`、`wait` 的输出参数）不改到父进程；父进程复制走之后子进程再写不再复制；最后父进程把内存全部用完（堆和管道），子进程让内核往共用的页里写得到 `EFAULT`，自己写被结束 | `fork of a process with a 64-page heap used N pages`，N < 16；`killed: out of memory (copy-on-write)`；最后 `N checks, 0 failed`，退出码 0；前后 `mem` 一样 |
 | `t_sbrk` | 堆一开始是空的；长 3 页多：返回原来的末尾、清零、按页映射（最后一页的页尾能写，下一页缺页）；内核通过管道读写堆里的内存；`fork` 复制堆；缩到页中间：这一页还在，后面的页缺页；再长回来是清零的；缩到起点下面、`minInt`、长进栈、`maxInt`、超过物理内存都失败，失败时不漏页、`brk` 不变；一个字节一个字节地长过页边界；全部还回去 | 同上；中间有几行 `killed: store_page_fault`，是故意去碰没映射的页的子进程 |

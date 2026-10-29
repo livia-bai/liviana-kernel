@@ -13,8 +13,8 @@
 | CSR | 用途 | 用在哪里 |
 | --- | --- | --- |
 | `sstatus` | S 模式状态：全局中断使能 SIE、陷入前的特权级 SPP、陷入前的 SIE（SPIE）等 | 开关中断；陷阱时保存/恢复；构造进入 U 模式的状态 |
-| `sie` | 各类 S 模式中断的使能位 | PLIC、定时器初始化时打开 SEIE、STIE；panic 停机时清零 |
-| `sip` | 各类中断的挂起位 | 目前只在注释里提到（`wfi` 的唤醒条件） |
+| `sie` | 各类 S 模式中断的使能位 | PLIC、定时器、核间中断初始化时打开 SEIE、STIE、SSIE；panic 停机时清零 |
+| `sip` | 各类中断的挂起位 | 收到核间中断后清掉 SSIP（`ipi.onInterrupt`）；也是 `wfi` 的唤醒条件 |
 | `stvec` | 陷阱入口地址 + 模式 | `trap.init` |
 | `sscratch` | 给陷阱处理程序用的暂存寄存器 | 进出 U 模式时存内核栈顶，见 [trap.md](trap.md#sscratch-约定) |
 | `sepc` | 陷阱发生时的 PC | 陷阱入口保存、出口恢复；跳过 `ebreak`/`ecall` |
@@ -33,6 +33,7 @@ pub const sstatus_spie: usize = 1 << 5; // 陷入前的 SIE，sret 时恢复到 
 pub const sstatus_spp: usize = 1 << 8;  // 陷入前的特权级：0 = U，1 = S
 pub const sstatus_fs: usize = 3 << 13;  // 浮点单元状态（2 位）：0 = Off
 
+pub const sip_ssip: usize = 1 << 1;     // 软件中断挂起（核间中断），S 模式可写，处理时自己清
 pub const sie_ssie: usize = 1 << 1;     // 软件中断
 pub const sie_stie: usize = 1 << 5;     // 时钟中断
 pub const sie_seie: usize = 1 << 9;     // 外部中断（PLIC）
@@ -103,8 +104,10 @@ fn call(ext: Extension, fid: usize, arg0: usize, arg1: usize, arg2: usize) Ret {
 | TIME | `0x54494D45`（"TIME"） | `set_timer` | 0 | `setTimer(deadline)`：`time` 达到 `deadline` 时产生 S 模式时钟中断，同时清除当前挂起的时钟中断 |
 | SRST | `0x53525354`（"SRST"） | `system_reset` | 0 | `shutdown()`：参数 type 0 = 关机，reason 0 = 无原因 |
 | HSM | `0x48534D`（"HSM"） | `hart_start` | 0 | `hartStart(hartid, start, arg)`：让停着的 hart 在 S 模式从物理地址 `start` 开始执行，`a0` = 它的编号，`a1` = `arg`，`satp` = 0、`sstatus.SIE` = 0。返回错误码 |
+| IPI | `0x735049`（"sPI"） | `send_ipi` | 0 | `sendIpi(hart_mask, hart_mask_base)`：给 `hart_mask` 里的 hart（第 i 位是 `hart_mask_base + i` 号）发核间中断，它们的 `sip.SSIP` 被置 1。返回错误码 |
 
 - `setTimer` 是唯一能清除 S 模式时钟中断挂起位的办法（`sip.STIP` 对 S 模式只读），所以时钟中断处理程序每次都要调用它预约下一次，否则中断会一直挂着、处理程序返回后马上又进来。
 - `shutdown` 成功时不返回，QEMU 退出且退出码为 0。如果固件不支持 SRST 扩展调用会返回，这时只能在 `wfi` 循环里停机。不管在哪个 hart 上调用，整台机器都关掉。
 - `hartStart` 只是请固件让那个 hart 开始运行，返回时它不一定已经执行到 `start` 了，所以 `kmain` 还要等它报到（[boot.md](boot.md#启动其他-hart)）。实测（QEMU 8.2 的 OpenSBI，4 个 hart）：启动不存在的 hart 5 返回 -3（`SBI_ERR_INVALID_PARAM`），再启动一次已经在运行的 hart 1 返回 -6（`SBI_ERR_ALREADY_AVAILABLE`）。
+- S 模式自己发不了核间中断（要写只有 M 模式能访问的 CLINT），所以请 OpenSBI 代发：它在 M 模式写目标 hart 的 CLINT，目标 hart 进 M 模式之后再把它的 `sip.SSIP` 置 1，于是目标 hart 收到 S 模式软件中断（[process.md](process.md#核间中断)）。`ipi.send` 每次只发给一个 hart（`sendIpi(1, id)`）。
 - QEMU 的 CPU 支持 Sstc 扩展（横幅里的 `Boot HART ISA Extensions: time,sstc`），S 模式本可以直接写 `stimecmp` 设置定时器，这个内核为了简单和可移植仍然走 SBI。

@@ -36,6 +36,10 @@ TIMEBASE_HZ = 10_000_000  # QEMU virt 的 time CSR 频率
 GUARD_PAGE = (0x7FFFB000, 0x7FFFC000)
 USER_SPACE = (0x40000000, 0x80000000)
 MAX_PROCS = 16  # src/abi.zig 的 max_procs，其中两个槽位是 init 和 sh
+# t_ipi 的两个延迟（中位数，微秒）的上限，多核时检查。没有核间中断时实测 kill ≥ 4000、wakeup ≥ 1100；
+# 有了之后 kill 约 300～560（Debug 最慢，含打印 killed 那一行）、wakeup 约 200
+IPI_KILL_MAX_US = 2000
+IPI_WAKEUP_MAX_US = 1000
 SPIN_STARTED = re.compile(r"pid (\d+) spinning in U-mode")
 
 
@@ -249,6 +253,19 @@ def ps_table(q, c):
     return {r[0]: (r[2], r[3], r[4]) for r in rows if r not in init + sh}
 
 
+def wait_ps_empty(q, c, what):
+    """等到 ps 里除了 init 和 sh 什么都没有、init 在睡。被杀的进程先打印 killed 那一行，之后才关文件、
+    变成 zombie；父进程先结束了的话，它还要等 init 来回收。所以刚看到 killed 那一行时 ps 可能还看得到它
+    （running），init 也可能正在回收它（running）。最多等 2 秒。"""
+    for _ in range(20):
+        attempt = Checks()
+        if ps_table(q, attempt) == {} and not attempt.failures:
+            return
+        time.sleep(0.1)
+    c.failures += [f"{what}: {f}" for f in attempt.failures]
+    c.expect(False, f"{what}: processes still left after 2s")
+
+
 def case_sched(q, c, mode):
     # 两个后台进程死循环，前台程序和 shell 照样能运行
     spinners = [start_background(q, c, "spin") for _ in range(2)]
@@ -430,7 +447,7 @@ def case_pipe(q, c, mode):
     out = q.wait_for(lambda t: t.count(PROMPT) > prompts and all(re.search(k, t[start:]) for k in killed),
                      COMMAND_TIMEOUT, "Ctrl-C to kill cat | wc")[start:]
     c.expect(out.count("^C") == 1, f"run cat | wc + Ctrl-C:\n{indent(out)}")
-    c.expect(ps_table(q, c) == {}, "ps: processes left after Ctrl-C on a pipeline")
+    wait_ps_empty(q, c, "ps after Ctrl-C on a pipeline")
     # 在键盘上按 Ctrl-D：cat 读到结尾
     start = len(q.text())
     prompts = q.text().count(PROMPT)
@@ -454,6 +471,20 @@ def case_cow(q, c, mode):
     c.contains(out, r"\[proc\] pid \d+ \(t_cow\) killed: out of memory \(copy-on-write\) at 0x[0-9a-f]+, stval=0x[0-9a-f]+\n",
                "run t_cow: writing a shared page without memory")
     check_counts(c, out, "t_cow")
+
+
+def case_ipi(q, c, mode):
+    # 核间中断：kill 别的 hart 上在跑的进程、叫醒进程给空闲的 hart 运行，都不用等时钟中断（10 ms 一次）。
+    # 没有核间中断时多核下的中位数实测是 kill 4～8 ms、wakeup 1.1～7.6 ms；有了之后都在 0.6 ms 以内。
+    # 单核时 wakeup 必然要等父进程的时间片用完，只检查能跑完
+    out = q.command("run t_ipi")
+    m = c.contains(out, r"ipi latency \(median of \d+\): kill (\d+) us, wakeup (\d+) us\n", "run t_ipi")
+    if m and q.smp >= 2:
+        kill, wakeup = int(m.group(1)), int(m.group(2))
+        c.expect(kill < IPI_KILL_MAX_US, f"run t_ipi: killing a process on another hart took {kill} us")
+        c.expect(wakeup < IPI_WAKEUP_MAX_US, f"run t_ipi: an idle hart took {wakeup} us to run a woken process")
+    c.expect("FAIL" not in out, f"run t_ipi:\n{indent(out)}")
+    exited(c, out, "t_ipi", 0)
 
 
 def case_smp(q, c, mode):
@@ -480,7 +511,7 @@ def case_smp(q, c, mode):
 
 # 每个用例覆盖的文件。改了 CORE 里的文件（或者没列出的内核文件）就跑全部用例。
 CORE = ["build.zig", "linker.ld", "src/main.zig", "src/riscv.zig", "src/trap.zig", "src/vm.zig", "src/page.zig",
-        "src/dtb.zig", "src/uart.zig", "src/proc.zig", "src/syscall.zig", "src/abi.zig", "src/spinlock.zig", "src/hart.zig",
+        "src/dtb.zig", "src/uart.zig", "src/proc.zig", "src/syscall.zig", "src/abi.zig", "src/spinlock.zig", "src/hart.zig", "src/ipi.zig",
         "src/file.zig", "user/start.zig", "user/sys.zig", "user/init.zig", "user/sh.zig", "tools/qemu_test.py"]
 NOT_KERNEL = ["src/tests.zig"]  # 只在单元测试里用
 CASES = {
@@ -501,6 +532,7 @@ CASES = {
                          "user/tests/t_args.zig"]),
     "sbrk": (case_sbrk, ["user/tests/t_sbrk.zig"]),
     "cow": (case_cow, ["user/tests/t_cow.zig"]),
+    "ipi": (case_ipi, ["src/sbi.zig", "user/tests/t_ipi.zig"]),
     "smp": (case_smp, ["src/timer.zig", "src/plic.zig", "src/pipe.zig", "user/spin.zig", "user/tests/t_smp.zig"]),
 }
 
@@ -549,7 +581,7 @@ def check_boot(q, c, smp):
         rf"\[ok\] device tree: \d+ MiB RAM at 0x80000000, timebase {TIMEBASE_HZ} Hz",
         r"\[ok\] page allocator: \d+ free pages",
         r"\[ok\] Sv39 paging enabled",
-        r"\[ok\] interrupt sources enabled: timer at 100 Hz",
+        r"\[ok\] interrupt sources enabled: timer at 100 Hz, keyboard via UART \+ PLIC, IPIs\n",
         rf"\[ok\] {smp} harts? running, booted on hart \d+\n",
     ]:
         c.contains(text, pattern, "boot log")

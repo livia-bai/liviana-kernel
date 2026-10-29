@@ -2,6 +2,12 @@
 
 每次改了内核（`src/`、`user/`、`build.zig`、链接脚本），在最上面加几行：新增了什么功能，修了什么 bug。最新的在前面。
 
+## 2026-10-29 核间中断
+
+- 新增：核间中断（`src/ipi.zig`，经 SBI IPI 扩展的 `send_ipi`，新增 `sbi.sendIpi`；收到的是 S 模式软件中断，每个 hart 在 `ipi.initHart` 里打开 `sie.SSIE`）。调度器扫描前把自己登记为空闲；`wakeup`、`kill` 叫醒睡着的进程、`fork` 建好子进程时，给一个空闲的 hart 发核间中断，它马上来运行，不用等自己的下一个时钟中断。`kill`、Ctrl-C 杀的进程正在别的 hart 上运行时（新增进程字段 `hart`），给那个 hart 发核间中断，它马上进内核结束这个进程。多核时杀掉别的 hart 上的进程从 4～8 ms 降到约 0.3 ms，叫醒的进程开始运行从 1～7.6 ms 降到约 0.2 ms。
+- 改动：启动日志改成 `[ok] interrupt sources enabled: timer at 100 Hz, keyboard via UART + PLIC, IPIs`。
+- 新增：回归测试 `t_ipi`（用 `rdtime` 量两个延迟）、QEMU 测试用例 `ipi`；`wakeIdle` 的单元测试。
+
 ## 2026-10-29 写时复制的 fork
 
 - 新增：`fork` 写时复制。`vm.cloneUserSpace` 只给子进程建页表，用户页和父进程共用；可写的页两边都改成只读、在页表项的 RSW 位上标 `cow`（`Pte.cow`）。谁先写哪一页，谁在 `store_page_fault` 里由新增的 `vm.breakCow` 复制一份，只剩自己在用时直接改回可写、不复制。内核往用户内存写（`copyToUser`、检查可写的 `checkUser`）遇到 `cow` 页也先复制。带着 64 页堆的进程 `fork` 一次，从多用 78 页降到多用 5 页；`fork` 之后马上 `exec` 的话一页都不复制。

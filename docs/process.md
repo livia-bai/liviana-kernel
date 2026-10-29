@@ -1,6 +1,6 @@
 # 进程：创建、调度和结束
 
-涉及文件：`src/proc.zig`（以及 `src/trap.zig` 的 `trapExit`、`src/vm.zig` 的用户地址空间函数、`src/spinlock.zig`、`src/hart.zig`；调用方：`src/main.zig`、`src/trap.zig`、`src/syscall.zig`、`src/file.zig`、`src/pipe.zig`、`src/timer.zig`）
+涉及文件：`src/proc.zig`（以及 `src/trap.zig` 的 `trapExit`、`src/vm.zig` 的用户地址空间函数、`src/spinlock.zig`、`src/hart.zig`、`src/ipi.zig`；调用方：`src/main.zig`、`src/trap.zig`、`src/syscall.zig`、`src/file.zig`、`src/pipe.zig`、`src/timer.zig`）
 
 进程表里最多同时有 16 个进程，在所有 hart 上按时间片轮转（round-robin）抢占式调度。进程的创建、调度、结束和加锁都照搬 [xv6](https://github.com/mit-pdos/xv6-riscv)（`kernel/proc.c`）的结构：
 
@@ -46,6 +46,7 @@ pub const ProcState = enum(u8) { unused, runnable, running, sleeping, zombie }; 
 pub const Process = struct {
     lock: Spinlock = .init("proc"),    // 保护下面标着 lock 的字段，见“锁”
     state: State = .unused,            // lock
+    hart: usize = 0,                   // lock。running 时在哪个 hart 上运行（kill 发核间中断用）
     pid: usize = 0,                    // lock
     name: []const u8 = "",             // lock。程序名，exec 时换掉；fork 出来的子进程沿用父进程的
     space: *vm.PageTable = undefined,  // 根页表
@@ -337,12 +338,15 @@ pub fn scheduler() noreturn {
         riscv.enableInterrupts();
         riscv.disableInterrupts();
         hart.checkPanic();
+        ipi.setIdle(true);
         var found = false;
         for (&table) |*p| {
             p.lock.acquire();
             defer p.lock.release();
             if (p.state != .runnable) continue;
+            ipi.setIdle(false);
             p.state = .running;
+            p.hart = hart.id();
             c.proc = p;
             vm.activate(p.space);
             switchContext(&c.context, &p.context);
@@ -357,8 +361,8 @@ pub fn scheduler() noreturn {
 
 和 xv6 的 `scheduler()` 一句一句对得上。每个 hart 跑一份，各自用自己的启动栈和 `cpus[hart.id()]`，扫的是同一张进程表：
 
-1. **开一下中断再关上**。进程和调度器都是关着中断运行的，中断只在这里（以及 U 模式）才会被处理。挂起的中断（时钟、键盘）在这一刻进来，中断处理程序可能 `wakeup` 某个进程。然后看一眼是不是有别的 hart 在 panic（[boot.md](boot.md#panic)），有的话停下。
-2. **扫一遍进程表**，每个槽位先拿它的锁再看状态。`runnable` 的进程：状态设为 `running`，`c.proc` 指向它，切到它的地址空间，`switchContext(&c.context, &p.context)` 切过去。进程要么第一次运行（`forkret`），要么从它上次调用 `sched()` 的地方继续。
+1. **开一下中断再关上**。进程和调度器都是关着中断运行的，中断只在这里（以及 U 模式）才会被处理。挂起的中断（时钟、键盘、核间中断）在这一刻进来，中断处理程序可能 `wakeup` 某个进程。然后看一眼是不是有别的 hart 在 panic（[boot.md](boot.md#panic)），有的话停下。
+2. **登记成空闲，扫一遍进程表**，每个槽位先拿它的锁再看状态。`runnable` 的进程：清掉空闲登记，状态设为 `running`，记下 `p.hart`，`c.proc` 指向它，切到它的地址空间，`switchContext(&c.context, &p.context)` 切过去。进程要么第一次运行（`forkret`），要么从它上次调用 `sched()` 的地方继续。
 3. 进程调用 `sched()` 之后，执行回到这里，这时**又拿着这个进程的锁**（进程是拿着它切回来的）：切回内核页表，`c.proc = null`，放开锁，接着扫下一个槽位。
 4. **一整圈都没有可运行的进程就 `wfi`**，等下一个中断。
 
@@ -370,7 +374,46 @@ pub fn scheduler() noreturn {
 
 **先关中断再扫描、再 `wfi`，顺序不能改**，原因是一个经典的竞争：如果开着中断扫描，可能出现“扫描时没有可运行的进程 → 正要执行 `wfi` 时键盘中断来了，叫醒了 shell → `wfi` 睡下去”，shell 要等到下一个中断（最长 10 ms 后的时钟中断）才能运行。关着中断扫描就没有这个问题：中断只是挂起（`sip` 里的位置 1）而不会被处理；`wfi` 只看 `sie` 和 `sip`、不看 `sstatus.SIE`，有挂起的中断就立即返回；下一轮开头开中断，挂起的中断马上被处理。xv6 的注释里讲的也是这件事。
 
-**别的 hart 叫醒的进程**：hart A 上的 `wakeup` 把一个进程改成 `runnable` 时，正在 `wfi` 的 hart B 不会马上知道（没有发核间中断），要等它自己的下一个时钟中断，最多 10 ms。xv6 也是这样。通常不明显：hart A 自己的调度器下一圈也会看到这个进程。
+**别的 hart 叫醒的进程**：hart A 上的 `wakeup` 把一个进程改成 `runnable` 时，正在 `wfi` 的 hart B 本来不会知道，要等它自己的下一个时钟中断（最多 10 ms，xv6 就是这样）。现在 hart A 给一个登记为空闲的 hart 发核间中断，它马上来运行这个进程，见下一节。
+
+### 核间中断
+
+```zig
+// ipi.zig
+var idle: std.atomic.Value(usize)        // 第 i 位：hart i 在调度器里扫描或者正要 wfi，没在运行进程
+pub fn initHart() void                   // sie.SSIE = 1，每个 hart 一次
+pub fn setIdle(on: bool) void            // 调度器：扫描之前置位，挑中进程时清掉
+pub fn wakeIdle(n: usize) void           // 叫醒最多 n 个别的空闲 hart
+pub fn send(id: usize) void              // 给 hart id 发一个核间中断
+pub fn onInterrupt() void                // 收到时清掉 sip.SSIP
+```
+
+核间中断（IPI）就是一个 hart 打断另一个 hart。S 模式自己发不了（要写只有 M 模式能访问的 CLINT），请 OpenSBI 代发（`sbi.sendIpi`，[riscv-sbi.md](riscv-sbi.md#用到的扩展)）；目标 hart 的 `sip.SSIP` 被置 1，收到 S 模式软件中断。中断不带任何信息，只是让目标 hart 进一次陷阱处理程序，`ipi.onInterrupt` 清掉 `SSIP`（不清的话一开中断又会进来），别的什么都不做。用在两件事上：
+
+**叫醒空闲的 hart**（`wakeIdle`）。`wakeup` 叫醒了几个进程，就叫最多几个空闲的 hart；`kill` 叫醒一个睡着的进程、`fork` 建好一个子进程时各叫一个。被叫的 hart 如果在 `wfi`，立刻醒来；如果还在扫描，中断挂在 `sip` 里，接下来的 `wfi` 立刻返回。下一轮开头开中断时处理掉它，接着扫描，看到新的 `runnable` 进程。
+
+- **扫描之前登记，不是扫完才登记**：hart B 扫到槽位 k（不是 `runnable`）之后、`wfi` 之前，hart A 把槽位 k 改成 `runnable`。如果 B 扫完才登记，A 可能在那之前读 `idle`、看不到 B，B 就白睡一觉。B 在扫描之前登记，而 A 是拿着槽位 k 的锁改状态、放开锁之后才读 `idle`：要么 B 拿到这把锁时已经看到 `runnable`，要么 A 拿到锁在 B 放开之后，那么 B 的登记（在 B 放开锁之前）一定对 A 可见，A 会发核间中断过来。和调度器“关着中断扫描再 `wfi`”防的是同一种竞争，只是跨 hart。
+- **认领**：`wakeIdle` 用 `cmpxchg` 把一个空闲 hart 的位清掉，成功了才给它发。两个 hart 同时叫醒进程时不会都去叫同一个空闲的 hart，另一个会去叫下一个。被叫的 hart 下一轮开头重新登记。
+- **不叫自己**：调用方所在的 hart 反正会再扫一遍（它在调度器里，或者当前进程迟早让出 CPU）。
+- 挑中进程时清掉登记，所以正在运行进程的 hart 不会被白白打断。被认领、但没等到中断就自己扫到了进程的 hart，会在进入 U 模式之后收到这个中断，什么也不做就回去了。
+
+**催正在运行被杀进程的 hart**（`markKilled` → `send(p.hart)`）。`kill`、Ctrl-C 杀的进程正在另一个 hart 上运行（`state == running`，`p.hart` 不是自己）时，给那个 hart 发核间中断：
+
+- 它在 U 模式里的话，马上陷入内核，`handleTrap` 末尾的 `checkKilled` 结束它，不用等那个 hart 的下一个时钟中断。
+- 它在内核里（系统调用中，中断关着）的话，中断挂着；它本来就会在回到 U 模式之前检查 `killed`，回到 U 模式时这个中断进来一次，什么也不做。
+- `p.hart` 和 `state` 都在 `p.lock` 下读写，`markKilled` 拿着这把锁，所以读到的是一致的：要么它真在那个 hart 上运行，要么它刚好在切走（调度器要拿到这把锁才能换下一个进程），那样下一个进程会收到一个什么也不做的中断。
+
+`send` 可以拿着锁调用（`wakeup`、`markKilled` 都拿着锁），它只是一次 SBI 调用。单元测试在主机上运行，`send` 什么也不做。
+
+实测（回归测试 `t_ipi`，用 U 模式的 `rdtime` 计时，15 次的中位数，safe 模式）：
+
+| | 没有核间中断 | 有核间中断 |
+| --- | --- | --- |
+| 杀掉另一个 hart 上在 U 模式里死循环的进程，从 `kill` 到 `wait` 返回 | 2 核 7.2～8.1 ms，4 核 4.0～4.4 ms | 2～8 核 0.27～0.46 ms |
+| 父进程写管道之后自己接着忙，睡在 `read` 里的子进程多久之后醒来运行 | 2 核 1.1～7.6 ms，4 核 3.6～3.8 ms | 2～8 核 0.18～0.23 ms |
+| 单核（只有一个 hart，没有核间中断可发） | kill 约 0.2 ms，wakeup 7.3～8.1 ms | 一样 |
+
+单核时第二项要等父进程的时间片用完，和有没有核间中断无关。
 
 ### sched、yield
 
@@ -397,7 +440,7 @@ pub fn yield() void {
 
 注意 `sched` 每次现查 `cpus[hart.id()]`，不能在函数开头取一次存着：切回来的时候可能已经在另一个 hart 上了。
 
-`yield` 由 `yield` 系统调用调用；时钟中断打断 U 模式时（时间片用完，[trap.md](trap.md#分发)）陷阱处理程序调用 `yieldTimeslice`，它多做一件事：拿着锁给 `ticks` 加 1。只有时钟中断让出 CPU，串口中断不让（和 xv6 一样）：串口中断只是叫醒在 `read` 里等输入的进程（通常是 shell），它最多等当前进程用完这个时间片（10 ms），多核时空闲的 hart 也会在自己的下一个时钟中断运行它。
+`yield` 由 `yield` 系统调用调用；时钟中断打断 U 模式时（时间片用完，[trap.md](trap.md#分发)）陷阱处理程序调用 `yieldTimeslice`，它多做一件事：拿着锁给 `ticks` 加 1。只有时钟中断让出 CPU，串口中断不让（和 xv6 一样）：串口中断只是叫醒在 `read` 里等输入的进程（通常是 shell），它最多等当前进程用完这个时间片（10 ms）；多核时 `wakeup` 给一个空闲的 hart 发核间中断，它马上来运行 shell。
 
 **时间片**：每个 hart 的时钟中断是每 10 ms 一次（[devices.md](devices.md#定时器timerzig)），不是按进程计时的，所以一个进程刚被调度就碰上时钟中断时，它的时间片会不足 10 ms。`ticks` 只在时钟中断打断这个进程时加 1，是它用掉的 CPU 时间的近似值（单位 10 ms），`ps` 显示它。两个死循环的进程一起跑时，`ticks` 的增速几乎相同；多核时它们在不同的 hart 上同时跑，各自每秒接近 100。
 
@@ -614,7 +657,7 @@ pub fn wait(pid: usize, nohang: bool, status_ptr: usize) WaitError!?usize {
 
 - 陷阱处理程序回到 U 模式之前调用 `checkKilled()`（[trap.md](trap.md#分发)），新进程第一次进入 U 模式之前 `forkretC` 也调用它。拿着进程锁读出 `killed`，不为空就 `killCurrent("{s}", .{reason})`。所以**被杀的进程不会再执行一条用户指令**。
 - 睡着的进程被改成 `runnable`，醒来后在 `sleep`、`read`、`write`（管道）、`wait` 的循环里看到 `killed`（`proc.isKilled()`，也拿进程锁读），提前返回，接着在 `checkKilled` 里结束。
-- 正在 U 模式运行的进程：中断（或者另一个 hart 上的 `kill` 系统调用）只给它做标记。单核时串口中断打断的就是它，这次中断返回之前 `checkKilled` 就结束它；多核时它可能正在另一个 hart 上运行，要等那个 hart 的下一个时钟中断（最多 10 ms）进入内核，回到 U 模式之前结束。没有核间中断去催它，xv6 也是这样。
+- 正在 U 模式运行的进程：中断（或者另一个 hart 上的 `kill` 系统调用）只给它做标记。单核时串口中断打断的就是它，这次中断返回之前 `checkKilled` 就结束它；多核时它可能正在另一个 hart 上运行，`markKilled` 给那个 hart 发核间中断，它马上进入内核，回到 U 模式之前结束（[核间中断](#核间中断)）。xv6 不发，要等那个 hart 的下一个时钟中断。
 - `kill` 先找到这个 pid 的进程并拿着它的锁（`lockPid`：逐个槽位拿锁比较 pid），再标记。只改标志和状态，所以中断处理程序里也能调用。同一个进程被杀两次，保留第一次的原因。zombie 也能“杀”，什么都不变。
 - 杀 init 是 `PermissionDenied`（`-EPERM`），没有这个进程是 `NoSuchProcess`（`-ESRCH`）。
 
@@ -641,13 +684,12 @@ Ctrl-C 结束的是**前台进程和它的所有子孙**：shell 用 `fork` 启�
 
 1. 串口中断处理程序看到 `0x03`，不放进输入缓冲区，`uart.onInterrupt()` 返回 `true`（[devices.md](devices.md#ctrl-c)）。
 2. 同一个中断里，`trap.handleExternal` 接着调用 `proc.interruptForeground()`：拿上 `wait_lock`，前台进程存在、没结束、不是 init 的话，打印 `^C`，然后扫一遍进程表，对前台进程和它的子孙（顺着 `parent` 往上找得到前台进程的）都拿锁做 `kill` 的标记（原因是 `interrupted by Ctrl-C`）；否则什么也不做，所以在 shell 里随手按的 Ctrl-C 不会留到下一个程序。整个扫描拿着 `wait_lock`，父子关系不会变、前台进程也不会被回收；`kill` 只做标记，标记的时候谁都还没结束、没有被交给 init，父子关系是完整的，一遍就能找全。这和 xv6 的 `consoleintr` 在中断里直接处理控制字符是一个思路。
-3. 被杀的进程在这个 hart 的 U 模式运行的话，这次中断返回之前 `checkKilled` 就结束它；在别的 hart 的 U 模式运行的话，那个 hart 的下一个时钟中断结束它；在 `sleep`、`read`、`write`、`wait` 里睡着的话，它被叫醒后结束；`runnable` 的话，下次被调度时结束。用户程序就算死循环、从不做系统调用，也不会再回到 U 模式。
+3. 被杀的进程在这个 hart 的 U 模式运行的话，这次中断返回之前 `checkKilled` 就结束它；在别的 hart 的 U 模式运行的话，`markKilled` 发过去的核间中断让那个 hart 马上进内核结束它；在 `sleep`、`read`、`write`、`wait` 里睡着的话，它被叫醒后结束；`runnable` 的话，下次被调度时结束。用户程序就算死循环、从不做系统调用，也不会再回到 U 模式。
 4. 前台进程结束时叫醒在 `wait` 里等它的 shell。
 
 ## 限制和以后可以做的
 
 - 内核代码不可抢占：进程在内核里关着中断运行，直到自己调用 `sched`。xv6 在内核里也开着中断，内核代码被时钟中断打断时也会 `yield`。这里内核里没有长时间的计算，不需要。
-- 没有核间中断（IPI）：叫醒了进程、杀了别的 hart 上正在运行的进程，都要等那个 hart 自己的下一个时钟中断（最多 10 ms）才生效。
 - 进程之间没有优先级，也不考虑在哪个 hart 上运行过（没有亲和性）。
 - 进程表固定 16 项，内核栈和启动栈是静态的，两侧没有保护页：溢出时会悄悄踩坏相邻的数据，所以栈的大小按实测用量留了余量。
 - `fork` 写时复制，但页表还是整个复制的；内存用完时写共用的页只能结束进程（没有换页、没有 OOM killer 挑别的进程）。
@@ -661,7 +703,7 @@ Ctrl-C 结束的是**前台进程和它的所有子孙**：shell 用 `fork` 启�
 
 | 锁 | 保护什么 | 在哪 |
 | --- | --- | --- |
-| `Process.lock`（每个进程一把） | 这个进程的 `state`、`pid`、`name`、`chan`、`killed`、`xstatus`、`ticks`；调度器拿着它切到进程，进程拿着它切回调度器 | 本文 |
+| `Process.lock`（每个进程一把） | 这个进程的 `state`、`hart`、`pid`、`name`、`chan`、`killed`、`xstatus`、`ticks`；调度器拿着它切到进程，进程拿着它切回调度器 | 本文 |
 | `proc.wait_lock` | 所有进程的 `parent`；`wait` 拿着它睡在自己身上 | 本文 |
 | `timer.lock` | `timer.ticks`；`sleep` 系统调用拿着它睡在 `&ticks` 上 | [devices.md](devices.md#定时器timerzig) |
 | `page.lock` | 空闲页链表、`free_pages`、每一页的引用数（写时复制） | [page-allocator.md](page-allocator.md) |

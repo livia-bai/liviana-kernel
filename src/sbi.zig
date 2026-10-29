@@ -7,6 +7,7 @@ const Extension = enum(usize) {
     time = 0x54494D45, // "TIME"
     srst = 0x53525354, // "SRST"：系统复位
     hsm = 0x48534D, // "HSM"：hart 状态管理，启动别的 hart
+    ipi = 0x735049, // "sPI"：核间中断
 };
 
 const Ret = struct {
@@ -63,6 +64,12 @@ pub fn setTimer(deadline: u64) void {
 /// 只是请固件让它开始运行，返回时那个 hart 不一定已经执行到 start 了。
 pub fn hartStart(hartid: usize, start: usize, arg: usize) isize {
     return call(.hsm, 0, hartid, start, arg).err;
+}
+
+/// 给 hart_mask 里的 hart 发核间中断：它们的 sip.SSIP 被置 1，打开了 sie.SSIE 的话就会收到 S 模式软件中断
+/// （SBI 规范 IPI 扩展的 send_ipi）。hart_mask 的第 i 位是 hart_mask_base + i 号 hart。返回 SBI 的错误码，0 是成功。
+pub fn sendIpi(hart_mask: usize, hart_mask_base: usize) isize {
+    return call(.ipi, 0, hart_mask, hart_mask_base, 0).err;
 }
 
 pub fn shutdown() noreturn {

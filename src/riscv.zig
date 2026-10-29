@@ -20,6 +20,9 @@ pub const sstatus_spie: usize = 1 << 5; // 陷入前的 SIE，sret 时恢复到 
 pub const sstatus_spp: usize = 1 << 8; // 陷入前的特权级：0 = U，1 = S；sret 回到这个特权级
 pub const sstatus_fs: usize = 3 << 13; // 浮点单元状态（2 位）：0 = Off，这时浮点指令都是非法指令
 
+// sip 中的位：S 模式软件中断挂起。核间中断就是别的 hart（经 SBI）把它置 1，处理时要自己清掉
+pub const sip_ssip: usize = 1 << 1;
+
 // sie 中的位：分别使能三类 S 模式中断
 pub const sie_ssie: usize = 1 << 1; // 软件中断
 pub const sie_stie: usize = 1 << 5; // 时钟中断

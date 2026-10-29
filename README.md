@@ -9,7 +9,7 @@
 - 解析设备树，得到内存范围和时钟频率
 - 物理页分配器，Sv39 分页，内核按段设置权限（代码只读可执行，数据不可执行）
 - U 模式用户程序：独立编译的 ELF 嵌进内核，由内核加载；用户程序出错或按 Ctrl-C 只结束进程，内核照常运行
-- 多核：启动 hart 用 SBI 的 HSM 扩展启动设备树里的其他 hart（QEMU 默认 4 个，最多用 8 个），每个 hart 跑自己的调度器
+- 多核：启动 hart 用 SBI 的 HSM 扩展启动设备树里的其他 hart（QEMU 默认 4 个，最多用 8 个），每个 hart 跑自己的调度器；核间中断叫醒空闲的 hart、打断运行着被杀进程的 hart
 - 多进程，照 xv6 的结构：时间片轮转调度（每个 hart 一个调度器循环、`sleep`/`wakeup`、`kill` 只做标记）；`fork`/`exec`/`wait`、父子进程、zombie 和孤儿回收；最多 16 个进程
 - 写时复制的 `fork`：父子进程共用物理页（页分配器记引用数），谁先写哪一页谁在缺页异常里复制一份
 - 21 个系统调用：文件描述符（`read`/`write`/`close`/`dup`）和管道（`pipe`），命令行参数（`exec` 带 `argv`），堆（`sbrk`）
@@ -24,7 +24,7 @@ SBI: OpenSBI, spec v1.0 | hart 0 | device tree at 0x87e00000
 [ok] device tree: 128 MiB RAM at 0x80000000, timebase 10000000 Hz
 [ok] page allocator: 31772 free pages (127088 KiB)
 [ok] Sv39 paging enabled: kernel mapped 1:1, text r-x, rodata r--, data rw-
-[ok] interrupt sources enabled: timer at 100 Hz, keyboard via UART + PLIC
+[ok] interrupt sources enabled: timer at 100 Hz, keyboard via UART + PLIC, IPIs
 [ok] 4 harts running, booted on hart 0
 Type 'help' for commands.
 > run hello
@@ -130,7 +130,6 @@ tools/          QEMU 测试脚本
 
 ## 可以继续做的方向
 
-- 多核：核间中断（叫醒的进程、被杀的进程现在要等那个 hart 的下一个时钟中断）
 - 从设备树读串口、PLIC 的地址和中断号
 - 按需分页（`sbrk` 先不分配，第一次访问时再分配）；内核栈两侧的保护页
 - 文件系统：现在只能运行嵌在内核里的程序

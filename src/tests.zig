@@ -11,4 +11,5 @@ test {
     _ = @import("spinlock.zig");
     _ = @import("pipe.zig");
     _ = @import("file.zig");
+    _ = @import("ipi.zig");
 }

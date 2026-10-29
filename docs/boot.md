@@ -128,7 +128,7 @@ export var boot_stacks: [hart.max][1 << boot_stack_shift]u8 align(16) = undefine
 | 5 | `dtb.parse(dtb_addr)` | `[ok] device tree: 128 MiB RAM at 0x80000000, timebase 10000000 Hz` | 页分配器要知道内存范围和保留区，定时器要知道时钟频率 |
 | 6 | `page.init(vm.kernelEnd(), info.memory.end(), info.reserved())` | `[ok] page allocator: N free pages (... KiB)` | 建页表需要分配页 |
 | 7 | `vm.init(info.memory)` | `[ok] Sv39 paging enabled: ...` | 写 `satp` 打开分页。恒等映射保证这一刻前后地址不变 |
-| 8 | `plic.init()`、`plic.initHart()`、`timer.init(info.timebase_hz)`、`timer.initHart()` | `[ok] interrupt sources enabled: timer at 100 Hz, keyboard via UART + PLIC` | 全局的设置（串口中断的优先级、时钟频率、由哪个 hart 计时）和这个 hart 自己的（PLIC 上下文、第一次时钟中断、`sie` 里的使能位）。全局开关 `sstatus.SIE` 不在这里开，见下文 |
+| 8 | `plic.init()`、`plic.initHart()`、`timer.init(info.timebase_hz)`、`timer.initHart()`、`ipi.initHart()` | `[ok] interrupt sources enabled: timer at 100 Hz, keyboard via UART + PLIC, IPIs` | 全局的设置（串口中断的优先级、时钟频率、由哪个 hart 计时）和这个 hart 自己的（PLIC 上下文、第一次时钟中断、`sie` 里时钟、外部、软件中断的使能位）。全局开关 `sstatus.SIE` 不在这里开，见下文 |
 | 9 | `startHarts(hartid, info.harts(), info.timebase_hz)` | `[ok] 4 harts running, booted on hart 0` | 启动设备树里列出的其他 hart，等它们都进了调度器（[启动其他 hart](#启动其他-hart)）。要在全局的初始化都做完之后：它们直接用页表、页分配器 |
 | 10 | `proc.userinit()` + `proc.scheduler()` | `Type 'help' for commands.`、`> ` | 和 xv6 的 `main` 一样：建好第一个进程 init，启动栈交给调度器，`kmain` 不再返回。之后的两行是 shell（init 启动的）打印的，init 和 shell 可能在任何一个 hart 上运行 |
 
@@ -150,8 +150,8 @@ fn kmainSecondary() callconv(.c) noreturn
 2. **一个一个来**：每启动一个，就等它把 `harts_online` 加 1（原子变量，最多等一秒，等不到就 panic），再启动下一个。所以启动日志的顺序是固定的，也不会出现几个 hart 同时初始化的情况。
 3. 调用 `hart_start` 之前先 `fence rw, rw`：新的 hart 要看到启动 hart 之前写的所有东西（页表、页分配器、各个模块的初始化）。SBI 规范没说 `hart_start` 本身保证这一点，所以自己做。`harts_online` 的加 1 和读取用 release / acquire，反方向也一样。
 4. `secondaryEntry` 是裸函数：`enter_asm` 设好 `tp` 和启动栈，`tail` 到 `kmainSecondary`。它不清零 `.bss`（启动 hart 早就清过，现在里面全是有用的数据）。
-5. `kmainSecondary` 做每个 hart 一份的初始化：关掉 `sstatus.FS`（OpenSBI 给每个 hart 都留着），`trap.init()`（每个 hart 有自己的 `stvec`、`sscratch`），`vm.initHart()`（打开分页：内核页表所有 hart 共用，启动后不再改），`plic.initHart()`、`timer.initHart()`（自己的 PLIC 上下文、自己的定时器），然后把 `harts_online` 加 1，进入自己的调度器。它不打印东西。
-6. 全部启动完，启动 hart 打印 `[ok] N harts running, booted on hart M`，然后才创建 init。这时其他 hart 已经在调度器里空转（没有可运行的进程就 `wfi`，每 10 ms 被自己的时钟中断叫醒一次）。
+5. `kmainSecondary` 做每个 hart 一份的初始化：关掉 `sstatus.FS`（OpenSBI 给每个 hart 都留着），`trap.init()`（每个 hart 有自己的 `stvec`、`sscratch`），`vm.initHart()`（打开分页：内核页表所有 hart 共用，启动后不再改），`plic.initHart()`、`timer.initHart()`、`ipi.initHart()`（自己的 PLIC 上下文、自己的定时器、接收核间中断），然后把 `harts_online` 加 1，进入自己的调度器。它不打印东西。
+6. 全部启动完，启动 hart 打印 `[ok] N harts running, booted on hart M`，然后才创建 init。这时其他 hart 已经在调度器里空转（没有可运行的进程就 `wfi`，每 10 ms 被自己的时钟中断叫醒一次；有进程变成 runnable 时被核间中断叫醒）。
 
 `hart_start` 失败（返回错误码）只打印 `[warn] cannot start hart N: SBI error E`，跳过它，内核照样用剩下的 hart 运行。QEMU `-smp 1` 时设备树里只有一个 hart，`startHarts` 什么都不启动，打印 `[ok] 1 hart running, booted on hart 0`。
 
