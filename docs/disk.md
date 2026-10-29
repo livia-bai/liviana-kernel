@@ -1,12 +1,13 @@
 # 磁盘：virtio 块设备、睡眠锁、缓冲区缓存
 
-涉及文件：`src/virtio_disk.zig`（驱动）、`src/sleeplock.zig`（睡眠锁）、`src/bio.zig`（缓冲区缓存）；调用方：`src/main.zig`（初始化）、`src/trap.zig`（中断）、`src/syscall.zig`（`blockcount`、`readblock`、`writeblock`）
+涉及文件：`src/virtio_disk.zig`（驱动）、`src/sleeplock.zig`（睡眠锁）、`src/bio.zig`（缓冲区缓存）；调用方：`src/main.zig`（初始化）、`src/trap.zig`（中断）、文件系统（[fs.md](fs.md)）、`src/syscall.zig`（`blockcount`、`readblock`、`writeblock`）
 
-内核有了一块磁盘：QEMU 给 `virt` 机器接一个 virtio 块设备，内核按 4 KiB 一块读写它，中间隔着一层缓冲区缓存。这三部分都照 xv6 的 `virtio_disk.c`、`sleeplock.c`、`bio.c` 写。现在还没有文件系统，用户程序通过三个系统调用直接读写块（像读写 Linux 的 `/dev/vda`）；以后的文件系统也建在缓冲区缓存上。
+内核有了一块磁盘：QEMU 给 `virt` 机器接一个 virtio 块设备，内核按 4 KiB 一块读写它，中间隔着一层缓冲区缓存。这三部分都照 xv6 的 `virtio_disk.c`、`sleeplock.c`、`bio.c` 写。磁盘的前一部分是文件系统（[fs.md](fs.md)），后一部分是“原始区域”，用户程序可以通过三个系统调用直接读写它的块。
 
 ```
-系统调用 readblock / writeblock            （以后：文件系统）
-        │
+系统调用 readblock / writeblock      文件系统（fs.zig → ctree.zig）
+   （只能碰原始区域）                        │
+        └──────────────┬───────────────────┘
 bio.zig：缓冲区缓存（32 块，LRU，每块一把睡眠锁）
         │  Device.transfer(块号, 数据, 读/写)
 virtio_disk.zig：组请求、交给设备、睡着等中断
@@ -24,14 +25,15 @@ QEMU 的 virtio-blk 设备 → 磁盘镜像文件
 
 - `virt` 机器有 8 个 virtio-mmio 槽位：`0x1000_1000` 起，每个 `0x1000`，第 i 个的中断是 PLIC 的 i + 1 号源（设备树里的 `virtio_mmio@10001000` 等节点，`interrupts = <1>`…`<8>`）。`bus=virtio-mmio-bus.0` 把磁盘接在第 0 个槽位，所以实际用的是 `0x1000_1000`、1 号中断。驱动不假定槽位，启动时逐个找。
 - **`force-legacy=false`**：QEMU 默认给 virtio-mmio 设备旧版接口（version 1，要求整个队列在一块按页对齐的内存里，用 `QueuePFN` 指定），驱动只支持现代接口（version 2，三部分各自给地址）。没加这个参数时内核打印 `[warn] virtio disk uses the legacy interface; run QEMU with -global virtio-mmio.force-legacy=false`，当作没有磁盘。
-- **磁盘镜像**由 `build.zig` 生成：4 MiB（1024 块），第 b 块的第 i 个字节是 `(b * 131 + i) % 251`，回归测试照着它检查读到的内容（[testing.md](testing.md#回归测试程序)）。装到 `zig-out/disk.img`。`zig build run` 用 `snapshot=on`：写只进 QEMU 的临时覆盖层，退出就丢，镜像不变；`qemu_test.py` 每次启动拷一份新的、不加 `snapshot`，退出之后读镜像文件检查写进去的内容（[build.md](build.md#磁盘镜像)）。
-- 没有接磁盘时打印 `[warn] no virtio disk`，`blockcount` 返回 0，`readblock`、`writeblock` 返回 `-ENODEV`，别的照常。
+- **磁盘镜像**由 `build.zig` 运行主机上的 `mkfs` 生成：32 MiB（8192 块）。前 7168 块是文件系统，用户程序装在 `/bin` 里；后 1024 块是原始区域，第 b 块（从原始区域的开头算）的第 i 个字节是 `(b * 131 + i) % 251`，回归测试照着它检查读到的内容（[testing.md](testing.md#回归测试程序)）。装到 `zig-out/disk.img`（[build.md](build.md#磁盘镜像)）。`zig build run` 用 `snapshot=on`：写只进 QEMU 的临时覆盖层，退出就丢，镜像不变；`qemu_test.py` 每次启动拷一份新的、不加 `snapshot`，退出之后读镜像文件检查写进去的内容（[build.md](build.md#磁盘镜像)）。
+- 没有接磁盘时打印 `[warn] no virtio disk`，`blockcount` 返回 0，`readblock`、`writeblock` 和文件系统的系统调用返回 `-ENODEV`，别的照常。
 
-启动日志：
+启动日志（`zig build run` 的 Debug 构建；最后一行是第一个进程挂载文件系统时打印的，见 [fs.md](fs.md#接进内核fsyszig)）：
 
 ```
-[ok] virtio disk: 1024 blocks of 4 KiB (4 MiB), irq 1
+[ok] virtio disk: 8192 blocks of 4 KiB (32 MiB), irq 1
 [ok] interrupt sources enabled: timer at 100 Hz, keyboard via UART + PLIC, IPIs, disk
+[ok] file system: 6841 of 7168 blocks free, generation 27
 ```
 
 ## virtio 块设备驱动（`virtio_disk.zig`）
@@ -171,7 +173,7 @@ pub fn blockCount() u64
 作用有两个，和 xv6 的一样：
 
 1. **缓存**：最近用过的块留在内存里，再读不用等磁盘。
-2. **同一块在内存里只有一份，同时只有一个进程用**：`read`/`get` 返回时拿着这一块的睡眠锁，别的进程要同一块就睡着等。以后的文件系统靠这一点保证两个进程不会同时改同一个块。
+2. **同一块在内存里只有一份，同时只有一个进程用**：`read`/`get` 返回时拿着这一块的睡眠锁，别的进程要同一块就睡着等。
 
 ### 找缓冲区（`get`）
 
@@ -179,7 +181,7 @@ pub fn blockCount() u64
 
 1. 从表头（最近用过）往后找 `blockno` 相同、并且 `refcnt > 0` 或 `valid` 的缓冲区：这一块已经在缓存里（或者正有人在读它）。
 2. 没有的话从表尾（最久没用）往前找 `refcnt == 0` 的，改成这一块，`valid = false`。
-3. 都没有（32 个都有人拿着）就 `proc.sleep(&lru, &bio.lock)`，等有人 `release`。xv6 在这里 panic；这里每个系统调用最多同时拿一个缓冲区，等下去不会死锁。
+3. 都没有（32 个都有人拿着）就 `proc.sleep(&lru, &bio.lock)`，等有人 `release`。xv6 在这里 panic。等下去不会死锁：同时拿着好几个缓冲区的只有文件系统（B 树的一条路径加上分裂出来的节点，最多 17 个），而同一时刻只有一个进程在用文件系统（`fsys.lock`）；`readblock`、`writeblock` 最多拿一个，拿着的时候不等别的东西。
 4. `refcnt += 1`，放开 `bio.lock`，再拿缓冲区的睡眠锁：可能要睡着等别的进程用完。
 
 `refcnt` 在放开 `bio.lock` 之前加，所以别人没法在“找到了”和“拿到睡眠锁”之间把这个缓冲区换成别的块。
@@ -201,7 +203,7 @@ pub fn blockCount() u64
 bio.init(if (virtio_disk.blocks > 0) .{ .blocks = virtio_disk.blocks, .transfer = virtio_disk.rw } else null);
 ```
 
-单元测试交进去一块内存，记着读写了几次，在主机上测缓存的行为（命中不读盘、换掉的是最久没用的、拿着的缓冲区不会被换掉、`write` 写回、超出范围、没有磁盘）。以后文件系统的单元测试也可以这样在内存里跑。
+单元测试交进去一块内存，记着读写了几次，在主机上测缓存的行为（命中不读盘、换掉的是最久没用的、拿着的缓冲区不会被换掉、`write` 写回、超出范围、没有磁盘）。B 树、文件系统的单元测试和主机上的 `mkfs` 也这样在内存里跑。
 
 ### 锁
 
@@ -213,13 +215,13 @@ bio.init(if (virtio_disk.blocks > 0) .{ .blocks = virtio_disk.blocks, .transfer 
 
 | 号 | 调用 | 说明 |
 | --- | --- | --- |
-| 21 | `blockcount()` | 磁盘有多少块，没有磁盘时是 0 |
-| 22 | `readblock(blockno, ptr)` | 第 `blockno` 块读进用户内存 `ptr`（4096 字节）。先 `checkUser` 检查整个目标可写（顺便复制好写时复制的页），再 `bio.read`、`copyToUser` |
-| 23 | `writeblock(blockno, ptr)` | 用户内存的 4096 字节写到第 `blockno` 块，写完才返回。先 `checkUser` 检查来源可读，再 `bio.get`（不读旧内容）、`copyFromUser`、`bio.write` |
+| 21 | `blockcount()` | 原始区域有多少块，没有磁盘时是 0 |
+| 22 | `readblock(blockno, ptr)` | 原始区域的第 `blockno` 块读进用户内存 `ptr`（4096 字节）。先 `checkUser` 检查整个目标可写（顺便复制好写时复制的页），再 `bio.read`、`copyToUser` |
+| 23 | `writeblock(blockno, ptr)` | 用户内存的 4096 字节写到原始区域的第 `blockno` 块，写完才返回。先 `checkUser` 检查来源可读，再 `bio.get`（不读旧内容）、`copyFromUser`、`bio.write` |
 
-都返回 0；块号超出磁盘是 `-EINVAL`，没有磁盘是 `-ENODEV`，指针不对是 `-EFAULT`（[syscalls.md](syscalls.md#调用列表)）。先检查指针再碰缓冲区：复制到一半失败的话，缓冲区里会留下半新半旧的内容（写），或者白读一次盘（读）。shell 的 `disk` 命令打印 `blockcount`。
+都返回 0；块号超出原始区域是 `-EINVAL`，没有磁盘是 `-ENODEV`，指针不对是 `-EFAULT`（[syscalls.md](syscalls.md#调用列表)）。先检查指针再碰缓冲区：复制到一半失败的话，缓冲区里会留下半新半旧的内容（写），或者白读一次盘（读）。shell 的 `disk` 命令打印 `blockcount`。
 
-这三个调用直接读写磁盘的块，以后有了文件系统，`writeblock` 写的块可能正被文件系统用着（和往 Linux 的 `/dev/vda` 里 `dd` 一样），推测会留给检查、调试文件系统的工具用。
+**原始区域**：块号从文件系统之后算起（`fsys.raw_base`，就是超级块里记的文件系统块数），所以这三个调用碰不到文件系统用着的块，不会绕过事务把它写坏。磁盘上没有文件系统时整个磁盘都是原始区域。回归测试 `t_disk` 用它测驱动和缓冲区缓存。
 
 ## 限制和以后可以做的
 

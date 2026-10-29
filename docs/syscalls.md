@@ -26,14 +26,23 @@ pub const Syscall = enum(usize) {
     setfg = 12, procinfo = 13, meminfo = 14, listprog = 15, shutdown = 16,
     close = 17, dup = 18, pipe = 19, sbrk = 20,
     blockcount = 21, readblock = 22, writeblock = 23,
+    open = 24, mkdir = 25, unlink = 26, chdir = 27, fstat = 28, readdir = 29,
     _,
 };
 
 pub const Errno = enum(usize) {
     perm = 1,     // EPERM：杀 init
-    noent = 2,    // ENOENT：没有这个程序（exec、listprog）
+    noent = 2,    // ENOENT：没有这个程序（exec、listprog），没有这个文件或目录
     srch = 3,     // ESRCH：没有这个进程（kill、setfg）
-    nodev = 19,   // ENODEV：没有磁盘（readblock、writeblock）
+    io = 5,       // EIO：磁盘上的数据不对（校验和、结构）
+    nodev = 19,   // ENODEV：没有磁盘，或者磁盘上没有文件系统
+    exist = 17,   // EEXIST：已经有这个名字了（mkdir；open 带 O_CREATE 时不算错）
+    notdir = 20,  // ENOTDIR：路径中间的一段不是目录；chdir、readdir 的不是目录
+    isdir = 21,   // EISDIR：读写目录、写方式打开目录
+    fbig = 27,    // EFBIG：文件太大
+    nospc = 28,   // ENOSPC：磁盘满了
+    nametoolong = 36, // ENAMETOOLONG：名字长于 255 字节，或者路径长于 256 字节
+    notempty = 39,    // ENOTEMPTY：删除的目录不是空的
     toobig = 7,   // E2BIG：命令行参数太多或太长（exec）
     noexec = 8,   // ENOEXEC：程序不是合法的 ELF（exec）
     badf = 9,     // EBADF：fd 没有打开，或者方向不对（往读端写、从写端读）
@@ -41,7 +50,7 @@ pub const Errno = enum(usize) {
     again = 11,   // EAGAIN：进程表满了（fork）
     nomem = 12,   // ENOMEM：物理内存不够（fork、exec、pipe），或者堆不能再长了（sbrk）
     fault = 14,   // EFAULT：指针指向的内存不属于用户空间、没有映射，或者要写的页不可写
-    inval = 22,   // EINVAL：参数不对（wait 的 options，sbrk 缩到堆的起点下面，块号超出磁盘）
+    inval = 22,   // EINVAL：参数不对（wait 的 options，sbrk 缩到堆的起点下面，块号超出原始区域，open 的 flags，名字是 "."、".."）
     nfile = 23,   // ENFILE：系统的文件表满了（pipe）
     mfile = 24,   // EMFILE：进程的 fd 表满了（dup、pipe）
     pipe = 32,    // EPIPE：管道的读端都关了（write）
@@ -55,6 +64,10 @@ pub const stdin = 0, stdout = 1, stderr = 2;
 pub const max_args = 16;                 // exec 最多传几个参数
 pub const max_arg_bytes = 1024;          // 参数加起来最多多少字节
 pub const block_size = 4096;             // 磁盘块的大小，正好一页
+pub const max_path = 256;                // 路径最长多少字节
+pub const max_name = 255;                // 名字（路径的一段）最长多少字节
+pub const open_read = 0x000, open_write = 0x001, open_rdwr = 0x002;   // open 的 flags，数值照 xv6
+pub const open_create = 0x200, open_trunc = 0x400;
 pub const Arg = extern struct { ptr: usize, len: usize };   // 一个命令行参数（不以 0 结尾）
 pub const wait_any: usize = 0 -% 1;   // wait 的 pid：任意一个子进程
 pub const wait_nohang: usize = 1;     // wait 的 options：不阻塞
@@ -63,6 +76,9 @@ pub const killed_status: u32 = 0x100; // wait 拿到的“被杀”状态（正�
 pub const ProcState = enum(u8) { unused, runnable, running, sleeping, zombie };
 pub const ProcInfo = extern struct { pid: u64, ppid: u64, ticks: u64, state: ProcState, name_len: u8, name: [16]u8 };
 pub const MemInfo = extern struct { free_pages: u64, total_pages: u64, page_size: u64 };
+pub const FileKind = enum(u8) { file = 1, dir = 2, console = 3, pipe = 4, _ };
+pub const Stat = extern struct { ino: u64, size: u64, kind: FileKind, _pad: [7]u8 };
+pub const Dirent = extern struct { ino: u64, kind: FileKind, name_len: u8, _pad: [6]u8, name: [max_name]u8 };
 
 pub fn fail(e: Errno) usize            // 把错误码编码成返回值：0 -% e
 pub fn errnoOf(ret: usize) ?Errno      // 返回值在 [-4095, -1] 内时取出错误码
@@ -70,7 +86,7 @@ pub fn errnoOf(ret: usize) ?Errno      // 返回值在 [-4095, -1] 内时取出�
 
 `Syscall` 和 `Errno` 都是非穷尽的（`_`），所以用户程序传来任意数字都能安全地转换成 `Syscall`（`@fromBackingInt`），不认识的落到 `_` 分支。
 
-`ProcInfo`、`MemInfo`、`Arg` 是 `extern struct`，内核把它们的字节原样复制进用户内存，两边的布局由 C ABI 保证一致。`ProcState` 同时是内核进程表的状态类型（`proc.State = abi.ProcState`），不用转换。
+`ProcInfo`、`MemInfo`、`Arg`、`Stat`、`Dirent` 是 `extern struct`，内核把它们的字节原样复制进用户内存，两边的布局由 C ABI 保证一致。`ProcState` 同时是内核进程表的状态类型（`proc.State = abi.ProcState`），不用转换。
 
 这个文件被**两次编译**使用：内核里按路径 `@import("abi.zig")`，用户程序里作为构建系统创建的 `abi` 模块（[build.md](build.md#用户程序)），用户程序通过 `sys.abi` 访问它。改它就同时改了两边的约定。
 
@@ -79,12 +95,12 @@ pub fn errnoOf(ret: usize) ?Errno      // 返回值在 [-4095, -1] 内时取出�
 | 号 | 调用 | 参数 | 返回 | 说明 |
 | --- | --- | --- | --- | --- |
 | 0 | `exit` | `a0` = 退出码 | 不返回 | 只取低 8 位（`@truncate` 成 `u8`）。打印 `[proc] pid N (NAME) exited with code C`，变成 zombie 等父进程回收（[process.md](process.md#结束进程)） |
-| 1 | `write` | `a0` = fd，`a1` = 用户缓冲区地址，`a2` = 长度 | 写出的字节数；`-EBADF`、`-EFAULT`、`-EPIPE` | 写进串口或管道，详见下文 |
+| 1 | `write` | `a0` = fd，`a1` = 用户缓冲区地址，`a2` = 长度 | 写出的字节数；`-EBADF`、`-EFAULT`、`-EPIPE`；文件：`-ENOSPC`、`-EFBIG`、`-EIO`、`-ENOENT`（文件被删了） | 写进串口、管道或文件，详见下文 |
 | 2 | `getpid` | 无 | 进程号 | 每创建一个进程加 1，不复用。init 是 1，shell 是 2 |
 | 3 | `uptime` | 无 | 开机以来的毫秒数 | `timer.uptimeMs()`，精度 10 ms（一个时钟 tick） |
 | 4 | `yield` | 无 | 0 | 让出 CPU：回到调度器，别的 runnable 进程先运行，轮到它时返回。没有别的 runnable 进程时很快就会返回 |
 | 5 | `sleep` | `a0` = 毫秒数 | 0 | 睡至少 `a0` 毫秒（按 10 ms 的 tick 向上取整），期间不被调度、不占 CPU。`0` 立刻返回 |
-| 6 | `read` | `a0` = fd，`a1` = 缓冲区地址，`a2` = 长度 | 读到的字节数，0 表示读到结尾；`-EBADF`、`-EFAULT` | 从串口或管道读，详见下文 |
+| 6 | `read` | `a0` = fd，`a1` = 缓冲区地址，`a2` = 长度 | 读到的字节数，0 表示读到结尾；`-EBADF`、`-EFAULT`；文件：`-EISDIR`、`-EIO`、`-ENOENT` | 从串口、管道或文件读，详见下文 |
 | 7 | `fork` | 无 | 父进程得到子进程的 pid，子进程得到 0；或 `-EAGAIN`、`-ENOMEM` | 复制当前进程（[process.md](process.md#fork)） |
 | 8 | `exec` | `a0` = 程序名地址，`a1` = 名字长度，`a2` = `Arg` 数组的地址，`a3` = 参数个数 | 成功时不返回（新程序的 `a0` = 参数个数）；`-ENOENT`、`-ENOEXEC`、`-ENOMEM`、`-EFAULT`、`-E2BIG` | 换成嵌在内核里的程序 `name` 运行，打开的文件不变，详见下文 |
 | 9 | `wait` | `a0` = pid（`wait_any` 表示任意一个），`a1` = 状态的地址（0 表示不要），`a2` = options | 回收的子进程的 pid；`nohang` 时没有已结束的子进程返回 0；`-ECHILD`、`-EFAULT`、`-EINVAL` | 详见下文 |
@@ -99,9 +115,15 @@ pub fn errnoOf(ret: usize) ?Errno      // 返回值在 [-4095, -1] 内时取出�
 | 18 | `dup` | `a0` = fd | 新的 fd；`-EBADF`、`-EMFILE` | 编号最小的空闲 fd 指向同一个文件 |
 | 19 | `pipe` | `a0` = 两个 `u32` 的地址 | 0；`-EFAULT`、`-EMFILE`、`-ENFILE`、`-ENOMEM` | 创建管道，读端、写端的 fd 写进 `a0` 指向的地方（[files.md](files.md#管道)） |
 | 20 | `sbrk` | `a0` = 增量（有符号） | 原来的堆末尾；`-ENOMEM`、`-EINVAL` | 堆变大或变小（[process.md](process.md#sbrk堆)）。`sbrk(0)` 只查询 |
-| 21 | `blockcount` | 无 | 磁盘的块数，没有磁盘时是 0 | 每块 `abi.block_size` = 4096 字节（[disk.md](disk.md#系统调用)） |
-| 22 | `readblock` | `a0` = 块号，`a1` = 缓冲区地址 | 0；`-EINVAL`（块号超出磁盘）、`-ENODEV`、`-EFAULT` | 经过缓冲区缓存读一块，4096 字节写进缓冲区 |
-| 23 | `writeblock` | `a0` = 块号，`a1` = 缓冲区地址 | 0；`-EINVAL`、`-ENODEV`、`-EFAULT` | 缓冲区的 4096 字节写到这一块，写完才返回 |
+| 21 | `blockcount` | 无 | 磁盘的原始区域（文件系统之后的块）有多少块，没有磁盘时是 0 | 每块 `abi.block_size` = 4096 字节（[disk.md](disk.md#系统调用)） |
+| 22 | `readblock` | `a0` = 块号，`a1` = 缓冲区地址 | 0；`-EINVAL`（块号超出原始区域）、`-ENODEV`、`-EFAULT` | 经过缓冲区缓存读原始区域的一块，4096 字节写进缓冲区 |
+| 23 | `writeblock` | `a0` = 块号，`a1` = 缓冲区地址 | 0；`-EINVAL`、`-ENODEV`、`-EFAULT` | 缓冲区的 4096 字节写到原始区域的这一块，写完才返回 |
+| 24 | `open` | `a0` = 路径地址，`a1` = 路径长度，`a2` = flags | 新的 fd；`-ENOENT`、`-ENOTDIR`、`-EISDIR`、`-EEXIST`、`-ENAMETOOLONG`、`-EINVAL`、`-ENOSPC`、`-EIO`、`-ENODEV`、`-EFAULT`、`-ENFILE`、`-EMFILE` | 打开文件或目录（[fs.md](fs.md#接进内核fsyszig)）。flags：`open_read`/`open_write`/`open_rdwr` 加上 `open_create`（没有就建一个空文件）、`open_trunc`（可写时截成 0 字节）；别的位、读写方式是 3 都是 `-EINVAL`。目录只能只读地打开。相对路径从当前目录开始 |
+| 25 | `mkdir` | `a0` = 路径地址，`a1` = 路径长度 | 0；`-EEXIST`、`-ENOENT`、`-ENOTDIR`、`-EINVAL`、`-ENAMETOOLONG`、`-ENOSPC` 等 | 建一个空目录 |
+| 26 | `unlink` | 同上 | 0；`-ENOENT`、`-ENOTEMPTY`、`-EINVAL` 等 | 删掉一个文件或空目录。打开着它的 fd 之后读写是 `-ENOENT` |
+| 27 | `chdir` | 同上 | 0；`-ENOENT`、`-ENOTDIR` 等 | 换当前目录（`Process.cwd`，`fork` 继承） |
+| 28 | `fstat` | `a0` = fd，`a1` = `Stat` 的地址 | 0；`-EBADF`、`-EFAULT`、`-ENOENT` | inode 号、长度、种类。串口、管道的 inode 号和长度是 0 |
+| 29 | `readdir` | `a0` = fd，`a1` = `Dirent` 的地址 | 1；列完了是 0；`-EBADF`、`-ENOTDIR`、`-EFAULT` | 目录的下一项（不含 `.`、`..`），按名字的散列排序。读写位置就是 `fs.readdir` 的 cookie，结果写进用户内存成功了才往后挪 |
 | 其他 | | | `-ENOSYS` | |
 
 ### 分发
@@ -136,7 +158,7 @@ fn write(fd: usize, ptr: usize, len: usize) usize {
 }
 ```
 
-`fileOf` 查当前进程的 fd 表：`fd >= max_fds` 或者那一项是空的，返回 `-EBADF`。不可写的文件（管道的读端）也是 `-EBADF`。真正的写由 `file.write` 按文件的种类分给串口或管道（[files.md](files.md)），两种都遵守同一个约定：
+`fileOf` 查当前进程的 fd 表：`fd >= max_fds` 或者那一项是空的，返回 `-EBADF`。不可写的文件（管道的读端）也是 `-EBADF`。真正的写由 `file.write` 按文件的种类分给串口、管道或文件系统（[files.md](files.md)）。串口和管道遵守同一个约定：
 
 - 用户内存先**复制**到内核（串口：栈上 128 字节的缓冲区；管道：直接复制进管道的缓冲区），再输出。内核从不直接解引用用户给的指针。
 - 每一块都不跨页（块大小取缓冲区大小、剩余长度、到页尾的距离三者的最小值）。所以一块复制失败，就说明这一页整个不能读，而之前的块都已经完整写出了。这保证了返回值的含义是精确的：
@@ -146,6 +168,8 @@ fn write(fd: usize, ptr: usize, len: usize) usize {
 - `ptr + done` 不会溢出：`done > 0` 说明 `[ptr, ptr + done)` 已经全部通过了检查，都在用户区内。
 - 最初的实现不按页分块，一个 128 字节的块可能跨过有效页和无效页的边界，导致“前 4 个字节有效，后面无效”的写入整体失败、返回 EFAULT，而不是写出 4 个字节。测试时发现并修正了。
 - 写管道时管道满了会等，读端都关了返回 `-EPIPE`（已经写进去一部分的话返回写进去的字节数）。
+
+写文件不一样：**一次 `write` 是一个事务**（[fs.md](fs.md#事务每个操作提交一次)），要么全写进去、返回 `len`，要么什么都没写、返回错误码（用户内存中途读不出来是 `-EFAULT`，磁盘满了是 `-ENOSPC`）。
 
 ## read
 
@@ -161,7 +185,7 @@ fn read(fd: usize, ptr: usize, len: usize) usize {
 - **先检查整个目标范围可写，再读**（`vm.checkUser`）：从串口的缓冲区取出来的字符放不回去，要是取出来才发现用户给的地址写不进去，这些字符就丢了。所以坏地址立刻返回 `-EFAULT`，不阻塞、不消耗输入。
 - `len = 0` 直接返回 0，不检查指针、不阻塞。
 - 没有数据时阻塞，至少读到一个字节才返回；有多少就读多少（最多 `len`），不等凑满。**返回 0 表示读到了结尾**：管道的写端都关了，或者在串口上按了 Ctrl-D。
-- 串口：**不回显、不做行编辑**，原样返回收到的字节（回车是 `\r`），shell 自己回显；Ctrl-C 不会被读到。管道：写进去什么读出来什么。细节见 [files.md](files.md)。
+- 串口：**不回显、不做行编辑**，原样返回收到的字节（回车是 `\r`），shell 自己回显；Ctrl-C 不会被读到。管道：写进去什么读出来什么。文件：从读写位置开始读，不阻塞，到末尾返回 0。细节见 [files.md](files.md)。
 - 被 kill 了就提前返回（返回值是 0，没人看），回到陷阱处理程序后结束。
 - 好几个进程同时 `read` 同一个文件时，都被叫醒，先运行的那个拿走数据，其他的发现又空了，接着睡。
 
@@ -250,14 +274,23 @@ pub var argv: []const abi.Arg                                   // 命令行参�
 pub fn arg(i: usize) ?[]const u8                                // 第 i 个参数
 
 pub fn exit(code: u8) noreturn
-pub fn write(fd: Fd, bytes: []const u8) error{ BadAddress, BadFd, BrokenPipe, Unexpected }!usize
+pub fn write(fd: Fd, bytes: []const u8) WriteError!usize
+// WriteError = error{ BadAddress, BadFd, BrokenPipe, NoSpace, FileTooBig, IsDir, IoError, NotFound, Unexpected }
 pub fn writeAll(fd: Fd, bytes: []const u8) WriteError!void
 pub fn getpid() usize
 pub fn getppid() usize
 pub fn uptime() u64
 pub fn yield() void
 pub fn sleep(ms: u64) void
-pub fn read(fd: Fd, buf: []u8) error{ BadAddress, BadFd, Unexpected }!usize
+pub fn read(fd: Fd, buf: []u8) error{ BadAddress, BadFd, IsDir, IoError, NotFound, Unexpected }!usize
+pub fn open(path: []const u8, flags: OpenFlags) FsError!Fd   // OpenFlags{ read = true, write, create, truncate }
+pub fn mkdir(path: []const u8) FsError!void
+pub fn unlink(path: []const u8) FsError!void
+pub fn chdir(path: []const u8) FsError!void
+pub fn fstat(fd: Fd) FsError!abi.Stat
+pub fn readdir(fd: Fd, ent: *abi.Dirent) FsError!bool        // 列完了是 false
+// FsError = error{ NotFound, Exists, NotDir, IsDir, NotEmpty, NameTooLong, InvalidArgument, NoSpace,
+//                  FileTooBig, IoError, NoDevice, BadAddress, BadFd, TooManyOpenFiles, SystemFdQuotaExceeded, Unexpected }
 pub fn close(fd: Fd) error{ BadFd, Unexpected }!void
 pub fn dup(fd: Fd) error{ BadFd, TooManyOpenFiles, Unexpected }!Fd
 pub fn pipe() error{ TooManyOpenFiles, SystemFdQuotaExceeded, OutOfMemory, Unexpected }![2]Fd   // { 读端, 写端 }
@@ -291,7 +324,8 @@ pub fn fprint(fd: Fd, comptime fmt: []const u8, args: anytype) void
 - 系统调用在陷阱处理程序里执行，**全程关着中断**，所以每个调用都要短。一个很长的 `write` 会在输出期间挡住时钟中断，但不会丢失中断：挂起的中断在 `sret` 回到 U 模式后立刻被处理（这时进程马上让出 CPU），计时也不会少，`timer` 按预约时刻补上错过的 tick（[devices.md](devices.md#定时器timerzig)）。
 - 会等待的调用（`yield`、`sleep`、`read`、管道的 `write`、`wait`）不在里面开中断等待，而是切回调度器，由调度器开着中断去处理别的事。
 - `exec` 一次加载整个程序（分配页、复制内容），`fork` 一次复制整个地址空间，`sbrk` 一次映射所有新的页，期间都关着中断。现在的程序都只有几十 KiB，没有问题；`sbrk` 一次要上百 MiB 时会关着中断清零这么多页，`t_sbrk` 里长到超过物理内存（约 125 MiB）再失败、回滚，QEMU 里测试照常通过。
-- 运行在当前进程自己的内核栈上（16 KiB），系统调用里不要放大的局部数组。最大的是 `exec` 复制参数用的约 1.6 KiB（参数 1024 字节、`Arg` 数组和切片各 256 字节、程序名 32 字节）。
+- 运行在当前进程自己的内核栈上（16 KiB），系统调用里不要放大的局部数组，也不要按值复制大的结构体（[fs.md](fs.md#接进内核fsyszig)：8 KiB 的位图按值传过一次，把栈撑爆了）。局部数组最大的是 `exec` 复制参数用的约 1.6 KiB（参数 1024 字节、`Arg` 数组和切片各 256 字节、程序名 32 字节）；栈用得最深的是文件系统的调用（实测 Debug 模式不到 10 KiB，[process.md](process.md#进程表)）。
+- 文件系统的调用拿着睡眠锁 `fsys.lock` 读写磁盘，要等磁盘时和 `read` 一样切回调度器。
 - `exit`、`shutdown` 和成功的 `exec` 不返回；其他调用返回后，用户程序从 `ecall` 的下一条指令继续执行，除 `a0` 以外的寄存器都不变。
 
 ## 新增一个系统调用

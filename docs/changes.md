@@ -2,6 +2,17 @@
 
 每次改了内核（`src/`、`user/`、`build.zig`、链接脚本），在最上面加几行：新增了什么功能，修了什么 bug。最新的在前面。
 
+## 2026-10-29 文件系统接进内核：mkfs、系统调用、shell 的 cd 和重定向
+
+- 新增：`src/mkfs.zig`，主机上生成磁盘镜像的程序（和内核共用 `fs.zig`、`ctree.zig`、`bio.zig`）。`build.zig` 构建时运行它：镜像改成 32 MiB（8192 块），前 7168 块是文件系统，用户程序装在 `/bin`；后 1024 块是原始区域，填原来的固定图案。
+- 新增：`src/fsys.zig`，内核这一侧的文件系统：第一个进程在 `forkretC` 里挂载（启动日志多了 `[ok] file system: N of 7168 blocks free, generation G`，没有文件系统时打印警告照常启动），一把睡眠锁 `fsys.lock` 管整个文件系统，文件系统的错误换成错误码。
+- 新增：系统调用 `open`（24，`O_CREATE`、`O_TRUNC`）、`mkdir`（25）、`unlink`（26）、`chdir`（27）、`fstat`（28）、`readdir`（29），错误码 `EIO`、`EEXIST`、`ENOTDIR`、`EISDIR`、`EFBIG`、`ENOSPC`、`ENAMETOOLONG`、`ENOTEMPTY`；`abi.Stat`、`abi.Dirent`、`abi.FileKind`。`read`、`write` 能读写文件（一次 `write` 一个事务，要么全写要么不写），`File` 多了 `.inode` 和读写位置；进程多了当前目录（`fork` 继承）。
+- 改动：`blockcount`、`readblock`、`writeblock` 只能碰原始区域（块号从文件系统之后算），不会写坏文件系统。
+- 新增：shell 的 `cd`、`run ... > 文件`、`run ... < 文件`（管道里的哪一段都行）；用户程序 `ls`、`mkdir`、`rm`，`cat` 能读文件。
+- 修复：目录项的名字长度按 `u8` 和头的大小相加，名字长于 239 字节时溢出（Debug/safe 下 panic）。
+- 修复：内核栈溢出。`ctree` 的位图用了 `std.bit_set`，它的 `isSet`、`count` 按值接收整个 8 KiB 的位图，加上 `x.* = y.*` 复制 4 KiB 的块，文件系统的调用在 Debug 模式下用到约 54 KiB 内核栈；改成自己的 `Bitmap` 和 `@memcpy` 之后最深不到 10 KiB。
+- 新增：回归测试 `t_fs`（系统调用的边界情况、共用读写位置、坏指针、并发写），QEMU 测试用例 `fs`：shell 里的文件操作，关机后重新启动文件还在，边写边杀掉 QEMU 再启动，每个操作要么做完了要么没做。
+
 ## 2026-10-29 文件系统（还没接进内核）
 
 - 新增：`src/fs.zig`，建在写时复制 B 树上的文件系统，照 btrfs 的条目设计简化：inode 条目（种类、长度、父目录）、按名字散列排序的目录项（散列相同的名字用序号分开）、每页一个的内容条目。不超过 512 字节的文件内联在条目里，更大的每页一个数据块（写时复制，条目里记着 crc32c，读盘时校验），没有条目的页是洞。创建、删除（目录要空）、路径解析（`.`、`..`）、`readdir`、读、写、截断成 0。每个操作一个事务（`Fs.run`：成功提交、出错作废）。

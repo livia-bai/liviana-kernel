@@ -59,6 +59,12 @@ pub fn close(fd: Fd) error{ BadFd, Unexpected }!void
 pub fn dup(fd: Fd) error{ BadFd, TooManyOpenFiles, Unexpected }!Fd
 pub fn pipe() PipeError![2]Fd            // { 读端, 写端 }
 pub fn sbrk(increment: isize) SbrkError!usize    // 返回原来的堆末尾
+pub fn open(path: []const u8, flags: OpenFlags) FsError!Fd   // OpenFlags{ read = true, write = false, create = false, truncate = false }
+pub fn mkdir(path: []const u8) FsError!void
+pub fn unlink(path: []const u8) FsError!void
+pub fn chdir(path: []const u8) FsError!void
+pub fn fstat(fd: Fd) FsError!abi.Stat
+pub fn readdir(fd: Fd, ent: *abi.Dirent) FsError!bool        // 列完了是 false
 pub fn getpid() usize
 pub fn getppid() usize
 pub fn uptime() u64                      // 开机以来的毫秒数
@@ -224,7 +230,7 @@ pub fn main() u8 {
 演示命令行参数和管道的三个小程序，和 Unix 的同名命令一样：
 
 - `echo`（`user/echo.zig`）：把参数用空格连起来，加换行，写到 stdout。写失败（读端关了）以 1 结束。
-- `cat`（`user/cat.zig`）：把 stdin 原样复制到 stdout，读到结尾结束。没有文件系统，不接受文件名。直接从键盘读时输入不回显（串口不回显，回显是 shell 做的），按 Ctrl-D 结束。
+- `cat`（`user/cat.zig`）：`cat [文件...]` 把每个文件依次原样复制到 stdout；不给文件名时复制 stdin，读到结尾结束。打不开的文件打印 `cat: 名字: NotFound` 这样的一行，接着处理下一个，最后以 1 结束。直接从键盘读时输入不回显（串口不回显，回显是 shell 做的），按 Ctrl-D 结束。
 - `wc`（`user/wc.zig`）：数 stdin 的行数、单词数、字节数，读到结尾后打印 `行 词 字节`。
 
 ```
@@ -245,6 +251,32 @@ pub fn main() u8 {
 （QEMU 测试跑到一半时的输出，所以 pid 比较大。）
 
 最后一行 `(sh)` 是 shell 为管道 fork 出来的“组长”（[shell.md](shell.md#管道)）。
+
+### ls、mkdir、rm
+
+文件系统的三个小命令（[fs.md](fs.md)），出错时都打印 `程序名: 路径: 错误名`（比如 `rm: /d: NotEmpty`），接着处理下一个参数，最后以 1 结束：
+
+- `ls`（`user/ls.zig`）：`ls [路径...]`，不给路径时是当前目录。目录的每一项一行：种类（`file`、`dir`）、字节数、名字；给的是文件的话只列它自己。目录项里没有长度，每个文件要再 `open`、`fstat` 一次。顺序是名字的散列的顺序，不是字母顺序。
+- `mkdir`（`user/mkdir.zig`）：`mkdir 目录...`，按顺序建，所以 `mkdir /a /a/b` 可以。
+- `rm`（`user/rm.zig`）：`rm 路径...`，删文件或空目录。
+
+```
+> run ls /bin
+...
+file   131824 sh
+...
+file   107248 ls
+...
+[proc] pid 3 (ls) exited with code 0
+> run mkdir /d /d/e
+[proc] pid 4 (mkdir) exited with code 0
+> cd /d
+> run ls
+dir         0 e
+[proc] pid 5 (ls) exited with code 0
+```
+
+（Debug 构建，`/bin` 只摘了两行。）
 
 ## 写一个新程序
 
@@ -268,7 +300,7 @@ pub fn main() u8 {
 不能用或要注意的：
 
 - 堆要自己用 `sbrk` 要：`std.heap.page_allocator` 等依赖操作系统的分配器不可用，`sys.zig` 也还没有提供分配器。可以用 `sbrk` 要一块内存，再用 `std.heap.FixedBufferAllocator` 包起来；小的也可以直接用全局数组或者栈。
-- 系统调用见 [syscalls.md](syscalls.md#调用列表)：可以读写 fd（串口、管道）、`fork`/`exec`/`wait`、读命令行参数，但没有文件系统、线程。`exec` 只能运行嵌在内核里的程序。
+- 系统调用见 [syscalls.md](syscalls.md#调用列表)：可以读写 fd（串口、管道、文件）、用文件系统（`open`、`mkdir`、`readdir` 等）、`fork`/`exec`/`wait`、读命令行参数，没有线程。`exec` 只能运行嵌在内核里的程序。
 - 不能用浮点指令：浮点运算由 compiler_rt 软件实现，慢而且让程序变大。浮点单元被内核关掉了（`sstatus.FS = Off`），手写的浮点指令会触发 `illegal_instruction` 被结束（回归测试 `t_fp`）。
 - 栈只有 16 KiB，下面是不映射的保护页：栈溢出时触发 `store_page_fault`（`stval` 落在 `0x7fffb000..0x7fffc000`），进程被结束。
 - 不能执行特权指令、不能访问 S 模式的 CSR（比如 `csrr sstatus`），否则触发 `illegal_instruction` 被结束。例外是 `cycle`、`time`、`instret` 三个计数器：OpenSBI 启动时把 `scounteren` 设成了 7（内核进入时实测，内核没有改它），所以用户程序可以直接用 `rdtime` 等指令读，实测 `rdtime` 在 U 模式下正常返回。

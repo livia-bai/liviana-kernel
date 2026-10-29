@@ -15,6 +15,8 @@ const sbi = @import("sbi.zig");
 const proc = @import("proc.zig");
 const file = @import("file.zig");
 const bio = @import("bio.zig");
+const fsys = @import("fsys.zig");
+const Fs = fsys.Fs;
 const TrapFrame = @import("trap.zig").TrapFrame;
 
 /// 返回值会写回用户程序的 a0。
@@ -43,9 +45,15 @@ pub fn dispatch(frame: *TrapFrame) usize {
         .dup => dup(args[0]),
         .pipe => pipe(args[0]),
         .sbrk => sbrk(args[0]),
-        .blockcount => bio.blockCount(),
+        .blockcount => fsys.raw_count,
         .readblock => readBlock(args[0], args[1]),
         .writeblock => writeBlock(args[0], args[1]),
+        .open => open(args[0], args[1], args[2]),
+        .mkdir => pathOp(args[0], args[1], .mkdir),
+        .unlink => pathOp(args[0], args[1], .unlink),
+        .chdir => pathOp(args[0], args[1], .chdir),
+        .fstat => fstat(args[0], args[1]),
+        .readdir => readdir(args[0], args[1]),
         _ => abi.fail(.nosys),
     };
 }
@@ -92,8 +100,8 @@ fn installFd(f: *file.File) ?usize {
 fn fileError(err: file.Error) usize {
     return abi.fail(switch (err) {
         error.NotReadable, error.NotWritable => .badf,
-        error.BadAddress => .fault,
         error.BrokenPipe => .pipe,
+        else => fsys.errno(err), // 文件系统里的文件：磁盘满了、读到坏块等
     });
 }
 
@@ -166,10 +174,18 @@ fn blockError(err: bio.Error) usize {
     });
 }
 
-/// 读一块到用户内存。先检查整个目标范围可写（顺便复制好写时复制的页），之后的 copyToUser 一定成功。
+/// 原始区域的第 blockno 块在磁盘上是第几块（fsys.raw_base 起）。
+fn rawBlock(blockno: usize) bio.Error!u64 {
+    if (fsys.raw_count == 0) return error.NoDevice;
+    if (blockno >= fsys.raw_count) return error.OutOfRange;
+    return fsys.raw_base + blockno;
+}
+
+/// 读原始区域的一块到用户内存。先检查整个目标范围可写（顺便复制好写时复制的页），之后的 copyToUser 一定成功。
 fn readBlock(blockno: usize, ptr: usize) usize {
     vm.checkUser(space(), ptr, abi.block_size, true) catch return abi.fail(.fault);
-    const b = bio.read(blockno) catch |err| return blockError(err);
+    const n = rawBlock(blockno) catch |err| return blockError(err);
+    const b = bio.read(n) catch |err| return blockError(err);
     defer bio.release(b);
     vm.copyToUser(space(), ptr, b.data) catch unreachable;
     return 0;
@@ -178,12 +194,113 @@ fn readBlock(blockno: usize, ptr: usize) usize {
 /// 用户内存的一块写到磁盘。整块覆盖，不用先读；先检查来源可读，复制到一半失败的话缓冲区里会留下半新半旧的内容。
 fn writeBlock(blockno: usize, ptr: usize) usize {
     vm.checkUser(space(), ptr, abi.block_size, false) catch return abi.fail(.fault);
-    const b = bio.get(blockno) catch |err| return blockError(err);
+    const n = rawBlock(blockno) catch |err| return blockError(err);
+    const b = bio.get(n) catch |err| return blockError(err);
     defer bio.release(b);
     vm.copyFromUser(space(), b.data, ptr) catch unreachable;
     b.valid = true;
     bio.write(b);
     return 0;
+}
+
+// ---- 文件系统 ----
+
+/// 把用户给的路径复制进 buf。
+fn userPath(ptr: usize, len: usize, buf: *[abi.max_path]u8) error{ NameTooLong, BadAddress }![]const u8 {
+    if (len > buf.len) return error.NameTooLong;
+    try vm.copyFromUser(space(), buf[0..len], ptr);
+    return buf[0..len];
+}
+
+/// 打开路径 path，返回 fd（见 abi.Syscall.open）。
+fn open(path_ptr: usize, path_len: usize, flags: usize) usize {
+    const access = flags & 3;
+    if (access == 3 or flags & ~(3 | abi.open_create | abi.open_trunc) != 0) return abi.fail(.inval);
+    const readable = access != abi.open_write;
+    const writable = access != abi.open_read;
+    var buf: [abi.max_path]u8 = undefined;
+    const path = userPath(path_ptr, path_len, &buf) catch |err| return abi.fail(fsys.errno(err));
+    const root = fsys.get() catch return abi.fail(.nodev);
+    const ino = openPath(root, proc.current().?.cwd, path, flags, writable) catch |err| {
+        fsys.unlock();
+        return abi.fail(fsys.errno(err));
+    };
+    fsys.unlock();
+    const f = file.openInode(ino, readable, writable) catch return abi.fail(.nfile);
+    return installFd(f) orelse {
+        file.close(f);
+        return abi.fail(.mfile);
+    };
+}
+
+fn openPath(root: *Fs, cwd: u64, path: []const u8, flags: usize, writable: bool) @import("fs.zig").Error!u64 {
+    const ino = root.resolve(cwd, path) catch |err| switch (err) {
+        error.NotFound => if (flags & abi.open_create != 0) return root.run(Fs.create, .{ cwd, path, .file }) else return err,
+        else => return err,
+    };
+    const st = try root.stat(ino);
+    if (st.kind == .dir and writable) return error.IsDir;
+    if (flags & abi.open_trunc != 0 and writable and st.size > 0) try root.run(Fs.truncate, .{ino});
+    return ino;
+}
+
+const PathOp = enum { mkdir, unlink, chdir };
+
+/// mkdir、unlink、chdir：只有一个路径参数。
+fn pathOp(path_ptr: usize, path_len: usize, op: PathOp) usize {
+    var buf: [abi.max_path]u8 = undefined;
+    const path = userPath(path_ptr, path_len, &buf) catch |err| return abi.fail(fsys.errno(err));
+    const p = proc.current().?;
+    const root = fsys.get() catch return abi.fail(.nodev);
+    defer fsys.unlock();
+    switch (op) {
+        .mkdir => _ = root.run(Fs.create, .{ p.cwd, path, .dir }) catch |err| return abi.fail(fsys.errno(err)),
+        .unlink => root.run(Fs.unlink, .{ p.cwd, path }) catch |err| return abi.fail(fsys.errno(err)),
+        .chdir => {
+            const ino = root.resolve(p.cwd, path) catch |err| return abi.fail(fsys.errno(err));
+            const st = root.stat(ino) catch |err| return abi.fail(fsys.errno(err));
+            if (st.kind != .dir) return abi.fail(.notdir);
+            p.cwd = ino;
+        },
+    }
+    return 0;
+}
+
+fn fstat(fd: usize, ptr: usize) usize {
+    const f = fileOf(fd) orelse return abi.fail(.badf);
+    var st: abi.Stat = .{ .ino = 0, .size = 0, .kind = .console };
+    switch (f.kind) {
+        .none => unreachable,
+        .console => {},
+        .pipe => st.kind = .pipe,
+        .inode => {
+            const root = fsys.get() catch return abi.fail(.nodev);
+            defer fsys.unlock();
+            const s = root.stat(f.ino) catch |err| return abi.fail(fsys.errno(err));
+            st = .{ .ino = s.ino, .size = s.size, .kind = @fromBackingInt(@backingInt(s.kind)) };
+        },
+    }
+    vm.copyToUser(space(), ptr, std.mem.asBytes(&st)) catch return abi.fail(.fault);
+    return 0;
+}
+
+/// 目录 fd 的下一个目录项：读写位置 off 就是 fs.readdir 的 cookie。写进用户内存成功了才往后挪。
+fn readdir(fd: usize, ptr: usize) usize {
+    const f = fileOf(fd) orelse return abi.fail(.badf);
+    if (f.kind != .inode) return abi.fail(.notdir);
+    const root = fsys.get() catch return abi.fail(.nodev);
+    defer fsys.unlock();
+    var ent: abi.Dirent = undefined;
+    const found = root.readdir(f.ino, f.off, &ent.name) catch |err| return abi.fail(fsys.errno(err));
+    const d = found orelse return 0;
+    ent.ino = d.ino;
+    ent.kind = @fromBackingInt(@backingInt(d.kind));
+    ent.name_len = @intCast(d.name_len);
+    ent._pad = @splat(0);
+    @memset(ent.name[d.name_len..], 0);
+    vm.copyToUser(space(), ptr, std.mem.asBytes(&ent)) catch return abi.fail(.fault);
+    f.off = d.next;
+    return 1;
 }
 
 fn fork() usize {

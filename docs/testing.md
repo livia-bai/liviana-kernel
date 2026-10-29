@@ -30,7 +30,7 @@ zig build test -Dtest-filter=掉电 --summary all   # 只跑名字里含“掉�
 | `src/sleeplock.zig` | 拿、放、`holding`（主机上没有进程，只测不需要等待的路径） |
 | `src/btree.zig` | 键的顺序和 `successor`；叶子的插入、删除和数据的挪动；叶子分裂后两边都空出至少四分之一；`childFor` 把 `ptrs[0].key` 当负无穷；内部节点的插入、删除、分裂；校验和 |
 | `src/ctree.zig` | 写时复制 B 树（[btree.md](btree.md#单元测试)）：插入、查找、遍历、更新、删除，树长高又变矮；没提交的改动挂载后没了，`pending` 的块不被提前分配；磁盘满；坏块、写丢了、超级块坏了；随机操作每步都检查；在每一次写之后掉电（包括只写进一部分）共 681 次，重新挂载后都是某个已提交的状态 |
-| `src/fs.zig` | 文件系统（[fs.md](fs.md#单元测试)）：目录和路径、各种错误；`readdir`、散列相同的名字；内联、换成数据块、跨页、洞、写到一半出错整个作废、截断、删除后块都还回来；数据块的校验和；在每一次写盘之后掉电（共 121 次），重新挂载后都是某一个操作做完的样子，再接着写也不坏 |
+| `src/fs.zig` | 文件系统（[fs.md](fs.md#单元测试)）：目录和路径、各种错误，255 字节的名字找得到、列得出来、删得掉；`readdir`、散列相同的名字；内联、换成数据块、跨页、洞、写到一半出错整个作废、截断、删除后块都还回来；数据块的校验和；在每一次写盘之后掉电（共 121 次），重新挂载后都是某一个操作做完的样子，再接着写也不坏 |
 | `src/ipi.zig` | `wakeIdle` 每次用 `cmpxchg` 认领一个别的空闲 hart，不叫自己，没有空闲的就停下 |
 | `src/file.zig` | `dup` 加引用、最后一个 `close` 才关掉管道；文件表满了 `openPipe` 失败且不漏 |
 
@@ -47,7 +47,7 @@ python3 tools/qemu_test.py --smp 8        # 只用 8 个 hart 跑（可以给几
 python3 tools/qemu_test.py --list         # 列出用例和它们覆盖的文件
 ```
 
-每种模式只构建一次（带上 `user/tests/` 里的测试程序），然后对每个 hart 数（默认 `-smp 1` 和 `-smp 4`）各启动一次 QEMU（每次接上一份新拷的磁盘镜像 `disk-smpN.img`，不加 `snapshot=on`，退出之后还要读它），等提示符出现再一条条输入命令、检查输出。不管跑哪些用例，都会检查启动日志（包括 `[ok] N harts running` 里的 N 等于 `-smp` 给的数）；结束时还要求前后两次 `mem` 的空闲页数相同（不能漏页）、`shutdown` 后 QEMU 的退出码为 0、输出里没有 `KERNEL PANIC`。
+每种模式只构建一次（带上 `user/tests/` 里的测试程序），然后对每个 hart 数（默认 `-smp 1` 和 `-smp 4`）各启动一次 QEMU（每次接上一份新拷的磁盘镜像 `disk-smpN.img`，不加 `snapshot=on`，退出之后还要读它），等提示符出现再一条条输入命令、检查输出。不管跑哪些用例，都会检查启动日志（包括 `[ok] N harts running` 里的 N 等于 `-smp` 给的数、文件系统挂上了）；结束时还要求前后两次 `mem` 的空闲页数相同（不能漏页）、`shutdown` 后 QEMU 的退出码为 0、输出里没有 `KERNEL PANIC`。
 
 单核、多核都要跑：多核时进程真的同时在跑，加锁的错误才会暴露出来；单核时所有进程只能轮流用一个 hart，“等别的进程让出 CPU”的路径（时间片轮转、调度器空转时的 `wfi`）才走得到。有的检查要按 hart 数写：`ps` 里死循环的后台进程，单核时是 `runnable`，多核时可能是 `running`；`ps` 可能正好看到 shell 刚 `fork` 出来、还没 `exec` 的子进程（名字还是 `sh`，父进程是 shell），所以认 shell 时看的是“父进程是 init 的那个 `sh`”。
 
@@ -64,7 +64,8 @@ python3 tools/qemu_test.py --list         # 列出用例和它们覆盖的文件
 | `pipe` | `t_pipe`（自己检查 31 项）；shell 的管道：`echo \| wc`、`echo \| cat \| cat \| wc`、`t_args \| wc` 的结果，找不到的程序、空的一段、超过 4 个程序时报错；后台管道；对 `cat \| wc` 按 Ctrl-C 杀掉三个进程（组长、cat、wc），之后 `ps` 里没有剩下的；对 `cat \| wc` 输入 `abc` 再按 Ctrl-D，wc 打印 `0 1 3` | `src/pipe.zig`、`user/echo.zig`、`user/cat.zig`、`user/wc.zig`、`user/tests/t_pipe.zig`、`user/tests/t_args.zig` |
 | `sbrk` | `t_sbrk`（自己检查 25 项） | `user/tests/t_sbrk.zig` |
 | `cow` | `t_cow`（自己检查 15 项，见下文）；它打印的 `fork` 用掉的页数少于 16；最后一项里子进程被 `killed: out of memory (copy-on-write)` | `user/tests/t_cow.zig` |
-| `disk` | `disk` 命令打印 `1024 blocks of 4 KiB (4 MiB)`；`t_disk`（自己检查 19 项，见下文）；QEMU 退出之后读这次启动用的磁盘镜像，每一块都要是 `t_disk` 写进去的或者原来的内容 | `src/sleeplock.zig`、`src/bio.zig`、`src/virtio_disk.zig`、`user/tests/t_disk.zig` |
+| `disk` | `disk` 命令打印 `1024 blocks of 4 KiB (4 MiB)`（原始区域）；`t_disk`（自己检查 19 项，见下文）；QEMU 退出之后读这次启动用的磁盘镜像，原始区域的每一块都要是 `t_disk` 写进去的或者原来的内容 | `src/sleeplock.zig`、`src/bio.zig`、`src/virtio_disk.zig`、`src/fsys.zig`、`src/mkfs.zig`、`user/tests/t_disk.zig` |
+| `fs` | shell 里的文件操作：`ls /`、`ls /bin`、`echo ... > F` 再 `cat F`、`wc < F`、`echo \| cat >F`、`mkdir` 两层、`cd` 进去用相对路径写和列、`cd ..`、`rm` 非空目录报 `NotEmpty`、删干净之后 `ls /` 只剩 `bin`；`cd`、`cat`、`<`、`>`、`mkdir` 的出错信息；`t_fs`（自己检查 84 项，见下文）。QEMU 正常关机之后在同一个镜像上**再启动两次**：第二次 `cat` 上一次写的文件还在，然后后台运行 `t_fs churn`，0.2～1 秒（随机）之后直接杀掉 QEMU；第三次启动时文件系统要能挂上，`t_fs verify` 检查 churn 写的东西（实测留下几十到一百多条记录）。两次启动的串口日志在 `disk-smpN-boot2.log`、`-boot3.log` | `src/btree.zig`、`src/ctree.zig`、`src/fs.zig`、`src/fsys.zig`、`src/mkfs.zig`、`src/sleeplock.zig`、`src/bio.zig`、`src/virtio_disk.zig`、`user/ls.zig`、`user/mkdir.zig`、`user/rm.zig`、`user/cat.zig`、`user/echo.zig`、`user/wc.zig`、`user/tests/t_fs.zig` |
 | `ipi` | `t_ipi`：打印 kill、wakeup 两个延迟的中位数；多核时要求 kill < 2000 µs、wakeup < 1000 µs（没有核间中断时实测 kill ≥ 4000 µs、wakeup ≥ 1100 µs，有了之后约 300～560 µs 和 200 µs） | `src/sbi.zig`、`user/tests/t_ipi.zig` |
 | `smp` | `t_smp`（自己检查 17 项，见下文）；至少 3 个 hart 时，两个后台 `spin` 0.5 秒里加起来拿到的 tick 要多于 65 个（一个 hart 最多给 50 个，所以它们一定是同时在两个 hart 上跑的。实测 4 核时约 100 个） | `src/timer.zig`、`src/plic.zig`、`src/pipe.zig`、`user/spin.zig`、`user/tests/t_smp.zig` |
 
@@ -103,7 +104,8 @@ FAIL  safe   smp4   sched       61 checks
 | `t_read` | 每次最多 `read` 3 个字节，读到回车为止 | 输入 `hello world` 回车：`got "hello world" in N reads`，N ≥ 4 |
 | `t_args` | 不带 `check` 时打印 argc、每个参数、总字节数，退出码是 argc。`t_args check`：`argv` 在栈顶那一页、16 字节对齐；17 个参数、1026 字节的参数返回 `ArgsTooLong`；`argv` 指针、参数指针指向内核时 `EFAULT`；长度为 0 的参数不检查指针；正好 16 个参数、1024 字节；没有参数。要看子进程收到的参数时，把它的 stdout 接到管道上读回来比较 | 每项失败打印 `FAIL: ...`；最后 `N checks, 0 failed`，退出码 0 |
 | `t_pipe` | 基本读写、fd 编号最小；往读端写、从写端读是 `BadFd`；写端关了读到结尾；子进程写 5000 字节（比缓冲区大，要等）、父进程读完一字不差且读了至少 3 次；读的一方先睡下；读端关了写返回 `BrokenPipe`；写满之后读端才关，睡着的写者被叫醒、只写出一部分；睡在管道读、写里时被 kill；坏的 fd、坏指针；`dup` 到 fd 表满、`pipe` 在只剩一个空位时失败且不漏；`fork` 继承 fd、子进程关 stdout 不影响父进程 | 同上 |
-| `t_disk` | `blockcount` 是 1024；每一块读一遍，和镜像一样（一路换掉缓存里的旧块）；块号超出磁盘、`maxInt`、读进代码页、从没有映射的地址和内核地址写都失败，失败的写不改磁盘；跨页的用户缓冲区；写 42 块（含第一块、最后一块）后马上读回、把缓存挤满之后再读回；6 个子进程同时各写 50 块再读回、同时读同一批块（比队列一次能放的请求多，有的要等描述符）；子进程读块到和父进程共用的页（写时复制）。同一次启动里再运行一遍也能通过 | `N checks, 0 failed`，退出码 0；QEMU 退出之后镜像里的内容由 `qemu_test.py` 检查 |
+| `t_disk` | `blockcount` 是 1024（原始区域）；每一块读一遍，和镜像一样（一路换掉缓存里的旧块）；块号超出磁盘、`maxInt`、读进代码页、从没有映射的地址和内核地址写都失败，失败的写不改磁盘；跨页的用户缓冲区；写 42 块（含第一块、最后一块）后马上读回、把缓存挤满之后再读回；6 个子进程同时各写 50 块再读回、同时读同一批块（比队列一次能放的请求多，有的要等描述符）；子进程读块到和父进程共用的页（写时复制）。同一次启动里再运行一遍也能通过 | `N checks, 0 failed`，退出码 0；QEMU 退出之后镜像里的内容由 `qemu_test.py` 检查 |
+| `t_fs` | 文件系统的系统调用，所有东西建在 `/t_fs` 下、最后删干净：串口、管道的 `fstat`，`readdir` 串口是 `NotDir`；建文件、写、读回来、读到结尾；只写的 fd 不能读、只读的不能写；`O_CREATE` 不截断、`O_TRUNC` 截断；`dup`、`fork` 出来的 fd 共用读写位置，各自 `open` 的各有各的；40000 字节的文件分 3000 字节写、换几种大小读回来，一次写 40000 字节再一次读回来；路径、读写缓冲区、`fstat`、`readdir` 的结果指向内核是 `BadAddress`，读失败不挪位置，写到一半碰到没映射的地址整个写作废、文件不变；`mkdir` 重复、在文件下面、在不存在的目录下面、`..`；写方式打开目录、`O_CREATE` 一个目录是 `IsDir`，读目录是 `IsDir`，`readdir` 一个文件是 `NotDir`；256 字节的名字、257 字节的路径是 `NameTooLong`，255 字节的名字可以建；30 个文件的目录 `readdir` 每个名字正好一次；`chdir` 到文件、不存在的目录，相对路径，子进程 `chdir` 不影响父进程，带 `.`、`..` 的路径；删非空目录、`.`、`/`、不存在的；删掉打开着的文件之后读它是 `NotFound`；4 个进程同时往共用一个位置的 fd 追加 100 字节的记录、同时各写自己的文件，记录不交错不丢、各自的文件内容不错。`t_fs churn`：一直往 `/churn.dat` 末尾追加 300 字节的记录，反复删除、截断重写 `/churn/` 下的 3 个 5000 字节的文件，直到被杀。`t_fs verify`：`/churn.dat` 的长度是整数条记录、每条都对，`/churn/` 下的文件要么是 0 字节（刚建还没写）、要么内容完整 | `N checks, 0 failed`，退出码 0；`verify` 先打印 `churn: N records intact` |
 | `t_ipi` | 核间中断的延迟，用 U 模式的 `rdtime` 计时，各测 15 次取中位数：杀掉一个在 U 模式里死循环的子进程（多核时在另一个 hart 上），从 `kill` 到 `wait` 返回；父进程写管道之后自己在 U 模式里忙 20 ms，睡在 `read` 里的子进程多久之后醒来 | `ipi latency (median of 15): kill N us, wakeup M us`，退出码 0 |
 | `t_smp` | 6 个工作进程同时（多核时在不同的 hart 上）各做 30 次 `fork`/`exit`/`wait`、各往同一个管道写 30 × 64 字节（父进程读完，按字节数对账）、各做 30 次 `sbrk` 长 3 页再缩回去，最后各留下一个交给 init 的孤儿；然后杀掉 3 个在 U 模式死循环的子进程（多核时它们正在别的 hart 上跑），`wait` 拿到的都是被杀的状态 | 每项失败打印 `FAIL: ...`；最后 `N checks, 0 failed`，退出码 0；前后 `mem` 一样 |
 | `t_cow` | 写时复制的 `fork`：带着 64 页堆的进程 `fork` 只多用了几页；父子进程各改各的（堆、全局变量，先写的、后写的都看不到对方的）；内核替子进程往共用的页里写（`read`、`pipe`、`meminfo`、`wait` 的输出参数）不改到父进程；父进程复制走之后子进程再写不再复制；最后父进程把内存全部用完（堆和管道），子进程让内核往共用的页里写得到 `EFAULT`，自己写被结束 | `fork of a process with a 64-page heap used N pages`，N < 16；`killed: out of memory (copy-on-write)`；最后 `N checks, 0 failed`，退出码 0；前后 `mem` 一样 |

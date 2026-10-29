@@ -56,8 +56,8 @@ python3 tools/qemu_test.py --list      # 列出 QEMU 测试的用例和它们覆
 - 全局的初始化（启动 hart 的 `kmain`） ↔ 每个 hart 一份的初始化（`kmainSecondary`：`trap.init`、`vm.initHart`、`plic.initHart`、`timer.initHart`、`ipi.initHart`，以及清 `sstatus.FS`）：新加的每个 hart 的 CSR 设置两边都要做（[docs/boot.md](docs/boot.md#启动其他-hart)）。
 - `user/linker.ld` 的页对齐、可读的段 ↔ `proc.loadSegment` 的检查。
 - virtio-mmio 的地址和槽位数（`virtio_disk.mmio_base`、`mmio_size`）↔ `vm.init` 的映射；磁盘的中断号（`virtio_disk.irq`，运行时找到的）↔ `plic.init` 的参数、`trap.handleExternal` 的分发（[docs/disk.md](docs/disk.md)）。
-- 磁盘镜像的内容（`build.zig` 生成：第 b 块的第 i 个字节是 `(b * 131 + i) % 251`）↔ `user/tests/t_disk.zig` ↔ `tools/qemu_test.py` 的 `disk_original`，以及 `t_disk` 改写哪些块 ↔ `disk_expected`。QEMU 的磁盘参数（`-global virtio-mmio.force-legacy=false` 等）在 `build.zig` 和 `qemu_test.py` 里各写了一遍。
-- 写时复制 B 树的磁盘格式（`btree.Header`、`Key`、`Item`、`Ptr`，`ctree.Super`，`magic`）：以后的 `mkfs` 和内核共用这两个文件；改了格式要换 `magic`（[docs/btree.md](docs/btree.md)）。
+- 磁盘镜像的布局（`build.zig` 给 `mkfs` 的参数：共 8192 块，前 7168 块是文件系统）↔ `tools/qemu_test.py` 的 `FS_BLOCKS`、`DISK_BLOCKS` ↔ `t_disk` 的 `disk_blocks`（原始区域 1024 块）。原始区域的内容（`src/mkfs.zig` 填：第 b 块的第 i 个字节是 `(b * 131 + i) % 251`）↔ `user/tests/t_disk.zig` ↔ `qemu_test.py` 的 `disk_original`，以及 `t_disk` 改写哪些块 ↔ `disk_expected`（[docs/build.md](docs/build.md#磁盘镜像)）。QEMU 的磁盘参数（`-global virtio-mmio.force-legacy=false` 等）在 `build.zig` 和 `qemu_test.py` 里各写了一遍。
+- 写时复制 B 树和文件系统的磁盘格式（`btree.Header`、`Key`、`Item`、`Ptr`，`ctree.Super`，`magic`；`fs.Inode`、`DirHeader`、`ExtentHeader` 和条目的键）：主机上的 `mkfs` 和内核共用这些文件；改了格式要换 `magic`（[docs/btree.md](docs/btree.md)、[docs/fs.md](docs/fs.md)）。
 - `src/abi.zig` 同时被内核和用户程序使用：新增系统调用时 `abi.zig`、`syscall.zig`、`user/sys.zig`、[docs/syscalls.md](docs/syscalls.md) 一起改。
 
 不能破坏的不变量：
@@ -72,8 +72,10 @@ python3 tools/qemu_test.py --list      # 列出 QEMU 测试的用例和它们覆
 - 进程的 `TrapFrame` 总在它内核栈的最顶端（`proc.frameOf`）：`trapEntry`、`trapExit` 设 `sscratch`、`fork` 复制父进程的 `TrapFrame` 都依赖这一点。
 - 结束的进程只由父进程 `wait` 回收（`proc.reap`），父进程先结束的交给 init；init（pid 1）不能结束，结束内核就 panic（[docs/process.md](docs/process.md#结束进程)）。
 - 等待用 `proc.sleep(chan, lock)` / `proc.wakeup(chan)`，`lock` 是保护等待条件的锁（不能为空：改条件的一方也要拿它），醒来后在循环里重新检查条件；`proc.kill` 只做标记，被杀的进程在回到 U 模式之前（`handleTrap` 末尾、`forkret`）由 `checkKilled` 结束（[docs/process.md](docs/process.md#结束进程)）。
-- 自旋锁（`src/spinlock.zig`）只在关中断时拿；调用 `proc.sched` 时只能拿着这个进程自己的锁，回到 U 模式时不能拿着任何锁（`sched`、`handleTrap`、`forkretC` 会检查）。嵌套加锁按固定顺序：`wait_lock` → 进程锁 → 页分配器、文件表、串口输出这些叶子锁；`timer.lock`、管道锁、`uart.rx_lock`、`virtio_disk.lock`、`bio.lock`、睡眠锁里的自旋锁 → 进程锁。新加的嵌套要先对照这个顺序（[docs/process.md](docs/process.md#锁)）。
-- 睡眠锁（`src/sleeplock.zig`，缓冲区缓存的每一块）只有进程能拿，拿它之前不能拿着自旋锁，拿着它可以睡觉；回到 U 模式时不能拿着（`proc.assertNoLocksHeld` 检查）。磁盘只能由进程读写：`virtio_disk.rw` 要睡着等中断，`kmain`、调度器、中断处理程序都不能读盘（[docs/disk.md](docs/disk.md)）。
+- 自旋锁（`src/spinlock.zig`）只在关中断时拿；调用 `proc.sched` 时只能拿着这个进程自己的锁，回到 U 模式时不能拿着任何锁（`sched`、`handleTrap`、`forkretC` 会检查）。嵌套加锁按固定顺序：`wait_lock` → 进程锁 → 页分配器、文件表、串口输出这些叶子锁；`timer.lock`、管道锁、`uart.rx_lock`、`virtio_disk.lock`、`bio.lock`、睡眠锁里的自旋锁 → 进程锁；睡眠锁之间 `fsys.lock` → 缓冲区的睡眠锁。新加的嵌套要先对照这个顺序（[docs/process.md](docs/process.md#锁)）。
+- 睡眠锁（`src/sleeplock.zig`：文件系统的 `fsys.lock`、缓冲区缓存的每一块）只有进程能拿，拿它之前不能拿着自旋锁，拿着它可以睡觉；回到 U 模式时不能拿着（`proc.assertNoLocksHeld` 检查）。磁盘只能由进程读写：`virtio_disk.rw` 要睡着等中断，`kmain`、调度器、中断处理程序都不能读盘（[docs/disk.md](docs/disk.md)），所以文件系统由第一个进程在 `forkretC` 里挂载。
+- 文件系统的每个系统调用拿着 `fsys.lock` 做完，每个改动是一个事务（`fs.Fs.run`：成功提交、出错作废）；`readblock`/`writeblock` 只能碰文件系统之后的原始区域（`fsys.raw_base` 起）（[docs/fs.md](docs/fs.md#接进内核fsyszig)）。
+- 内核栈只有 16 KiB，B 树的操作已经用掉近 10 KiB（Debug）：不要按值传、按值复制大的结构体（`std.bit_set` 的方法按值接收整个位图，`x.* = y.*` 复制一整块都会先放到栈上），用指针和 `@memcpy`；改了文件系统要重新量一次栈（[docs/process.md](docs/process.md#进程表)）。
 - 进程结束时（`proc.finish`）关掉它所有的 fd，不能留给 `wait`：管道的写端不关，读的进程读不到结尾（[docs/process.md](docs/process.md#结束进程)）。
 - 用户地址空间只能用 Sv39 根页表的第 1 项（`vm.user_base..vm.user_end`），内核映射不能放进这个范围（[docs/paging.md](docs/paging.md#用户地址空间)）。内核页表启动后不再改，所有 hart 共用；一个用户地址空间同一时刻只在一个 hart 上用，改了它只刷当前 hart 的 TLB。
 - 内核碰用户内存只能通过 `vm.copyFromUser` 这类先查页表的函数，不要打开 `sstatus.SUM` 直接解引用用户指针（[docs/syscalls.md](docs/syscalls.md#访问用户内存)）。

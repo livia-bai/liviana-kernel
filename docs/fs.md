@@ -1,8 +1,8 @@
 # 文件系统
 
-涉及文件：`src/fs.zig`；建在写时复制 B 树上（`src/ctree.zig`、`src/btree.zig`，[btree.md](btree.md)），数据块的读写走缓冲区缓存（[disk.md](disk.md#缓冲区缓存biozig)）
+涉及文件：`src/fs.zig`（文件系统本身）、`src/fsys.zig`（接进内核）、`src/mkfs.zig`（主机上生成磁盘镜像）；调用方：`src/syscall.zig`、`src/file.zig`；建在写时复制 B 树上（`src/ctree.zig`、`src/btree.zig`，[btree.md](btree.md)），数据块的读写走缓冲区缓存（[disk.md](disk.md#缓冲区缓存biozig)）
 
-文件系统的所有东西——inode、目录、文件内容——都是写时复制 B 树里的条目，照 btrfs 的条目设计简化。`fs.zig` 只有文件系统本身的逻辑：不加锁、不知道进程、不直接碰用户内存（读写通过调用方给的 `out`、`in`）。内核、以后的 `mkfs`、单元测试都用它。现在还没有接进内核。
+文件系统的所有东西——inode、目录、文件内容——都是写时复制 B 树里的条目，照 btrfs 的条目设计简化。`fs.zig` 只有文件系统本身的逻辑：不加锁、不知道进程、不直接碰用户内存（读写通过调用方给的 `out`、`in`）。内核、主机上的 `mkfs`、单元测试都用它。
 
 ## 条目
 
@@ -59,11 +59,68 @@ pub fn run(fs: *Fs, comptime op: anytype, args: anytype) Error!...
 
 代价是每个操作都写一次超级块。以后可以把几个操作攒在一个事务里（xv6 的日志也是攒着一起提交）。
 
+## 接进内核（`fsys.zig`）
+
+```zig
+var vol: ctree.Volume = .{};   // 唯一的一个卷
+var root: fs.Fs = undefined;   // 挂载好的文件系统
+pub var mounted = false;
+pub var lock: Sleeplock = .init("fs");
+pub var raw_base: u64 = 0;     // 原始区域：文件系统之后的块
+pub var raw_count: u64 = 0;
+
+pub fn init() void                    // 挂载
+pub fn get() error{NoDevice}!*Fs      // 拿着 lock 返回文件系统
+pub fn unlock() void
+pub fn errno(err: anyerror) abi.Errno // 文件系统的错误 → 系统调用的错误码
+```
+
+**挂载**：第一个进程（init）第一次回到 U 模式之前，在 `forkretC` 里调用 `fsys.init()`（xv6 的 `forkret` 里调用 `fsinit` 也是这个原因）：挂载要读盘，读盘要睡着等中断，只有进程能做，`kmain` 不行。之后创建的进程都在这之后运行。成功时打印
+
+```
+[ok] file system: 6841 of 7168 blocks free, generation 27
+```
+
+磁盘上没有文件系统时打印 `[warn] no file system on the disk: NotFormatted`（接一块全 0 的 4 MiB 镜像实测；超级块坏了是别的错误名），照常启动：文件系统的系统调用返回 `-ENODEV`（`ls /` 打印 `ls: /: NoDevice`），整个磁盘都是原始区域。
+
+**一把睡眠锁管整个文件系统**：每个系统调用拿着 `fsys.lock` 做完整个操作（包括读写文件时在缓冲区和用户内存之间复制），所以 `fs.zig`、`ctree.zig` 里不用加锁，同一时刻只有一个进程在用文件系统。代价是两个进程读写不同的文件也要排队；xv6 的 inode 各有一把睡眠锁，可以并行，这里的 B 树是整棵写时复制的，一个事务改的是整条路径，按文件分锁不容易。
+
+- 是睡眠锁：拿着它要读写磁盘（睡着等）。拿它之前不能拿着自旋锁；它在缓冲区的睡眠锁之前拿（`fsys.lock` → 缓冲区的睡眠锁 → `virtio_disk.lock`），回到 U 模式之前放开。
+- `File.off`（几个 fd 共用的读写位置）也由它保护：读写的整个过程拿着它，并发的 `write` 不会写到同一个位置上。
+- 原始区域只由 `readblock`、`writeblock` 读写，不拿 `fsys.lock`：它和文件系统用的块不重叠。
+
+**打开的文件**：`file.File` 多了一种 `.inode`，记着 inode 号 `ino` 和读写位置 `off`（[files.md](files.md)）。`read`、`write` 系统调用对它调用 `fs.read`、`fs.run(Fs.write, ...)`，`out`、`in` 是 `UserOut`、`UserIn`（用户地址空间和指针，经 `vm.copyToUser`、`copyFromUser`，[syscalls.md](syscalls.md#访问用户内存)），成功了才挪 `off`。
+
+**每个进程有当前目录**：`Process.cwd`（inode 号，从根目录开始），`fork` 继承，`exec` 不变，只有自己读写（`chdir`）。相对路径从它开始找。
+
+**系统调用**（[syscalls.md](syscalls.md#调用列表)）：
+
+| 调用 | 做什么 |
+| --- | --- |
+| `open(path, flags)` | `resolve`；没有并且带 `O_CREATE` 时 `create`；是目录并且要写是 `EISDIR`；带 `O_TRUNC` 并且可写时 `truncate`。返回 fd |
+| `mkdir(path)`、`unlink(path)` | `create(.dir)`、`unlink` |
+| `chdir(path)` | `resolve`，不是目录是 `ENOTDIR` |
+| `fstat(fd)` | inode 号、长度、种类；串口和管道也能查（种类是 `console`、`pipe`） |
+| `readdir(fd)` | 目录的下一项：`File.off` 就是 `fs.readdir` 的 cookie，结果写进用户内存成功了才往后挪 |
+| `read`、`write` | 从 `off` 开始读写；读写目录是 `EISDIR` |
+
+路径先复制进内核栈上的缓冲区（最长 `abi.max_path` = 256 字节，长了是 `ENAMETOOLONG`）。错误码：`NotFound` → `ENOENT`，`Exists` → `EEXIST`，`NotDir` → `ENOTDIR`，`IsDir` → `EISDIR`，`NotEmpty` → `ENOTEMPTY`，`NameTooLong` → `ENAMETOOLONG`，`InvalidName` → `EINVAL`，`NoSpace` → `ENOSPC`，`FileTooBig` → `EFBIG`，`BadAddress` → `EFAULT`，`Corrupt` 等磁盘上的东西不对 → `EIO`。
+
+**内核栈**：系统调用在 16 KiB 的进程内核栈上运行，B 树的操作走得很深。开发时内核栈被撑爆过一次（Debug 模式用到 54 KiB）：`std.bit_set` 的 `isSet`、`count` 按值接收整个位图，每调用一次在栈上复制 8 KiB；`x.* = y.*` 复制 4 KiB 的块也会先放在栈上。改成自己写的 `Bitmap`（方法接收指针）和 `@memcpy` 之后，实测跑完全部 QEMU 测试（包括 `t_fs`、掉电后重新启动），最深 Debug 9944 字节、safe 5312 字节、small 5144 字节（测法见 [process.md](process.md#进程表)）。
+
+## 生成磁盘镜像（`mkfs.zig`）
+
+```
+mkfs <输出文件> <总块数> <文件系统的块数> <文件>...
+```
+
+主机上的程序，`build.zig` 构建时运行它（xv6 的 `mkfs/mkfs.c`）：用 `fs.zig`、`ctree.zig`、`bio.zig` 这几个和内核同一份的文件，磁盘是内存里的一块数组（`bio` 的 `Device`）。`Fs.format` 格式化前 7168 块，建 `/bin`，把选中的每个用户程序的 ELF 装成 `/bin/<名字>`，跑一遍 `check`，再给后面 1024 块的原始区域填上固定图案（[disk.md](disk.md#qemu-的磁盘)），写出镜像文件。`mkfs.zig` 是一个单独的主机程序的根，和内核、单元测试是不同的编译，所以可以和它们共用 `src/` 下的文件（一个文件在一次编译里只能属于一个模块）。
+
 ## 单元测试
 
 都在主机上，用内存当磁盘：
 
-- 目录：创建、`resolve`（`.`、`..`、多余的 `/`、相对路径）；`Exists`、`NotFound`、`NotDir`、`InvalidName`、`NameTooLong`、`IsDir`；删除非空目录是 `NotEmpty`；删了之后找不到，inode 号不重用。
+- 目录：创建、`resolve`（`.`、`..`、多余的 `/`、相对路径）；`Exists`、`NotFound`、`NotDir`、`InvalidName`、`NameTooLong`、`IsDir`；最长的名字（255 字节）找得到、列得出来、删得掉；删除非空目录是 `NotEmpty`；删了之后找不到，inode 号不重用。
 - `readdir` 列出 62 个名字一个不少、不重复；散列相同的两个名字都找得到，删掉一个另一个还在。
 - 文件内容：内联的读写、中间补 0；正好 512 字节还是内联，再长一个字节换成数据块、内容不变；跨页的写；洞读出来是 0、不占块；读到末尾之后返回 0；写到一半“用户内存”出错，整个写作废、文件不变；`FileTooBig`；截断之后再写又是内联；删除文件之后空闲块数和创建之前一样。
 - 数据块的校验和：在磁盘上改一个字节，读这一页是 `Corrupt`，别的页照常；重新挂载之后内容还在。
@@ -71,9 +128,17 @@ pub fn run(fs: *Fs, comptime op: anytype, args: anytype) Error!...
 
   验证过它能抓住错误：改数据页时直接在旧块上改（不写时复制），掉电测试失败；挂载时不把数据块算作用着的（`dataRefs` 总返回 null），掉电测试失败（这一种是在加了“挂载之后接着写”之后才抓到的）。
 
+## QEMU 里的测试
+
+`tools/qemu_test.py` 的 `fs` 用例（[testing.md](testing.md)）：shell 里的 `ls`、`cat`、`mkdir`、`rm`、`cd`、`<`、`>`；回归测试 `t_fs` 测系统调用的边界情况和并发；关机之后在同一个镜像上再启动，上一次写的文件还在；然后边写边把 QEMU 杀掉（掉电），再启动一次，`t_fs verify` 检查每个操作要么做完了、要么没做。
+
+这个用例在开发时抓到过一个 bug：目录项的头里名字长度是 `u8`，`@sizeOf(DirHeader) + head.name_len` 按 `u8` 算，名字长于 239 字节时溢出（Debug、safe 模式下 panic；fast、small 模式下不检查溢出，是未定义行为）。单元测试原来只建了 255 字节的名字，没有再找它、列它，碰不到这段代码，现在补上了。
+
 ## 限制和以后可以做的
 
 - 只能截成 0；没有 `rename`、硬链接、权限、时间戳。
 - 一页一个数据块，没有 btrfs 那种连续多块的 extent；也没有压缩。
 - 每个操作一个事务，每次都写超级块。
-- 删除打开着的文件之后，打开它的人再读写会出错。
+- 删除打开着的文件之后，打开它的人再读写会出错（`ENOENT`）。
+- 一把锁管整个文件系统，读写不同文件的进程也要排队。
+- 没有 `lseek`：读写位置只能从 0 开始往后挪。

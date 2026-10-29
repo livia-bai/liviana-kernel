@@ -9,7 +9,7 @@ const std = @import("std");
 const sys = @import("sys");
 const abi = sys.abi;
 
-const Command = enum { help, uptime, mem, disk, run, ps, kill, shutdown };
+const Command = enum { help, uptime, mem, disk, cd, run, ps, kill, shutdown };
 
 var line: [128]u8 = undefined;
 
@@ -72,10 +72,12 @@ fn execute(input: []const u8) void {
             \\help        show this message
             \\uptime      time since boot
             \\mem         free physical pages
-            \\disk        size of the disk
+            \\disk        size of the raw disk area (the blocks after the file system)
+            \\cd [DIR]    change the current directory (default: /)
             \\run NAME [ARGS...]
             \\            run a user program and wait for it (without NAME: list them)
             \\run A | B   run A and B with A's output piped into B (up to 4 programs)
+            \\run ... > F write the output to file F (< F: read input from F)
             \\run ... &   run it in the background
             \\ps          list processes
             \\kill PID    kill a process
@@ -91,6 +93,10 @@ fn execute(input: []const u8) void {
             sys.print("{d} of {d} pages free ({d} KiB), {d} KiB each\n", .{
                 m.free_pages, m.total_pages, m.free_pages * m.page_size / 1024, m.page_size / 1024,
             });
+        },
+        .cd => {
+            const dir = std.mem.trim(u8, arg, " ");
+            sys.chdir(if (dir.len == 0) "/" else dir) catch |err| sys.print("cd: {s}: {s}\n", .{ dir, @errorName(err) });
         },
         .disk => {
             const n = sys.blockCount();
@@ -110,19 +116,22 @@ fn execute(input: []const u8) void {
     }
 }
 
-/// 一个要运行的程序：程序名是 args[0]。
+/// 一个要运行的程序：程序名是 args[0]。`< 文件`、`> 文件` 把标准输入、标准输出换成文件。
 const Stage = struct {
     args: [sys.abi.max_args][]const u8 = undefined,
     argc: usize = 0,
+    in: ?[]const u8 = null,
+    out: ?[]const u8 = null,
 
     fn name(st: *const Stage) []const u8 {
         return st.args[0];
     }
 };
 
-const ParseError = error{ EmptyCommand, TooManyArguments, TooManyStages };
+const ParseError = error{ EmptyCommand, TooManyArguments, TooManyStages, MissingFileName };
 
 /// 把 run 的参数拆成用 | 隔开的几段，每段按空格拆成命令行参数。参数是 line 里的切片。
+/// `<`、`>` 后面（可以有空格，也可以没有）是重定向的文件名，不算参数。
 fn parse(arg: []const u8, stages: *[max_stages]Stage) ParseError![]Stage {
     var n: usize = 0;
     var parts = std.mem.splitScalar(u8, arg, '|');
@@ -132,6 +141,11 @@ fn parse(arg: []const u8, stages: *[max_stages]Stage) ParseError![]Stage {
         st.* = .{};
         var words = std.mem.tokenizeScalar(u8, part, ' ');
         while (words.next()) |w| {
+            if (w[0] == '<' or w[0] == '>') {
+                const target = if (w.len > 1) w[1..] else words.next() orelse return error.MissingFileName;
+                if (w[0] == '<') st.in = target else st.out = target;
+                continue;
+            }
             if (st.argc == st.args.len) return error.TooManyArguments;
             st.args[st.argc] = w;
             st.argc += 1;
@@ -154,6 +168,7 @@ fn run(input: []const u8) void {
             error.EmptyCommand => "empty command in the pipeline",
             error.TooManyArguments => std.fmt.comptimePrint("too many arguments (at most {d})", .{abi.max_args}),
             error.TooManyStages => std.fmt.comptimePrint("too many programs in the pipeline (at most {d})", .{max_stages}),
+            error.MissingFileName => "missing file name after < or >",
         }});
         return;
     };
@@ -170,7 +185,10 @@ fn run(input: []const u8) void {
         // 前台的话子进程自己先登记成前台进程，再 exec：父进程的 setfg 可能晚于子进程开始运行
         // （fork 之后先调度谁不一定），那样程序刚开始运行时按的 Ctrl-C 就没人管了
         if (!background) sys.setfg(sys.getpid()) catch {};
-        if (stages.len == 1) execStage(&stages[0]);
+        if (stages.len == 1) {
+            redirect(&stages[0]);
+            execStage(&stages[0]);
+        }
         sys.exit(runPipeline(stages));
     }
     const what = if (stages.len == 1) stages[0].name() else "pipeline";
@@ -189,6 +207,23 @@ fn forkFailed(err: sys.ForkError) void {
         error.TooManyProcesses => sys.print("run: too many processes (at most {d})\n", .{abi.max_procs}),
         else => sys.print("run: cannot fork: {s}\n", .{@errorName(err)}),
     }
+}
+
+/// 在子进程里按 `<`、`>` 换掉标准输入、标准输出（`>` 的文件没有就建，有就截成 0 字节）。打不开就以 1 结束。
+fn redirect(st: *const Stage) void {
+    if (st.in) |path| replaceFd(sys.stdin, path, .{});
+    if (st.out) |path| replaceFd(sys.stdout, path, .{ .read = false, .write = true, .create = true, .truncate = true });
+}
+
+fn replaceFd(target: sys.Fd, path: []const u8, flags: sys.OpenFlags) void {
+    const fd = sys.open(path, flags) catch |err| {
+        sys.print("run: {s}: {s}\n", .{ path, @errorName(err) });
+        sys.exit(1);
+    };
+    // close 再 dup：dup 返回最小的空闲 fd，正好是刚关掉的那个
+    sys.close(target) catch {};
+    _ = sys.dup(fd) catch {};
+    sys.close(fd) catch {};
 }
 
 /// 在子进程里换成要运行的程序。失败时（比如 ELF 不合法）说明原因，以 127 结束。
@@ -238,6 +273,7 @@ fn runPipeline(stages: []Stage) u8 {
                 sys.close(p[0]) catch {};
                 sys.close(p[1]) catch {};
             }
+            redirect(st); // 重定向优先于管道（和 Unix 的 sh 一样）
             execStage(st);
         }
         started += 1;

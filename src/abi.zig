@@ -55,14 +55,66 @@ pub const Syscall = enum(usize) {
     /// sbrk(increment) 把堆的末尾（program break）移动 increment 字节（按有符号数理解，可以为负），
     /// 返回原来的末尾。新增的内存清零；缩小时释放整页
     sbrk = 20,
-    /// blockcount() 返回磁盘有多少个块（每块 block_size 字节），没有磁盘时返回 0
+    /// blockcount() 返回磁盘的原始区域（文件系统之后的块）有多少块（每块 block_size 字节），没有磁盘时返回 0
     blockcount = 21,
-    /// readblock(blockno, ptr) 把磁盘的第 blockno 块读进用户内存 ptr（block_size 字节），返回 0。
-    /// 经过缓冲区缓存，和以后的文件系统看到的是同一份（像读 Linux 的 /dev/vda）
+    /// readblock(blockno, ptr) 把原始区域的第 blockno 块读进用户内存 ptr（block_size 字节），返回 0。
+    /// 经过缓冲区缓存。原始区域在文件系统之后，读写它碰不到文件系统
     readblock = 22,
-    /// writeblock(blockno, ptr) 把用户内存 ptr 的 block_size 字节写到磁盘的第 blockno 块，写完才返回 0
+    /// writeblock(blockno, ptr) 把用户内存 ptr 的 block_size 字节写到原始区域的第 blockno 块，写完才返回 0
     writeblock = 23,
+    /// open(path_ptr, path_len, flags) 打开文件系统里的文件或目录，返回 fd。flags 见 open_*：
+    /// 读写方式（open_read、open_write、open_rdwr）加上 open_create（没有就建一个空文件）、
+    /// open_trunc（截成 0 字节）。目录只能只读地打开（用 readdir 列出来）
+    open = 24,
+    /// mkdir(path_ptr, path_len) 建一个空目录，返回 0
+    mkdir = 25,
+    /// unlink(path_ptr, path_len) 删掉一个文件或者空目录，返回 0
+    unlink = 26,
+    /// chdir(path_ptr, path_len) 换当前目录（相对路径从它开始找），返回 0
+    chdir = 27,
+    /// fstat(fd, ptr) 把 fd 的 Stat 写进用户内存，返回 0
+    fstat = 28,
+    /// readdir(fd, ptr) 把目录 fd 的下一个目录项（Dirent）写进用户内存，返回 1；列完了返回 0
+    readdir = 29,
     _,
+};
+
+/// open 的 flags（数值照 xv6）
+pub const open_read: usize = 0x000;
+pub const open_write: usize = 0x001;
+pub const open_rdwr: usize = 0x002;
+pub const open_create: usize = 0x200;
+pub const open_trunc: usize = 0x400;
+
+/// 路径最长多少字节
+pub const max_path = 256;
+/// 名字（路径的一段）最长多少字节
+pub const max_name = 255;
+
+/// fd 指向的是什么（fstat、readdir）。文件、目录的数值和文件系统里的 fs.Kind 一样
+pub const FileKind = enum(u8) {
+    file = 1,
+    dir = 2,
+    console = 3,
+    pipe = 4,
+    _,
+};
+
+pub const Stat = extern struct {
+    /// 文件系统里的 inode 号，串口和管道是 0
+    ino: u64,
+    /// 文件的字节数，目录、串口、管道是 0
+    size: u64,
+    kind: FileKind,
+    _pad: [7]u8 = @splat(0),
+};
+
+pub const Dirent = extern struct {
+    ino: u64,
+    kind: FileKind,
+    name_len: u8,
+    _pad: [6]u8 = @splat(0),
+    name: [max_name]u8,
 };
 
 /// 磁盘块的大小（缓冲区缓存、以后的文件系统都按这个大小读写），正好一页。
@@ -71,12 +123,28 @@ pub const block_size = 4096;
 pub const Errno = enum(usize) {
     /// 没有权限（kill init）
     perm = 1,
-    /// 没有这个程序（exec、listprog）
+    /// 没有这个程序（exec、listprog），没有这个文件或目录
     noent = 2,
     /// 没有这个进程（kill、setfg）
     srch = 3,
-    /// 没有磁盘（readblock、writeblock）
+    /// 没有磁盘，或者磁盘上没有文件系统
     nodev = 19,
+    /// 磁盘上的数据不对（校验和、结构）
+    io = 5,
+    /// 已经有这个名字了（mkdir、open_create 不会报这个）
+    exist = 17,
+    /// 路径中间的某一段不是目录；chdir、readdir 的不是目录
+    notdir = 20,
+    /// 读写目录、写方式打开目录
+    isdir = 21,
+    /// 文件太大
+    fbig = 27,
+    /// 磁盘满了
+    nospc = 28,
+    /// 名字或者路径太长
+    nametoolong = 36,
+    /// 删除的目录不是空的
+    notempty = 39,
     /// 命令行参数太多或太长（exec）
     toobig = 7,
     /// 程序不是合法的 ELF（exec）
@@ -91,7 +159,7 @@ pub const Errno = enum(usize) {
     nomem = 12,
     /// 指针指向的内存不属于用户空间，或者没有映射
     fault = 14,
-    /// 参数不对；块号超出磁盘（readblock、writeblock）
+    /// 参数不对；块号超出原始区域（readblock、writeblock）；名字是 "."、".."
     inval = 22,
     /// 系统的文件表满了（pipe、fork）
     nfile = 23,

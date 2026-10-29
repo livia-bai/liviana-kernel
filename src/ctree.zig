@@ -81,13 +81,33 @@ pub const DataRef = struct {
     generation: u64,
 };
 
-/// 每块一位。8 KiB 一个，比内核栈的一半还大：只在原地改（clear、下面的循环），不要写成
-/// `.initEmpty()`、`complement()` 这类会在栈上造一个临时值的写法
-const Bitmap = std.bit_set.ArrayBitSet(usize, max_blocks);
+/// 每块一位。8 KiB 一个，比内核栈的一半还大：所有操作都通过指针做，不要按值传、按值遍历、
+/// 也不要用 std.bit_set（它的 isSet、count 按值接收 self，调用一次就在栈上复制 8 KiB，开发时因此把内核栈撑爆过）。
+const Bitmap = struct {
+    masks: [max_blocks / 64]u64 = @splat(0),
 
-fn clear(b: *Bitmap) void {
-    @memset(&b.masks, 0);
-}
+    fn isSet(b: *const Bitmap, i: u64) bool {
+        return b.masks[i / 64] >> @intCast(i % 64) & 1 != 0;
+    }
+
+    fn set(b: *Bitmap, i: u64) void {
+        b.masks[i / 64] |= @as(u64, 1) << @intCast(i % 64);
+    }
+
+    fn unset(b: *Bitmap, i: u64) void {
+        b.masks[i / 64] &= ~(@as(u64, 1) << @intCast(i % 64));
+    }
+
+    fn count(b: *const Bitmap) u64 {
+        var n: u64 = 0;
+        for (&b.masks) |*m| n += @popCount(m.*);
+        return n;
+    }
+
+    fn clear(b: *Bitmap) void {
+        @memset(&b.masks, 0);
+    }
+};
 
 pub const Volume = struct {
     blocks: u64 = 0,
@@ -100,10 +120,10 @@ pub const Volume = struct {
     /// 当前事务开始以来改过东西没有（没改的话 commit 不写超级块）
     dirty: bool = false,
     /// 用着的块：当前的树、已提交的树、超级块。pending：已提交的树用着、当前的树不用了的块
-    used: Bitmap = .{ .masks = @splat(0) },
-    pending: Bitmap = .{ .masks = @splat(0) },
+    used: Bitmap = .{},
+    pending: Bitmap = .{},
     /// 挂载、检查时走树用的临时位图
-    seen: Bitmap = .{ .masks = @splat(0) },
+    seen: Bitmap = .{},
     free_count: u64 = 0,
     /// 叶子里的条目指向的树外的块（文件系统的数据块）。挂载、检查走树时对每个条目调用它，
     /// 返回的块也算用着的（同一块被引用两次是 Corrupt）。由文件系统在挂载之前设好，没有就是 null
@@ -150,8 +170,8 @@ pub const Volume = struct {
 
     /// 根据当前的根重新算用着的块（挂载、作废事务时）。
     fn rescan(v: *Volume) Error!void {
-        clear(&v.pending);
-        clear(&v.seen);
+        v.pending.clear();
+        v.seen.clear();
         try v.walk(v.root, null, null, null);
         @memcpy(&v.used.masks, &v.seen.masks);
         for (0..super_blocks) |i| v.used.set(i);
@@ -172,8 +192,8 @@ pub const Volume = struct {
             .root_level = v.root.level,
         });
         v.free_count += v.pending.count();
-        for (&v.used.masks, v.pending.masks) |*u, p| u.* &= ~p;
-        clear(&v.pending);
+        for (&v.used.masks, &v.pending.masks) |*u, *p| u.* &= ~p.*;
+        v.pending.clear();
         v.generation = v.transid;
         v.committed = v.root;
         v.transid += 1;
@@ -191,9 +211,9 @@ pub const Volume = struct {
     /// 分配编号最小的空闲块（first fit）。刚放出来的块马上就会被重用：哪里提前放出了已提交的树的块，
     /// 掉电测试马上就能撞上（按顺序往后找的 next fit 要绕一圈才会重用，掩盖了这种错误）。
     fn alloc(v: *Volume) Error!u64 {
-        for (v.used.masks, 0..) |m, i| {
-            if (m == std.math.maxInt(usize)) continue;
-            const b = i * @bitSizeOf(usize) + @ctz(~m);
+        for (&v.used.masks, 0..) |*m, i| {
+            if (m.* == std.math.maxInt(u64)) continue;
+            const b = i * 64 + @ctz(~m.*);
             if (b >= v.blocks) break;
             v.used.set(b);
             v.free_count -= 1;
@@ -278,7 +298,7 @@ pub const Volume = struct {
         errdefer bio.release(b);
         const blockno = try v.alloc();
         const nb = try bio.get(blockno);
-        nb.data.* = b.data.*;
+        @memcpy(nb.data, b.data); // 不写成 nb.data.* = b.data.*：Debug 模式下会先复制到栈上的临时值
         nb.valid = true;
         const nh = Node.of(nb.data).header();
         nh.blockno = blockno;
@@ -619,13 +639,13 @@ pub const Volume = struct {
     /// 检查当前的树：结构、校验和，以及位图：用着的块正好是树的块、超级块、等着释放的块。
     pub fn check(v: *Volume) Error!Stats {
         var stats: Stats = .{ .height = v.height() };
-        clear(&v.seen);
+        v.seen.clear();
         try v.walk(v.root, null, null, &stats);
         for (0..super_blocks) |i| v.seen.set(i);
         // 当前的树不能用着等释放的块：那些块属于已提交的树，提交之前不能分配出去
-        for (v.seen.masks, v.pending.masks) |x, p| if (x & p != 0) return error.Corrupt;
-        for (&v.seen.masks, v.pending.masks) |*x, p| x.* |= p;
-        if (!std.mem.eql(usize, &v.seen.masks, &v.used.masks) or v.free_count != v.blocks - v.used.count()) return error.Corrupt;
+        for (&v.seen.masks, &v.pending.masks) |*x, *p| if (x.* & p.* != 0) return error.Corrupt;
+        for (&v.seen.masks, &v.pending.masks) |*x, *p| x.* |= p.*;
+        if (!std.mem.eql(u64, &v.seen.masks, &v.used.masks) or v.free_count != v.blocks - v.used.count()) return error.Corrupt;
         return stats;
     }
 };

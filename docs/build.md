@@ -85,9 +85,10 @@ const UserProgram = struct {
     linker_script: []const u8 = "user/linker.ld",
 };
 const user_programs = [_]UserProgram{
-    .{ .name = "init" },  .{ .name = "sh" },   .{ .name = "hello" },
-    .{ .name = "fault" }, .{ .name = "spin" }, .{ .name = "ticker" },
-    .{ .name = "echo" },  .{ .name = "cat" },  .{ .name = "wc" },
+    .{ .name = "init" },  .{ .name = "sh" },    .{ .name = "hello" },
+    .{ .name = "fault" }, .{ .name = "spin" },  .{ .name = "ticker" },
+    .{ .name = "echo" },  .{ .name = "cat" },   .{ .name = "wc" },
+    .{ .name = "ls" },    .{ .name = "mkdir" }, .{ .name = "rm" },
 };
 const test_programs = [_]UserProgram{
     .{ .name = "t_sys", .dir = "user/tests" },
@@ -133,6 +134,7 @@ for (all_programs, 0..) |p, i| {
     unit_tests.root_module.addAnonymousImport(p.name, .{ .root_source_file = program.getEmittedBin() });
     if (i >= programs.len) continue; // 没被选中的测试程序只给单元测试用
     kernel.root_module.addAnonymousImport(p.name, .{ .root_source_file = program.getEmittedBin() });
+    program_bins.append(b.allocator, program.getEmittedBin()) catch @panic("OOM");   // 交给 mkfs，装进 /bin
     const install = b.addInstallArtifact(program, .{ .dest_dir = .{ .override = .{ .custom = "user" } } });
     b.getInstallStep().dependOn(&install.step);
 }
@@ -229,17 +231,25 @@ test_step.dependOn(&b.addRunArtifact(unit_tests).step);
 ## 磁盘镜像
 
 ```zig
-const disk_image = b.allocator.alloc(u8, disk_blocks * disk_block_size) catch @panic("OOM");
-for (disk_image, 0..) |*byte, n| {
-    byte.* = @intCast(((n / disk_block_size) * 131 + n % disk_block_size) % 251);
-}
-const disk = b.addWriteFiles().add("disk.img", disk_image);
+const mkfs = b.addExecutable(.{
+    .name = "mkfs",
+    .root_module = b.createModule(.{
+        .root_source_file = b.path("src/mkfs.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    }),
+});
+const make_disk = b.addRunArtifact(mkfs);
+const disk = make_disk.addOutputFileArg("disk.img");
+make_disk.addArgs(&.{ "8192", "7168" });
+for (program_bins.items) |bin| make_disk.addFileArg(bin);
 b.getInstallStep().dependOn(&b.addInstallFile(disk, "disk.img").step);
 ```
 
-- 构建脚本自己算出 4 MiB 的内容（1024 块，第 b 块的第 i 个字节是 `(b * 131 + i) % 251`），交给 `WriteFile` 写进缓存目录，再装到 `zig-out/disk.img`。还没有文件系统，这个固定图案给回归测试检查读写用（[disk.md](disk.md)）；以后改成由 `mkfs` 生成。
-- 内容是确定的，缓存命中时不会重写。`InstallFile` 发现 `zig-out/disk.img` 的大小或修改时间和缓存里的不一样就重新拷一份，所以测试改写过它之后，下一次 `zig build` 会恢复原样。
-- 公式在三个地方各写了一遍：`build.zig`、`user/tests/t_disk.zig`、`tools/qemu_test.py`，改一处要三处一起改。
+- `mkfs`（`src/mkfs.zig`，[fs.md](fs.md#生成磁盘镜像mkfszig)）编译成**主机**的程序，构建时运行：`mkfs <输出> 8192 7168 <ELF>...`。32 MiB 的镜像，前 7168 块格式化成文件系统，选中的每个用户程序装成 `/bin/<名字>`；后 1024 块是原始区域，填上固定图案（第 b 块的第 i 个字节是 `(b * 131 + i) % 251`），给回归测试 `t_disk` 检查读写（[disk.md](disk.md)）。结果装到 `zig-out/disk.img`。
+- `addOutputFileArg`、`addFileArg` 让构建系统知道 Run 步骤的输入和输出：`mkfs` 或哪个 ELF 变了才重新生成，否则命中缓存。`InstallFile` 发现 `zig-out/disk.img` 的大小或修改时间和缓存里的不一样就重新拷一份，所以磁盘被改写过之后，下一次 `zig build` 会恢复原样。
+- `-Dtest-programs=true` 时测试程序也装进 `/bin`，镜像和平时的不一样（空闲块少一些）。
+- 两个数字和原始区域的图案在几个地方各写了一遍：`build.zig`（`mkfs` 的参数）、`src/mkfs.zig`（图案）、`user/tests/t_disk.zig`（原始区域的块数和图案）、`tools/qemu_test.py`（`FS_BLOCKS`、`DISK_BLOCKS`、`disk_original`），改一处要一起改。
 
 ## 运行步骤
 

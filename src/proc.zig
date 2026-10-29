@@ -109,6 +109,8 @@ pub const Process = struct {
     brk: usize = 0,
     /// 拿着几把睡眠锁（sleeplock.zig）。只有自己改；回到 U 模式时必须是 0
     sleeplocks: u32 = 0,
+    /// 当前目录的 inode 号，相对路径从这里开始找。fork 继承，exec 不变；只有自己读写
+    cwd: u64 = @import("fs.zig").root_ino,
 };
 
 /// 进程表。槽位 i 的进程用 kernel_stacks[i] 作内核栈。
@@ -264,6 +266,7 @@ pub fn fork() ForkError!usize {
         .files = files,
         .heap_start = parent.heap_start,
         .brk = parent.brk,
+        .cwd = parent.cwd,
     });
     // 空闲的 hart 马上来运行子进程，不用等父进程让出 CPU
     ipi.wakeIdle(1);
@@ -370,7 +373,10 @@ fn forkret() callconv(.naked) noreturn {
 }
 
 fn forkretC() callconv(.c) void {
-    current().?.lock.release();
+    const p = current().?;
+    p.lock.release();
+    // 第一个进程第一次运行：挂载文件系统（要读盘、睡着等，kmain 做不了）。之后创建的进程都在这之后
+    if (p == init_proc) @import("fsys.zig").init();
     checkKilled();
     assertNoLocksHeld();
 }

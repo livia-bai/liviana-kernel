@@ -64,8 +64,12 @@ QEMU `virt` 机器、`-m 128M` 时，和这个内核有关的物理地址如下�
 main.zig ─┬─ uart.zig ──────────── 串口输出（加锁）、键盘输入缓冲、Ctrl-C
           ├─ sbi.zig ───────────── ecall 到 OpenSBI（定时器、关机、启动其他 hart）
           ├─ trap.zig ─┬─ timer.zig、plic.zig、uart.zig（中断）
-          │            ├─ syscall.zig ─── abi.zig、vm.zig、proc.zig、file.zig、page.zig、timer.zig、uart.zig、sbi.zig
+          │            ├─ syscall.zig ─── abi.zig、vm.zig、proc.zig、file.zig、page.zig、timer.zig、uart.zig、sbi.zig、
+          │            │                   bio.zig（原始区域）、fsys.zig（文件系统的调用）
+          │            ├─ virtio_disk.zig（磁盘中断）
           │            └─ proc.zig（让出 CPU、wakeup、杀进程）
+          ├─ virtio_disk.zig ───── virtio 块设备驱动（proc.zig 的 sleep/wakeup 等磁盘）
+          ├─ bio.zig ───────────── 缓冲区缓存（每块一把睡眠锁 sleeplock.zig），读写交给 virtio_disk.zig
           ├─ dtb.zig ───────────── 设备树
           ├─ page.zig ──────────── 物理页
           ├─ vm.zig ────────────── 页表（用 page.zig 分配页表）
@@ -74,7 +78,12 @@ main.zig ─┬─ uart.zig ──────────── 串口输出（
                                    vm.zig、trap.zig（进入 U 模式）、file.zig（fd 表）、abi.zig、build_options + 嵌入的用户程序
 
 file.zig ─┬─ uart.zig（串口作为文件）
-          └─ pipe.zig ─── page.zig（每个管道一页）、vm.zig（复制用户内存）、proc.zig（sleep/wakeup）
+          ├─ pipe.zig ─── page.zig（每个管道一页）、vm.zig（复制用户内存）、proc.zig（sleep/wakeup）
+          └─ fsys.zig ─── 挂载（proc.zig 的 forkretC 调用）、一把睡眠锁、错误码
+                └─ fs.zig ─── inode、目录、文件内容
+                      └─ ctree.zig ─── 写时复制 B 树、事务 ─── btree.zig（节点格式）、bio.zig
+
+src/mkfs.zig（主机上的程序）─── fs.zig、ctree.zig、bio.zig：构建时生成磁盘镜像
 
 user/start.zig ─┬─ user/sys.zig ─── src/abi.zig（与内核共用的系统调用约定）
                 └─ user/<程序>.zig ─── user/sys.zig      （init.zig、sh.zig 也是这样的程序）

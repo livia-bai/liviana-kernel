@@ -1,14 +1,15 @@
 //! 打开的文件，照 xv6 的 file.c 写。进程用 fd（Process.files 的下标）指代一个 File，
-//! File 是串口（console）或者管道的一端。
+//! File 是串口（console）、管道的一端，或者文件系统里的一个文件、目录（inode，见 fsys.zig）。
 //!
 //! - 文件表 table 是全局的，File 带引用计数：fork 复制 fd 表、dup 复制 fd，都只是让两个 fd
 //!   指向同一个 File（ref 加 1），所以父子进程共用读写位置、共用管道的一端。
 //!   最后一个引用关掉时（close、进程结束）才真正关掉：管道的一端关了，另一端会读到结尾或写失败。
-//! - 没有文件系统，所以文件只有这两种：init 打开串口作为 0、1、2 号 fd，其他进程都从它那里 fork 继承；
-//!   pipe 系统调用创建管道。
+//! - init 打开串口作为 0、1、2 号 fd，其他进程都从它那里 fork 继承；pipe 系统调用创建管道；
+//!   open 系统调用打开文件系统里的文件、目录。
 //!
-//! 文件表由 lock 保护（多核时几个 hart 会同时打开、关闭文件）。File 本身的 kind、readable 等字段
-//! 在分配出来之后就不变了，读写时不用拿 lock；管道的状态由管道自己的锁保护（pipe.zig）。
+//! 文件表由 lock 保护（多核时几个 hart 会同时打开、关闭文件）。File 本身的 kind、readable、ino 等字段
+//! 在分配出来之后就不变了，读写时不用拿 lock；管道的状态由管道自己的锁保护（pipe.zig），
+//! 文件的读写位置 off 由文件系统的锁保护（fsys.lock）。
 
 const std = @import("std");
 const uart = @import("uart.zig");
@@ -16,12 +17,14 @@ const vm = @import("vm.zig");
 const page = @import("page.zig");
 const proc = @import("proc.zig");
 const pipe = @import("pipe.zig");
+const fsys = @import("fsys.zig");
+const fs = @import("fs.zig");
 const Spinlock = @import("spinlock.zig").Spinlock;
 
 /// 整个系统最多同时有多少个打开的文件。每个进程最多 abi.max_fds 个 fd，但它们大多指向同一个串口。
 pub const max_files = 32;
 
-pub const Kind = enum { none, console, pipe };
+pub const Kind = enum { none, console, pipe, inode };
 
 pub const File = struct {
     /// 引用数：有多少个 fd 指向它。为 0 表示这个槽位空着
@@ -30,12 +33,15 @@ pub const File = struct {
     readable: bool = false,
     writable: bool = false,
     pipe: *pipe.Pipe = undefined,
+    /// kind 为 inode 时：文件系统里的 inode 号，和下一次读写的位置（fsys.lock）
+    ino: u64 = 0,
+    off: u64 = 0,
 };
 
 var lock: Spinlock = .init("file");
 var table: [max_files]File = @splat(.{});
 
-pub const Error = error{ NotReadable, NotWritable, BadAddress, BrokenPipe };
+pub const Error = error{ NotReadable, NotWritable, BadAddress, BrokenPipe } || fs.Error;
 
 /// 分配一个空的 File（ref = 1），由调用方填好其他字段。
 fn alloc() error{TooManyFiles}!*File {
@@ -71,6 +77,16 @@ pub fn openPipe() error{ TooManyFiles, OutOfMemory }![2]*File {
     return .{ r, w };
 }
 
+/// 打开文件系统里的 inode ino，读写位置从 0 开始。
+pub fn openInode(ino: u64, readable: bool, writable: bool) error{TooManyFiles}!*File {
+    const f = try alloc();
+    f.kind = .inode;
+    f.ino = ino;
+    f.readable = readable;
+    f.writable = writable;
+    return f;
+}
+
 /// 多一个引用（dup、fork），返回同一个 File。
 pub fn dup(f: *File) *File {
     lock.acquire();
@@ -104,6 +120,7 @@ pub fn read(f: *File, space: *vm.PageTable, ptr: usize, len: usize) Error!usize 
         .none => unreachable,
         .console => consoleRead(space, ptr, len),
         .pipe => pipe.read(f.pipe, space, ptr, len),
+        .inode => inodeRead(f, space, ptr, len),
     };
 }
 
@@ -115,6 +132,7 @@ pub fn write(f: *File, space: *vm.PageTable, ptr: usize, len: usize) Error!usize
         .none => unreachable,
         .console => consoleWrite(space, ptr, len),
         .pipe => pipe.write(f.pipe, space, ptr, len),
+        .inode => inodeWrite(f, space, ptr, len),
     };
 }
 
@@ -134,6 +152,24 @@ fn consoleWrite(space: *vm.PageTable, ptr: usize, len: usize) Error!usize {
         done += chunk.len;
     }
     return done;
+}
+
+/// 从文件当前的位置读，位置往后挪读到的字节数。读目录是 IsDir（列目录用 readdir 系统调用）。
+fn inodeRead(f: *File, space: *vm.PageTable, ptr: usize, len: usize) Error!usize {
+    const root = try fsys.get();
+    defer fsys.unlock();
+    const n = try root.read(f.ino, f.off, len, fsys.UserOut{ .space = space, .ptr = ptr });
+    f.off += n;
+    return n;
+}
+
+/// 写到文件当前的位置，位置往后挪。整个写是一个事务：用户内存中途读不出来、磁盘满了，什么都不写。
+fn inodeWrite(f: *File, space: *vm.PageTable, ptr: usize, len: usize) Error!usize {
+    const root = try fsys.get();
+    defer fsys.unlock();
+    const n = try root.run(fsys.Fs.write, .{ f.ino, f.off, len, fsys.UserIn{ .space = space, .ptr = ptr } });
+    f.off += n;
+    return n;
 }
 
 /// Ctrl-D：在串口上表示“输入结束”，和 Unix 终端一样。

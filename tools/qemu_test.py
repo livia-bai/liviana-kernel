@@ -14,6 +14,7 @@
 
 import argparse
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -62,6 +63,7 @@ class Qemu:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
         )
+        self.kernel = kernel
         self.smp = smp
         self.disk = disk
         self.after_shutdown = []  # [(Checks, 函数)]：QEMU 退出之后再做的检查（比如读磁盘镜像）
@@ -494,7 +496,9 @@ def case_ipi(q, c, mode):
     exited(c, out, "t_ipi", 0)
 
 
-# build.zig 生成的磁盘镜像和 t_disk 改写的块（两边的公式要一致）
+# build.zig 生成的磁盘镜像：前 FS_BLOCKS 块是文件系统（mkfs 的参数），后 DISK_BLOCKS 块是原始区域，
+# readblock/writeblock 只能读写原始区域，块号从它的开头算。原始区域的图案和 t_disk 改写的块见下面（几边的公式要一致）
+FS_BLOCKS = 7168
 DISK_BLOCKS = 1024
 BLOCK_SIZE = 4096
 _PERIOD = bytes(i % 251 for i in range(BLOCK_SIZE + 251))
@@ -519,8 +523,9 @@ def disk_expected(b):
 def check_disk_image(q, c):
     with open(q.disk, "rb") as f:
         image = f.read()
-    c.expect(len(image) == DISK_BLOCKS * BLOCK_SIZE, f"disk image: {len(image)} bytes")
-    bad = [b for b in range(DISK_BLOCKS) if image[b * BLOCK_SIZE:(b + 1) * BLOCK_SIZE] != disk_expected(b)]
+    c.expect(len(image) == (FS_BLOCKS + DISK_BLOCKS) * BLOCK_SIZE, f"disk image: {len(image)} bytes")
+    raw = image[FS_BLOCKS * BLOCK_SIZE:]
+    bad = [b for b in range(DISK_BLOCKS) if raw[b * BLOCK_SIZE:(b + 1) * BLOCK_SIZE] != disk_expected(b)]
     c.expect(not bad, f"disk image after shutdown: {len(bad)} blocks differ from what t_disk wrote, first {bad[:8]}")
 
 
@@ -529,6 +534,86 @@ def case_disk(q, c, mode):
     c.contains(q.command("disk"), r"1024 blocks of 4 KiB \(4 MiB\)\n", "disk")
     check_counts(c, q.command("run t_disk"), "t_disk")
     q.after_shutdown.append((c, lambda c: check_disk_image(q, c)))
+
+
+def reboot(q, c, what, steps):
+    """在同一个磁盘镜像上再启动一次（QEMU 已经退出），等提示符，确认文件系统挂上了，再调用 steps(新的 Qemu)。
+    串口输出存到镜像旁边的 <镜像名>-<what>.log。"""
+    r = Qemu(q.kernel, q.smp, q.disk)
+    try:
+        text = r.wait_for(lambda t: "Type 'help' for commands.\n> " in t or "KERNEL PANIC" in t, BOOT_TIMEOUT,
+                          f"the first prompt ({what})")
+        c.contains(text, rf"\[ok\] file system: \d+ of {FS_BLOCKS} blocks free", f"{what}: boot log")
+        steps(r)
+    except Failure as e:
+        c.failures.append(f"{what}: {e}")
+    finally:
+        r.kill()
+        with open(os.path.splitext(q.disk)[0] + f"-{what}.log", "w", encoding="utf-8") as f:
+            f.write(r.text())
+    c.expect("KERNEL PANIC" not in r.text(), f"{what}: KERNEL PANIC in the serial output")
+
+
+def check_fs_reboots(q, c):
+    """QEMU 正常关机之后：第二次启动，上一次写的文件还在；然后边写边把 QEMU 杀掉（掉电），
+    第三次启动，文件系统能挂上，t_fs verify 检查每个操作要么做完了、要么没做。"""
+    delay = random.uniform(0.2, 1.0)
+
+    def second(r):
+        c.contains(r.command("run cat /keep.txt"), r"\npersist across reboots\n", "reboot: cat /keep.txt")
+        r.send("run t_fs churn &\r")
+        r.wait_for(lambda t: "churn: started" in t, COMMAND_TIMEOUT, "churn: started")
+        time.sleep(delay)
+        r.kill()  # 不关机，直接杀掉：磁盘停在写到一半的地方
+
+    def third(r):
+        out = r.command("run t_fs verify")
+        m = c.contains(out, r"churn: (\d+) records intact\n", f"verify after killing QEMU {delay:.2f}s into churn")
+        if m:
+            c.expect(int(m.group(1)) > 0, f"verify: no records survived {delay:.2f}s of churn")
+        check_counts(c, out, "t_fs")
+        r.send("shutdown\r")
+        c.expect(r.finish(COMMAND_TIMEOUT) == 0, "shutdown after verify")
+
+    reboot(q, c, "boot2", second)
+    reboot(q, c, "boot3", third)
+
+
+def case_fs(q, c, mode):
+    # shell 里的文件操作：ls、重定向、cat、mkdir、cd、rm
+    out = q.command("run ls /")
+    c.contains(out, r"\ndir +0 bin\n", "run ls /")
+    c.contains(q.command("run ls /bin"), r"\nfile +\d+ hello\n", "run ls /bin")
+    q.command("run echo hello file system > /hello.txt")
+    c.contains(q.command("run cat /hello.txt"), r"\nhello file system\n", "run cat /hello.txt")
+    c.contains(q.command("run wc < /hello.txt"), r"\n1 3 18\n", "run wc < /hello.txt")
+    c.contains(q.command("run ls /hello.txt"), r"\nfile +18 /hello.txt\n", "run ls /hello.txt")
+    q.command("run echo a b c | cat >/p.txt")
+    c.contains(q.command("run cat </p.txt"), r"\na b c\n", "run echo | cat > F")
+    exited(c, q.command("run mkdir /d /d/e"), "mkdir", 0)
+    q.command("cd /d/e")
+    q.command("run echo deep > f")
+    c.contains(q.command("run ls"), r"\nfile +5 f\n", "run ls in /d/e")
+    q.command("cd ..")
+    c.contains(q.command("run ls"), r"\ndir +0 e\n", "run ls in /d")
+    c.contains(q.command("run rm /d"), r"rm: /d: NotEmpty\n", "run rm /d")
+    exited(c, q.command("run rm e/f e"), "rm", 0)
+    q.command("cd")
+    exited(c, q.command("run rm /d /hello.txt /p.txt"), "rm", 0)
+    c.contains(q.command("run ls /"), r"\ndir +0 bin\n\[proc\]", "run ls / after rm")
+    # 出错的情况
+    c.contains(q.command("cd /nope"), r"cd: /nope: NotFound\n", "cd /nope")
+    c.contains(q.command("cd /bin/hello"), r"cd: /bin/hello: NotDir\n", "cd /bin/hello")
+    c.contains(q.command("run cat /nope"), r"cat: /nope: NotFound\n", "run cat /nope")
+    c.contains(q.command("run cat < /nope"), r"run: /nope: NotFound\n", "run cat < /nope")
+    c.contains(q.command("run echo x > /bin"), r"run: /bin: IsDir\n", "run echo x > /bin")
+    c.contains(q.command("run echo x >"), r"run: missing file name after < or >\n", "run echo x >")
+    c.contains(q.command("run mkdir /bin"), r"mkdir: /bin: Exists\n", "run mkdir /bin")
+    # 系统调用的边界情况、并发
+    check_counts(c, q.command("run t_fs"), "t_fs")
+    # 关机之后：重新启动看文件还在，再测掉电
+    q.command("run echo persist across reboots > /keep.txt")
+    q.after_shutdown.append((c, lambda c: check_fs_reboots(q, c)))
 
 
 def case_smp(q, c, mode):
@@ -557,7 +642,7 @@ def case_smp(q, c, mode):
 CORE = ["build.zig", "linker.ld", "src/main.zig", "src/riscv.zig", "src/trap.zig", "src/vm.zig", "src/page.zig",
         "src/dtb.zig", "src/uart.zig", "src/proc.zig", "src/syscall.zig", "src/abi.zig", "src/spinlock.zig", "src/hart.zig", "src/ipi.zig",
         "src/file.zig", "user/start.zig", "user/sys.zig", "user/init.zig", "user/sh.zig", "tools/qemu_test.py"]
-NOT_KERNEL = ["src/tests.zig", "src/btree.zig", "src/ctree.zig", "src/fs.zig"]  # 只在单元测试里用（文件系统还没接进内核）
+NOT_KERNEL = ["src/tests.zig"]  # 只在单元测试里用
 CASES = {
     # 名字: (函数, 覆盖的文件)
     "shell": (case_shell, []),
@@ -577,7 +662,11 @@ CASES = {
     "sbrk": (case_sbrk, ["user/tests/t_sbrk.zig"]),
     "cow": (case_cow, ["user/tests/t_cow.zig"]),
     "ipi": (case_ipi, ["src/sbi.zig", "user/tests/t_ipi.zig"]),
-    "disk": (case_disk, ["src/sleeplock.zig", "src/bio.zig", "src/virtio_disk.zig", "user/tests/t_disk.zig"]),
+    "disk": (case_disk, ["src/sleeplock.zig", "src/bio.zig", "src/virtio_disk.zig", "src/fsys.zig", "src/mkfs.zig",
+                         "user/tests/t_disk.zig"]),
+    "fs": (case_fs, ["src/sleeplock.zig", "src/bio.zig", "src/virtio_disk.zig", "src/btree.zig", "src/ctree.zig",
+                     "src/fs.zig", "src/fsys.zig", "src/mkfs.zig", "user/ls.zig", "user/mkdir.zig", "user/rm.zig",
+                     "user/cat.zig", "user/echo.zig", "user/wc.zig", "user/tests/t_fs.zig"]),
     "smp": (case_smp, ["src/timer.zig", "src/plic.zig", "src/pipe.zig", "user/spin.zig", "user/tests/t_smp.zig"]),
 }
 
@@ -626,7 +715,8 @@ def check_boot(q, c, smp):
         rf"\[ok\] device tree: \d+ MiB RAM at 0x80000000, timebase {TIMEBASE_HZ} Hz",
         r"\[ok\] page allocator: \d+ free pages",
         r"\[ok\] Sv39 paging enabled",
-        r"\[ok\] virtio disk: 1024 blocks of 4 KiB \(4 MiB\), irq 1\n",
+        r"\[ok\] virtio disk: 8192 blocks of 4 KiB \(32 MiB\), irq 1\n",
+        rf"\[ok\] file system: \d+ of {FS_BLOCKS} blocks free, generation \d+\n",
         r"\[ok\] interrupt sources enabled: timer at 100 Hz, keyboard via UART \+ PLIC, IPIs, disk\n",
         rf"\[ok\] {smp} harts? running, booted on hart \d+\n",
     ]:

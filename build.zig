@@ -38,9 +38,10 @@ pub fn build(b: *std.Build) void {
     };
     // init 是内核启动的第一个进程，它再启动 sh（shell），两个都必须有
     const user_programs = [_]UserProgram{
-        .{ .name = "init" },  .{ .name = "sh" },   .{ .name = "hello" },
-        .{ .name = "fault" }, .{ .name = "spin" }, .{ .name = "ticker" },
-        .{ .name = "echo" },  .{ .name = "cat" },  .{ .name = "wc" },
+        .{ .name = "init" },  .{ .name = "sh" },    .{ .name = "hello" },
+        .{ .name = "fault" }, .{ .name = "spin" },  .{ .name = "ticker" },
+        .{ .name = "echo" },  .{ .name = "cat" },   .{ .name = "wc" },
+        .{ .name = "ls" },    .{ .name = "mkdir" }, .{ .name = "rm" },
     };
     const test_programs = [_]UserProgram{
         .{ .name = "t_sys", .dir = "user/tests" },
@@ -60,6 +61,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "t_cow", .dir = "user/tests" },
         .{ .name = "t_ipi", .dir = "user/tests" },
         .{ .name = "t_disk", .dir = "user/tests" },
+        .{ .name = "t_fs", .dir = "user/tests" },
         // 数据段没有任何权限，用来验证 ELF 加载器会拒绝它
         .{ .name = "t_noperm", .dir = "user/tests", .linker_script = "user/tests/noperm.ld" },
     };
@@ -92,6 +94,8 @@ pub fn build(b: *std.Build) void {
     const options = b.addOptions();
     options.addOption([]const []const u8, "user_programs", names);
     kernel.root_module.addOptions("build_options", options);
+    // 选中的程序的 ELF，mkfs 把它们装进磁盘镜像的 /bin
+    var program_bins: std.ArrayListUnmanaged(std.Build.LazyPath) = .empty;
     for (all_programs, 0..) |p, i| {
         const program = b.addExecutable(.{
             .name = p.name,
@@ -118,21 +122,28 @@ pub fn build(b: *std.Build) void {
         unit_tests.root_module.addAnonymousImport(p.name, .{ .root_source_file = program.getEmittedBin() });
         if (i >= programs.len) continue; // 没被选中的测试程序只给单元测试用
         kernel.root_module.addAnonymousImport(p.name, .{ .root_source_file = program.getEmittedBin() });
+        program_bins.append(b.allocator, program.getEmittedBin()) catch @panic("OOM");
         // 另外安装一份到 zig-out/user/，方便用 llvm-readelf 等工具查看（内核用的是上面嵌进去的那份）
         const install = b.addInstallArtifact(program, .{ .dest_dir = .{ .override = .{ .custom = "user" } } });
         b.getInstallStep().dependOn(&install.step);
     }
 
-    // 磁盘镜像：4 MiB，1024 个 4 KiB 的块，内容是固定的图案（第 b 块的第 i 个字节是 (b * 131 + i) % 251），
-    // 回归测试 t_disk 和 qemu_test.py 照着它检查读写。装到 zig-out/disk.img。
-    // 还没有文件系统，以后由 mkfs 生成。
-    const disk_blocks = 1024;
-    const disk_block_size = 4096;
-    const disk_image = b.allocator.alloc(u8, disk_blocks * disk_block_size) catch @panic("OOM");
-    for (disk_image, 0..) |*byte, n| {
-        byte.* = @intCast(((n / disk_block_size) * 131 + n % disk_block_size) % 251);
-    }
-    const disk = b.addWriteFiles().add("disk.img", disk_image);
+    // 磁盘镜像：32 MiB，8192 个 4 KiB 的块。前 7168 块是文件系统，由主机上的 mkfs（src/mkfs.zig，
+    // 和内核用同一份文件系统代码）生成，用户程序装在 /bin 里；后 1024 块是原始区域，填固定的图案
+    // （第 b 块的第 i 个字节是 (b * 131 + i) % 251），回归测试 t_disk 和 qemu_test.py 照着它检查读写。
+    // 装到 zig-out/disk.img。
+    const mkfs = b.addExecutable(.{
+        .name = "mkfs",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/mkfs.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+    const make_disk = b.addRunArtifact(mkfs);
+    const disk = make_disk.addOutputFileArg("disk.img");
+    make_disk.addArgs(&.{ "8192", "7168" });
+    for (program_bins.items) |bin| make_disk.addFileArg(bin);
     b.getInstallStep().dependOn(&b.addInstallFile(disk, "disk.img").step);
 
     // zig build run：用 QEMU 的 virt 机器启动内核。

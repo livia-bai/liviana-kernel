@@ -38,15 +38,21 @@ pub const stdin: Fd = abi.stdin;
 pub const stdout: Fd = abi.stdout;
 pub const stderr: Fd = abi.stderr;
 
-pub const WriteError = error{ BadAddress, BadFd, BrokenPipe, Unexpected };
+/// NotFound：打开着的文件被删掉了（ReadError 也是）
+pub const WriteError = error{ BadAddress, BadFd, BrokenPipe, NoSpace, FileTooBig, IsDir, IoError, NotFound, Unexpected };
 
-/// 写 fd，返回写出的字节数（遇到坏地址时可能比 bytes.len 少）。
+/// 写 fd，返回写出的字节数（串口、管道遇到坏地址时可能比 bytes.len 少；文件要么全写、要么返回错误）。
 pub fn write(fd: Fd, bytes: []const u8) WriteError!usize {
     const ret = syscall(.write, fd, @intFromPtr(bytes.ptr), bytes.len);
     if (abi.errnoOf(ret)) |e| return switch (e) {
         .fault => error.BadAddress,
         .badf => error.BadFd,
         .pipe => error.BrokenPipe,
+        .nospc => error.NoSpace,
+        .fbig => error.FileTooBig,
+        .isdir => error.IsDir,
+        .io => error.IoError,
+        .noent => error.NotFound,
         else => error.Unexpected,
     };
     return ret;
@@ -82,18 +88,114 @@ pub fn sleep(ms: u64) void {
     _ = syscall(.sleep, ms, 0, 0);
 }
 
-pub const ReadError = error{ BadAddress, BadFd, Unexpected };
+pub const ReadError = error{ BadAddress, BadFd, IsDir, IoError, NotFound, Unexpected };
 
-/// 从 fd 读最多 buf.len 个字节，返回读到的字节数，0 表示读到了结尾。没有数据时阻塞。
+/// 从 fd 读最多 buf.len 个字节，返回读到的字节数，0 表示读到了结尾。没有数据时阻塞（串口、管道）。
 /// 从串口读时不回显；单独按 Ctrl-D 读到 0。
 pub fn read(fd: Fd, buf: []u8) ReadError!usize {
     const ret = syscall(.read, fd, @intFromPtr(buf.ptr), buf.len);
     if (abi.errnoOf(ret)) |e| return switch (e) {
         .fault => error.BadAddress,
         .badf => error.BadFd,
+        .isdir => error.IsDir,
+        .io => error.IoError,
+        .noent => error.NotFound,
         else => error.Unexpected,
     };
     return ret;
+}
+
+// ---- 文件系统 ----
+
+pub const FsError = error{
+    NotFound,
+    Exists,
+    NotDir,
+    IsDir,
+    NotEmpty,
+    NameTooLong,
+    /// 名字是空的、"."、".."，或者 open 的 flags 不对
+    InvalidArgument,
+    NoSpace,
+    FileTooBig,
+    /// 磁盘上的数据不对
+    IoError,
+    /// 没有磁盘或者没有文件系统
+    NoDevice,
+    BadAddress,
+    BadFd,
+    TooManyOpenFiles,
+    SystemFdQuotaExceeded,
+    Unexpected,
+};
+
+fn fsResult(ret: usize) FsError!usize {
+    const e = abi.errnoOf(ret) orelse return ret;
+    return switch (e) {
+        .noent => error.NotFound,
+        .exist => error.Exists,
+        .notdir => error.NotDir,
+        .isdir => error.IsDir,
+        .notempty => error.NotEmpty,
+        .nametoolong => error.NameTooLong,
+        .inval => error.InvalidArgument,
+        .nospc => error.NoSpace,
+        .fbig => error.FileTooBig,
+        .io => error.IoError,
+        .nodev => error.NoDevice,
+        .fault => error.BadAddress,
+        .badf => error.BadFd,
+        .mfile => error.TooManyOpenFiles,
+        .nfile => error.SystemFdQuotaExceeded,
+        else => error.Unexpected,
+    };
+}
+
+pub const OpenFlags = struct {
+    read: bool = true,
+    write: bool = false,
+    /// 没有这个文件就建一个空的
+    create: bool = false,
+    /// 截成 0 字节（要能写）
+    truncate: bool = false,
+
+    fn bits(f: OpenFlags) usize {
+        var b: usize = if (f.read and f.write) abi.open_rdwr else if (f.write) abi.open_write else abi.open_read;
+        if (f.create) b |= abi.open_create;
+        if (f.truncate) b |= abi.open_trunc;
+        return b;
+    }
+};
+
+/// 打开文件或目录，返回 fd。
+pub fn open(path: []const u8, flags: OpenFlags) FsError!Fd {
+    return fsResult(syscall(.open, @intFromPtr(path.ptr), path.len, flags.bits()));
+}
+
+/// 建一个空目录。
+pub fn mkdir(path: []const u8) FsError!void {
+    _ = try fsResult(syscall(.mkdir, @intFromPtr(path.ptr), path.len, 0));
+}
+
+/// 删掉一个文件或空目录。
+pub fn unlink(path: []const u8) FsError!void {
+    _ = try fsResult(syscall(.unlink, @intFromPtr(path.ptr), path.len, 0));
+}
+
+/// 换当前目录。
+pub fn chdir(path: []const u8) FsError!void {
+    _ = try fsResult(syscall(.chdir, @intFromPtr(path.ptr), path.len, 0));
+}
+
+pub fn fstat(fd: Fd) FsError!abi.Stat {
+    var st: abi.Stat = undefined;
+    _ = try fsResult(syscall(.fstat, fd, @intFromPtr(&st), 0));
+    return st;
+}
+
+/// 目录 fd 的下一个目录项写进 ent，返回 true；列完了返回 false。
+pub fn readdir(fd: Fd, ent: *abi.Dirent) FsError!bool {
+    return try fsResult(syscall(.readdir, fd, @intFromPtr(ent), 0)) == 1;
 }
 
 pub fn close(fd: Fd) error{ BadFd, Unexpected }!void {

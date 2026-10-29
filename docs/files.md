@@ -1,8 +1,8 @@
-# 文件：fd、串口和管道
+# 文件：fd、串口、管道和文件系统里的文件
 
-涉及文件：`src/file.zig`（文件表、串口的读写）、`src/pipe.zig`（管道）、`src/syscall.zig` 的 `read`、`write`、`close`、`dup`、`pipe`、`src/proc.zig` 的 `Process.files`
+涉及文件：`src/file.zig`（文件表、串口和文件的读写）、`src/pipe.zig`（管道）、`src/syscall.zig` 的 `read`、`write`、`close`、`dup`、`pipe`、`open`、`src/proc.zig` 的 `Process.files`
 
-照 xv6 的 `file.c`、`pipe.c`、`sysfile.c` 写。没有文件系统，所以“文件”只有两种：**串口**和**管道的一端**。用户程序用 fd（一个小整数）指代打开的文件，`read`/`write` 不关心 fd 背后是哪一种。
+照 xv6 的 `file.c`、`pipe.c`、`sysfile.c` 写。“文件”有三种：**串口**、**管道的一端**、**文件系统里的文件或目录**（`open` 打开，[fs.md](fs.md)）。用户程序用 fd（一个小整数）指代打开的文件，`read`/`write` 不关心 fd 背后是哪一种。
 
 ## 三层结构
 
@@ -23,36 +23,41 @@ files[1] ──────────┴──────────↗
 - **文件表**（`file.table: [32]File`）：全局，每个 `File` 带引用数 `ref`，`ref = 0` 表示空槽位。`fork` 复制 fd 表、`dup` 复制 fd，都只是让两个 fd 指向同一个 `File`（`ref` 加 1）。
 - **底下的东西**：串口不需要状态；管道是一个 `Pipe`，读端和写端是两个不同的 `File`，指向同一个 `Pipe`。
 
-为什么要中间这一层，而不是 fd 表直接指向管道：fd 表里的每一项要知道自己是读端还是写端；同一个“打开”被 `fork`、`dup` 共享时，要知道什么时候最后一个引用没了，才能真正关掉（管道的一端关了，另一端才会读到结尾或写失败）。xv6 的 `struct file` 还记着读写位置（`off`），这里没有文件系统，用不着。
+为什么要中间这一层，而不是 fd 表直接指向管道：fd 表里的每一项要知道自己是读端还是写端；同一个“打开”被 `fork`、`dup` 共享时，要知道什么时候最后一个引用没了，才能真正关掉（管道的一端关了，另一端才会读到结尾或写失败）。文件系统里的文件还要记读写位置（`off`）：`fork`、`dup` 出来的 fd 共用一个位置（父进程写一段、子进程接着写一段，不会互相覆盖），各自 `open` 的各有各的，和 Unix 一样。
 
 ## 文件表
 
 ```zig
 pub const File = struct {
     ref: u32 = 0,
-    kind: Kind = .none,          // .none（空槽位）、.console、.pipe
+    kind: Kind = .none,          // .none（空槽位）、.console、.pipe、.inode
     readable: bool = false,
     writable: bool = false,
     pipe: *pipe.Pipe = undefined,
+    ino: u64 = 0,                // .inode：文件系统里的 inode 号
+    off: u64 = 0,                // .inode：下一次读写的位置（fsys.lock 保护）
 };
 
 pub fn openConsole() error{TooManyFiles}!*File
 pub fn openPipe() error{ TooManyFiles, OutOfMemory }![2]*File   // { 读端, 写端 }
+pub fn openInode(ino: u64, readable: bool, writable: bool) error{TooManyFiles}!*File
 pub fn dup(f: *File) *File
 pub fn close(f: *File) void
 pub fn read(f: *File, space: *vm.PageTable, ptr: usize, len: usize) Error!usize
 pub fn write(f: *File, space: *vm.PageTable, ptr: usize, len: usize) Error!usize
 ```
 
-- 文件表由 `file.lock` 保护：分配槽位（`alloc`）、改引用数（`dup`、`close`）都要拿它。`File` 的其他字段分配出来之后就不变了，读写时不用拿锁。
+- 文件表由 `file.lock` 保护：分配槽位（`alloc`）、改引用数（`dup`、`close`）都要拿它。`File` 的其他字段分配出来之后就不变了，读写时不用拿锁；只有 `off` 会变，由文件系统的锁 `fsys.lock` 保护（读写文件的整个过程都拿着它）。
 - **`close` 先放开文件表的锁，再去关管道**：管道有自己的锁，这样两把锁不会嵌套，就不用规定加锁顺序。最后一个引用关掉时，先把槽位清空（别的进程马上就能用），再关底下的东西。
 - `openPipe` 先分配两个 `File`，再分配 `Pipe`；任何一步失败，`errdefer` 把已经分配的还回去。
-- `read`/`write` 先检查方向（`readable`/`writable`，不对是 `NotReadable`/`NotWritable`，系统调用返回 `-EBADF`），再按 `kind` 分给串口或管道。
+- `read`/`write` 先检查方向（`readable`/`writable`，不对是 `NotReadable`/`NotWritable`，系统调用返回 `-EBADF`），再按 `kind` 分给串口、管道或文件系统。`Error` 包含文件系统的错误（`fs.Error`），系统调用用 `fsys.errno` 换成错误码。
+- **文件的读写**（`inodeRead`、`inodeWrite`）：拿 `fsys.lock`，从 `off` 开始 `fs.read` 或 `fs.run(Fs.write, ...)`，数据直接在缓冲区和用户内存之间复制；成功了 `off` 加上读写的字节数。一次 `write` 是一个事务：中途用户内存读不出来、磁盘满了，什么都不写、`off` 不动（串口、管道是写出多少算多少）。读到文件末尾返回 0。读写目录是 `IsDir`（列目录用 `readdir` 系统调用）。打开着的文件被别人删了，之后读写是 `NotFound`（[fs.md](fs.md#目录)）。
 
 **谁打开、谁关掉**：
 
 - init 启动时（`proc.userinit`）打开一次串口，作为 0、1、2 号 fd（同一个 `File`，`ref = 3`）。之后所有进程都是 `fork` 出来的，继承这三个 fd，所以串口的 `File` 只有一个，`ref` 随进程数变化。
 - `pipe` 系统调用创建管道。
+- `open` 系统调用打开文件系统里的文件、目录（`openInode`），关掉不用做什么：内容都已经在磁盘上了（每个 `write` 提交一次）。
 - 进程结束时（`proc.finish`）关掉 fd 表里所有的文件（[process.md](process.md#exit变成-zombie)）。`exec` 不碰 fd 表：shell 在子进程里先把标准输入输出换成管道，再 `exec`，新程序直接用 0、1 号 fd（[shell.md](shell.md#管道)）。
 
 单元测试（`file.zig` 末尾）检查：`dup` 之后关一次，管道的写端还开着，再关一次才关上；表只剩一个空位时 `openPipe` 失败，不漏槽位也不漏页。
@@ -153,7 +158,7 @@ pub fn close(p: *Pipe, writable: bool) void {
 
 ## 限制和以后可以做的
 
-- 没有文件系统，没有 `open`：文件只有串口和管道。
+- 没有 `lseek`、`pread`：文件的读写位置只能从 0 往后挪。
 - 没有 `dup2`，重定向靠“`close` 再 `dup`，拿到编号最小的空闲 fd”。
 - 没有非阻塞读写，没有 `poll`/`select`。
 - 没有信号：写一个读端已经关了的管道只返回 `-EPIPE`，程序自己决定怎么办。

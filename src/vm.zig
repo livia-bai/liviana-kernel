@@ -186,7 +186,7 @@ fn walk(root: *PageTable, va: usize, level: u2) MapError!*Pte {
 /// 新建一个用户地址空间：复制内核的根页表（第 1 项在内核页表里是空的，留给用户程序）。
 pub fn createUserSpace() error{OutOfMemory}!*PageTable {
     const root: *PageTable = @ptrCast(try page.alloc());
-    root.* = kernel_root.*;
+    @memcpy(root, kernel_root); // 不写成 root.* = kernel_root.*：Debug 模式下会先在栈上复制一份 4 KiB
     return root;
 }
 

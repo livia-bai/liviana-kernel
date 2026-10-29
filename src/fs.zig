@@ -190,7 +190,7 @@ pub const Fs = struct {
             if (f.key.objectid != dir or f.key.type != type_dir or f.key.offset >> 32 != h) break;
             if (f.size < @sizeOf(DirHeader)) return error.Corrupt;
             const head = std.mem.bytesToValue(DirHeader, buf[0..@sizeOf(DirHeader)]);
-            if (@sizeOf(DirHeader) + head.name_len != f.size) return error.Corrupt;
+            if (@sizeOf(DirHeader) + @as(usize, head.name_len) != f.size) return error.Corrupt; // name_len 是 u8，先扩宽再加
             if (std.mem.eql(u8, buf[@sizeOf(DirHeader)..f.size], name)) return .{ .{ .ino = head.ino, .kind = head.kind, .offset = f.key.offset }, 0 };
             next_seq = (f.key.offset & 0xffff_ffff) + 1;
             k = f.key.successor() orelse break;
@@ -289,7 +289,7 @@ pub const Fs = struct {
         if (f.key.objectid != dir or f.key.type != type_dir) return null;
         if (f.size < @sizeOf(DirHeader)) return error.Corrupt;
         const head = std.mem.bytesToValue(DirHeader, buf[0..@sizeOf(DirHeader)]);
-        if (@sizeOf(DirHeader) + head.name_len != f.size) return error.Corrupt;
+        if (@sizeOf(DirHeader) + @as(usize, head.name_len) != f.size) return error.Corrupt; // name_len 是 u8，先扩宽再加
         @memcpy(name[0..head.name_len], buf[@sizeOf(DirHeader)..f.size]);
         return .{ .ino = head.ino, .kind = head.kind, .name_len = head.name_len, .next = f.key.offset + 1 };
     }
@@ -438,7 +438,7 @@ pub const Fs = struct {
             if (old) |e| {
                 const ob = try fs.readData(e);
                 defer bio.release(ob);
-                b.data.* = ob.data.*;
+                @memcpy(b.data, ob.data);
             } else {
                 @memset(b.data, 0);
             }
@@ -580,7 +580,17 @@ test "目录：创建、查找、路径（. ..、多余的 /）、各种错误" 
     }
     const long: [max_name + 1]u8 = @splat('x');
     try std.testing.expectError(error.NameTooLong, fs.run(Fs.create, .{ root_ino, &long, Kind.file }));
-    _ = try fs.run(Fs.create, .{ root_ino, long[0..max_name], Kind.file });
+    // 最长的名字（255 字节）：找得到、列得出来、删得掉（目录项的长度不能按 u8 算）
+    const longest = try fs.run(Fs.create, .{ root_ino, long[0..max_name], Kind.file });
+    try std.testing.expectEqual(longest, try fs.resolve(root_ino, long[0..max_name]));
+    var listed = false;
+    var name: [max_name]u8 = undefined;
+    var cookie: u64 = 0;
+    while (try fs.readdir(root_ino, cookie, &name)) |d| : (cookie = d.next) {
+        if (d.ino == longest) listed = d.name_len == max_name and std.mem.eql(u8, name[0..max_name], long[0..max_name]);
+    }
+    try std.testing.expect(listed);
+    try fs.run(Fs.unlink, .{ root_ino, long[0..max_name] });
     try std.testing.expectError(error.IsDir, fs.read(a, 0, 1, SliceOut{ .buf = &.{} }));
 
     // 删除：目录不空不行；删了之后找不到；inode 号不重用

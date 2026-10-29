@@ -60,6 +60,7 @@ pub const Process = struct {
     heap_start: usize = 0,             // 堆的起点（最后一个段之后的页边界）
     brk: usize = 0,                    // 堆的末尾，sbrk 调整
     sleeplocks: u32 = 0,               // 拿着几把睡眠锁，回到 U 模式时必须是 0
+    cwd: u64 = fs.root_ino,            // 当前目录的 inode 号（chdir），fork 继承，exec 不变
 };
 
 pub var table: [max_procs]Process = @splat(.{});
@@ -92,10 +93,10 @@ pub fn current() ?*Process              // cpus[hart.id()].proc
 
 所有的状态变化都拿着这个进程的锁。
 
-- **每个进程一块 16 KiB 的内核栈**，静态分配在 `.bss` 里（16 块共 256 KiB）。不从页分配器要：它一次只给一页，给不出连续的 16 KiB。实测 Debug 模式下跑完全部 QEMU 测试（单核和 4 核），最深用了 8216 字节，safe 模式下 3312 字节，small 模式下 2903 字节。测法：`.bss` 启动时清零，`shutdown` 时从每块栈的底部找第一个不为 0 的字节，取最大值（临时加的代码，没有留在仓库里）。内核栈两侧没有保护页：内核内存是用大页恒等映射的，要在中间挖出不映射的页得拆大页，现在没做。
+- **每个进程一块 16 KiB 的内核栈**，静态分配在 `.bss` 里（16 块共 256 KiB）。不从页分配器要：它一次只给一页，给不出连续的 16 KiB。实测 Debug 模式下跑完全部 QEMU 测试（单核和 4 核，包括文件系统的 `t_fs` 和掉电后重新启动），最深用了 9944 字节，safe 模式下 5312 字节，small 模式下 5144 字节，最深的是文件系统的系统调用（B 树的操作，[fs.md](fs.md#接进内核fsyszig)）。测法：`.bss` 启动时清零，`shutdown` 时从每块栈的底部找第一个不为 0 的字节，取最大值（临时加的代码，没有留在仓库里）。内核栈两侧没有保护页：内核内存是用大页恒等映射的，要在中间挖出不映射的页得拆大页，现在没做。
 - init 和 shell 一直占着两个槽位，所以同时最多运行 14 个别的程序。
 - `current()` 返回当前 hart 上正在运行的进程：`cpus[hart.id()].proc`，只在 `scheduler` 切到进程前设置、切回来后清回 `null`。系统调用和陷阱处理程序用 `current().?` 取当前进程，Debug/safe 模式下没有进程时会 panic。它不用加锁：只有这个 hart 自己读写自己那一项，而且内核关着中断运行，读到之后到开中断之前，这个 hart 不会换进程（xv6 的 `myproc` 为此要 `push_off`）。
-- 哪些字段由谁保护见[锁](#锁)。`space`、`context`、`files`、`heap_start`、`brk` 不用加锁：只有进程自己会读写它们（`close`/`dup`/`pipe`/`sbrk` 系统调用、`fork` 时复制给子进程、结束时关掉文件），没有线程，别的进程碰不到；父进程回收 zombie 时它已经不会再运行了。
+- 哪些字段由谁保护见[锁](#锁)。`space`、`context`、`files`、`heap_start`、`brk`、`cwd` 不用加锁：只有进程自己会读写它们（`close`/`dup`/`pipe`/`sbrk` 系统调用、`fork` 时复制给子进程、结束时关掉文件），没有线程，别的进程碰不到；父进程回收 zombie 时它已经不会再运行了。
 
 ## 用户地址空间
 
@@ -204,13 +205,15 @@ scheduler → switchContext ─ret→ forkret → forkretC（放开进程锁、c
   }
 
   fn forkretC() callconv(.c) void {
-      current().?.lock.release();
+      const p = current().?;
+      p.lock.release();
+      if (p == init_proc) fsys.init();   // 第一个进程：挂载文件系统
       checkKilled();
       assertNoLocksHeld();   // 没拿着自旋锁，也没拿着睡眠锁
   }
   ```
 
-  `forkretC` 先放开进程锁：调度器是拿着它切过来的，平时由 `sched` 的调用方在切回来之后放开，新进程没有这个调用方，就在这里放（xv6 的 `forkret` 第一句也是 `release(&myproc()->lock)`）。再调用 `checkKilled`（还没运行就被 kill 了的话，在这里结束，见[结束进程](#结束进程)），然后跳进 `trapExit`。`sp` 一直指向 `TrapFrame`（`forkretC` 是普通函数，只用 `sp` 以下的栈），于是 `trapExit` 按它恢复寄存器、`sret` 进入 U 模式。
+  `forkretC` 先放开进程锁：调度器是拿着它切过来的，平时由 `sched` 的调用方在切回来之后放开，新进程没有这个调用方，就在这里放（xv6 的 `forkret` 第一句也是 `release(&myproc()->lock)`）。再调用 `checkKilled`（还没运行就被 kill 了的话，在这里结束，见[结束进程](#结束进程)），然后跳进 `trapExit`。第一个进程（init）在这里挂载文件系统（`fsys.init`，[fs.md](fs.md#接进内核fsyszig)）：挂载要读盘、睡着等磁盘中断，`kmain` 不是进程，做不了（xv6 的 `forkret` 里调用 `fsinit` 也是这个原因）；之后的进程都是 init 的子孙，在它之后运行，用的时候已经挂好了。`sp` 一直指向 `TrapFrame`（`forkretC` 是普通函数，只用 `sp` 以下的栈），于是 `trapExit` 按它恢复寄存器、`sret` 进入 U 模式。
 
 ### userinit
 
@@ -694,7 +697,7 @@ Ctrl-C 结束的是**前台进程和它的所有子孙**：shell 用 `fork` 启�
 - 进程之间没有优先级，也不考虑在哪个 hart 上运行过（没有亲和性）。
 - 进程表固定 16 项，内核栈和启动栈是静态的，两侧没有保护页：溢出时会悄悄踩坏相邻的数据，所以栈的大小按实测用量留了余量。
 - `fork` 写时复制，但页表还是整个复制的；内存用完时写共用的页只能结束进程（没有换页、没有 OOM killer 挑别的进程）。
-- 没有文件系统，`exec` 只能运行嵌在内核里的程序，打开的文件只有串口和管道。
+- `exec` 只能运行嵌在内核里的程序，还不能从文件系统加载（`/bin` 里已经有它们了）。
 - 只有一个前台进程，没有进程组和信号：Ctrl-C 杀前台进程和它的子孙；前台进程的子孙被交给 init 之后（父进程先结束了）就不算了。
 - 只有 `sbrk`，没有 `mmap`；用户栈固定 16 KiB，不能增长。
 
@@ -716,7 +719,7 @@ Ctrl-C 结束的是**前台进程和它的所有子孙**：shell 用 `fork` 启�
 | `Sleeplock.lk` | 一把睡眠锁的 `locked`、`holder`；等锁的进程拿着它睡下 | [disk.md](disk.md#睡眠锁sleeplockzig) |
 | `uart.tx_lock` | 串口输出：一次 `print`、一次 `write` 系统调用整段输出，不和别的 hart 的输出交错 | [devices.md](devices.md#串口uartzig) |
 
-不用锁的：`proc.next_pid`、`proc.foreground` 是原子变量；`init_proc` 只在启动时写一次；`cpus[i]`、`spinlock` 的 `held[i]`、`timer.deadline[i]` 只有 hart i 自己读写；进程的 `space`、`context`、`files`、`heap_start`、`brk` 只有进程自己读写（见[进程表](#进程表)）；内核页表启动后不再改。
+不用锁的：`proc.next_pid`、`proc.foreground` 是原子变量；`init_proc` 只在启动时写一次；`cpus[i]`、`spinlock` 的 `held[i]`、`timer.deadline[i]` 只有 hart i 自己读写；进程的 `space`、`context`、`files`、`heap_start`、`brk`、`cwd` 只有进程自己读写（见[进程表](#进程表)）；内核页表启动后不再改。
 
 规矩（`spinlock.zig` 的开头也写了）：
 
@@ -729,7 +732,7 @@ Ctrl-C 结束的是**前台进程和它的所有子孙**：shell 用 `fork` 启�
   timer.lock、Pipe.lock、uart.rx_lock、virtio_disk.lock、bio.lock、Sleeplock.lk → Process.lock
   ```
 
-  另外有**睡眠锁**（[disk.md](disk.md#睡眠锁sleeplockzig)，现在只有缓冲区缓存的每一块）：拿着它可以睡觉，所以拿它之前不能拿着任何自旋锁；拿着它可以再去拿自旋锁（读写磁盘时拿 `virtio_disk.lock`）。回到 U 模式时也不能拿着睡眠锁（`proc.assertNoLocksHeld`）。
+  另外有**睡眠锁**（[disk.md](disk.md#睡眠锁sleeplockzig)：文件系统的 `fsys.lock` 和缓冲区缓存的每一块）：拿着它可以睡觉，所以拿它之前不能拿着任何自旋锁；拿着它可以再去拿自旋锁（读写磁盘时拿 `virtio_disk.lock`）。回到 U 模式时也不能拿着睡眠锁（`proc.assertNoLocksHeld`）。睡眠锁之间的顺序是 `fsys.lock` → 缓冲区的睡眠锁（[fs.md](fs.md#接进内核fsyszig)）。文件系统会同时拿着好几个缓冲区，但同一时刻只有一个进程在用文件系统，别的拿缓冲区的只有 `readblock`、`writeblock`（一次一个，原始区域的块和文件系统的不重叠），所以不会互相等。
 
   - `wait_lock` 在进程锁前面：`fork`、`finish`、`wait`、`interruptForeground`、`info` 都是先拿 `wait_lock` 再拿进程锁。
   - 等待条件的锁在进程锁前面：`sleep` 拿着 `lock` 去拿进程锁；改条件的一方拿着 `lock` 调用 `wakeup`、`isKilled`，它们拿进程锁。`wait_lock` 也是这种用法。
