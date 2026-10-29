@@ -12,4 +12,6 @@ test {
     _ = @import("pipe.zig");
     _ = @import("file.zig");
     _ = @import("ipi.zig");
+    _ = @import("sleeplock.zig");
+    _ = @import("bio.zig");
 }

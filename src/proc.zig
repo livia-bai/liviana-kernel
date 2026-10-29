@@ -27,7 +27,7 @@
 //!   进程拿着它切回调度器，所以“改状态 + 切换”在别的 hart 看来是一步完成的。
 //! - wait_lock 保护所有进程的 parent，wait 拿着它睡在自己身上。加锁顺序：wait_lock 在前，进程锁在后；
 //!   别的锁（管道、串口、ticks）也都在进程锁前面拿，进程锁之后只会再拿页分配器、文件表这种不再往下拿锁的。
-//! - 其他字段（space、context、files、heap_start、brk）只有进程自己会读写（没有线程），不用加锁；
+//! - 其他字段（space、context、files、heap_start、brk、sleeplocks）只有进程自己会读写（没有线程），不用加锁；
 //!   父进程 wait 回收 zombie 时它已经不再运行了。
 
 const std = @import("std");
@@ -107,6 +107,8 @@ pub const Process = struct {
     /// 堆的起点（程序最后一个段之后的页边界）和当前的末尾，见 sbrk
     heap_start: usize = 0,
     brk: usize = 0,
+    /// 拿着几把睡眠锁（sleeplock.zig）。只有自己改；回到 U 模式时必须是 0
+    sleeplocks: u32 = 0,
 };
 
 /// 进程表。槽位 i 的进程用 kernel_stacks[i] 作内核栈。
@@ -370,7 +372,21 @@ fn forkret() callconv(.naked) noreturn {
 fn forkretC() callconv(.c) void {
     current().?.lock.release();
     checkKilled();
+    assertNoLocksHeld();
+}
+
+/// 回到 U 模式之前调用：这时不能拿着任何自旋锁，当前进程也不能拿着睡眠锁。
+pub fn assertNoLocksHeld() void {
     spinlock.assertNoneHeld();
+    const n = current().?.sleeplocks;
+    if (n != 0) std.debug.panic("{d} sleeplock(s) still held", .{n});
+}
+
+/// 当前进程拿着的睡眠锁多了（delta = 1）或者少了（-1）一把。由 sleeplock.zig 调用；
+/// 单元测试里没有当前进程，什么也不做。
+pub fn countSleeplock(delta: i2) void {
+    const p = current() orelse return;
+    if (delta > 0) p.sleeplocks += 1 else p.sleeplocks -= 1;
 }
 
 /// 调度器（对应 xv6 的 scheduler()）。每个 hart 初始化完之后调用，在这个 hart 的启动栈上永远循环：

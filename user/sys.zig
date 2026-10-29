@@ -144,6 +144,35 @@ pub fn sbrk(increment: isize) SbrkError!usize {
     return ret;
 }
 
+/// 磁盘块的大小。
+pub const block_size = abi.block_size;
+
+/// 磁盘有多少块，没有磁盘时是 0。
+pub fn blockCount() u64 {
+    return syscall(.blockcount, 0, 0, 0);
+}
+
+pub const BlockError = error{ NoDevice, OutOfRange, BadAddress, Unexpected };
+
+fn blockError(ret: usize) BlockError!void {
+    if (abi.errnoOf(ret)) |e| return switch (e) {
+        .nodev => error.NoDevice,
+        .inval => error.OutOfRange,
+        .fault => error.BadAddress,
+        else => error.Unexpected,
+    };
+}
+
+/// 把磁盘的第 n 块读进 buf。
+pub fn readBlock(n: u64, buf: *[block_size]u8) BlockError!void {
+    return blockError(syscall(.readblock, n, @intFromPtr(buf), 0));
+}
+
+/// 把 buf 写到磁盘的第 n 块，写完才返回。
+pub fn writeBlock(n: u64, buf: *const [block_size]u8) BlockError!void {
+    return blockError(syscall(.writeblock, n, @intFromPtr(buf), 0));
+}
+
 pub const ForkError = error{ TooManyProcesses, OutOfMemory, Unexpected };
 
 /// 复制当前进程。父进程得到子进程的 pid，子进程得到 0。

@@ -15,6 +15,7 @@
 import argparse
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -50,14 +51,20 @@ class Failure(Exception):
 class Qemu:
     """启动 QEMU，后台线程持续读取串口输出；按提示符一条一条地发命令。"""
 
-    def __init__(self, kernel, smp):
+    def __init__(self, kernel, smp, disk):
+        # 磁盘：virtio 块设备，现代（version 2）的 virtio-mmio 接口，和 build.zig 的 zig build run 一样，
+        # 只是不加 snapshot=on：退出之后要检查写进磁盘镜像的内容
+        drive = ["-global", "virtio-mmio.force-legacy=false", "-drive", f"if=none,format=raw,id=disk,file={disk}",
+                 "-device", "virtio-blk-device,drive=disk,bus=virtio-mmio-bus.0"]
         self.proc = subprocess.Popen(
-            QEMU + ["-smp", str(smp), "-kernel", kernel],
+            QEMU + ["-smp", str(smp), "-kernel", kernel] + drive,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
         )
         self.smp = smp
+        self.disk = disk
+        self.after_shutdown = []  # [(Checks, 函数)]：QEMU 退出之后再做的检查（比如读磁盘镜像）
         self.raw = bytearray()
         self.cond = threading.Condition()
         self.reader = threading.Thread(target=self._read, daemon=True)
@@ -487,6 +494,43 @@ def case_ipi(q, c, mode):
     exited(c, out, "t_ipi", 0)
 
 
+# build.zig 生成的磁盘镜像和 t_disk 改写的块（两边的公式要一致）
+DISK_BLOCKS = 1024
+BLOCK_SIZE = 4096
+_PERIOD = bytes(i % 251 for i in range(BLOCK_SIZE + 251))
+
+
+def disk_original(b):
+    """镜像里第 b 块的内容：第 i 个字节是 (b * 131 + i) % 251。按 251 循环，所以是一段固定序列的切片。"""
+    start = b * 131 % 251
+    return _PERIOD[start:start + BLOCK_SIZE]
+
+
+def disk_expected(b):
+    """t_disk 跑过之后第 b 块应该是什么。"""
+    if b == 0 or b == DISK_BLOCKS - 1 or 100 <= b < 140:
+        return bytes(255 - x for x in disk_original(b))
+    if 200 <= b < 500:
+        k = (b - 200) // 50
+        return bytes((b * 7 + i * 3 + k * 29 + 1) & 0xFF for i in range(BLOCK_SIZE))
+    return disk_original(b)
+
+
+def check_disk_image(q, c):
+    with open(q.disk, "rb") as f:
+        image = f.read()
+    c.expect(len(image) == DISK_BLOCKS * BLOCK_SIZE, f"disk image: {len(image)} bytes")
+    bad = [b for b in range(DISK_BLOCKS) if image[b * BLOCK_SIZE:(b + 1) * BLOCK_SIZE] != disk_expected(b)]
+    c.expect(not bad, f"disk image after shutdown: {len(bad)} blocks differ from what t_disk wrote, first {bad[:8]}")
+
+
+def case_disk(q, c, mode):
+    # t_disk 自己检查读、写、坏参数、并发和写时复制；QEMU 退出之后再读镜像文件，确认写的块真的到了磁盘上
+    c.contains(q.command("disk"), r"1024 blocks of 4 KiB \(4 MiB\)\n", "disk")
+    check_counts(c, q.command("run t_disk"), "t_disk")
+    q.after_shutdown.append((c, lambda c: check_disk_image(q, c)))
+
+
 def case_smp(q, c, mode):
     # 几个进程同时 fork/exit/wait、写同一个管道、sbrk、留下孤儿，再杀掉在别的 hart 上死循环的进程
     check_counts(c, q.command("run t_smp"), "t_smp")
@@ -533,6 +577,7 @@ CASES = {
     "sbrk": (case_sbrk, ["user/tests/t_sbrk.zig"]),
     "cow": (case_cow, ["user/tests/t_cow.zig"]),
     "ipi": (case_ipi, ["src/sbi.zig", "user/tests/t_ipi.zig"]),
+    "disk": (case_disk, ["src/sleeplock.zig", "src/bio.zig", "src/virtio_disk.zig", "user/tests/t_disk.zig"]),
     "smp": (case_smp, ["src/timer.zig", "src/plic.zig", "src/pipe.zig", "user/spin.zig", "user/tests/t_smp.zig"]),
 }
 
@@ -581,18 +626,19 @@ def check_boot(q, c, smp):
         rf"\[ok\] device tree: \d+ MiB RAM at 0x80000000, timebase {TIMEBASE_HZ} Hz",
         r"\[ok\] page allocator: \d+ free pages",
         r"\[ok\] Sv39 paging enabled",
-        r"\[ok\] interrupt sources enabled: timer at 100 Hz, keyboard via UART \+ PLIC, IPIs\n",
+        r"\[ok\] virtio disk: 1024 blocks of 4 KiB \(4 MiB\), irq 1\n",
+        r"\[ok\] interrupt sources enabled: timer at 100 Hz, keyboard via UART \+ PLIC, IPIs, disk\n",
         rf"\[ok\] {smp} harts? running, booted on hart \d+\n",
     ]:
         c.contains(text, pattern, "boot log")
 
 
-def run_session(kernel, log_path, names, mode, smp):
+def run_session(kernel, disk, log_path, names, mode, smp):
     """启动一次 QEMU，依次运行 names 里的用例。返回 [(名字, Checks)]，第一项是启动和收尾的检查。"""
     session = Checks()
     results = [("boot", session)]
     current = session  # 出错时，错误记在正在跑的那一项上
-    q = Qemu(kernel, smp)
+    q = Qemu(kernel, smp, disk)
     try:
         check_boot(q, session, smp)
         before = free_pages(q.command("mem"))
@@ -606,6 +652,8 @@ def run_session(kernel, log_path, names, mode, smp):
         q.send("shutdown\r")
         code = q.finish(COMMAND_TIMEOUT)
         session.expect(code == 0, f"shutdown: QEMU exit code {code}, expected 0")
+        for c, check in q.after_shutdown:
+            check(c)
     except Failure as e:
         current.failures.append(str(e))  # 之后的用例没有运行
     finally:
@@ -628,7 +676,10 @@ def run_mode(mode, names, smps):
     results = []
     for smp in smps:
         log = os.path.join(prefix, f"serial-smp{smp}.log")
-        results += [(smp, n, c, None, log) for n, c in run_session(kernel, log, names, mode, smp)]
+        # 每次启动用一份新的磁盘镜像（测试会改写它）
+        disk = os.path.join(prefix, f"disk-smp{smp}.img")
+        shutil.copyfile(os.path.join(prefix, "disk.img"), disk)
+        results += [(smp, n, c, None, log) for n, c in run_session(kernel, disk, log, names, mode, smp)]
     return results
 
 

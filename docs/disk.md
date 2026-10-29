@@ -1,0 +1,228 @@
+# 磁盘：virtio 块设备、睡眠锁、缓冲区缓存
+
+涉及文件：`src/virtio_disk.zig`（驱动）、`src/sleeplock.zig`（睡眠锁）、`src/bio.zig`（缓冲区缓存）；调用方：`src/main.zig`（初始化）、`src/trap.zig`（中断）、`src/syscall.zig`（`blockcount`、`readblock`、`writeblock`）
+
+内核有了一块磁盘：QEMU 给 `virt` 机器接一个 virtio 块设备，内核按 4 KiB 一块读写它，中间隔着一层缓冲区缓存。这三部分都照 xv6 的 `virtio_disk.c`、`sleeplock.c`、`bio.c` 写。现在还没有文件系统，用户程序通过三个系统调用直接读写块（像读写 Linux 的 `/dev/vda`）；以后的文件系统也建在缓冲区缓存上。
+
+```
+系统调用 readblock / writeblock            （以后：文件系统）
+        │
+bio.zig：缓冲区缓存（32 块，LRU，每块一把睡眠锁）
+        │  Device.transfer(块号, 数据, 读/写)
+virtio_disk.zig：组请求、交给设备、睡着等中断
+        │  DMA、中断（PLIC 1 号源）
+QEMU 的 virtio-blk 设备 → 磁盘镜像文件
+```
+
+## QEMU 的磁盘
+
+```sh
+-global virtio-mmio.force-legacy=false
+-drive if=none,format=raw,id=disk,file=<镜像>[,snapshot=on]
+-device virtio-blk-device,drive=disk,bus=virtio-mmio-bus.0
+```
+
+- `virt` 机器有 8 个 virtio-mmio 槽位：`0x1000_1000` 起，每个 `0x1000`，第 i 个的中断是 PLIC 的 i + 1 号源（设备树里的 `virtio_mmio@10001000` 等节点，`interrupts = <1>`…`<8>`）。`bus=virtio-mmio-bus.0` 把磁盘接在第 0 个槽位，所以实际用的是 `0x1000_1000`、1 号中断。驱动不假定槽位，启动时逐个找。
+- **`force-legacy=false`**：QEMU 默认给 virtio-mmio 设备旧版接口（version 1，要求整个队列在一块按页对齐的内存里，用 `QueuePFN` 指定），驱动只支持现代接口（version 2，三部分各自给地址）。没加这个参数时内核打印 `[warn] virtio disk uses the legacy interface; run QEMU with -global virtio-mmio.force-legacy=false`，当作没有磁盘。
+- **磁盘镜像**由 `build.zig` 生成：4 MiB（1024 块），第 b 块的第 i 个字节是 `(b * 131 + i) % 251`，回归测试照着它检查读到的内容（[testing.md](testing.md#回归测试程序)）。装到 `zig-out/disk.img`。`zig build run` 用 `snapshot=on`：写只进 QEMU 的临时覆盖层，退出就丢，镜像不变；`qemu_test.py` 每次启动拷一份新的、不加 `snapshot`，退出之后读镜像文件检查写进去的内容（[build.md](build.md#磁盘镜像)）。
+- 没有接磁盘时打印 `[warn] no virtio disk`，`blockcount` 返回 0，`readblock`、`writeblock` 返回 `-ENODEV`，别的照常。
+
+启动日志：
+
+```
+[ok] virtio disk: 1024 blocks of 4 KiB (4 MiB), irq 1
+[ok] interrupt sources enabled: timer at 100 Hz, keyboard via UART + PLIC, IPIs, disk
+```
+
+## virtio 块设备驱动（`virtio_disk.zig`）
+
+virtio 是虚拟机里的“标准设备”：设备和驱动通过一组 MMIO 寄存器协商、配置，真正的请求放在内存里的**virtqueue**（三个数组）里，设备用 DMA 直接读写内存，做完了发中断。规范是 *Virtual I/O Device (VIRTIO) Version 1.2*：2.7 节（split virtqueue）、4.2 节（virtio-mmio）、5.2 节（块设备）。
+
+### 寄存器
+
+每个槽位 `0x1000` 字节，用到的（都是 32 位，`*volatile u32`）：
+
+| 偏移 | 名字 | 用途 |
+| --- | --- | --- |
+| `0x000` | MagicValue | `0x74726976`（小端的 `"virt"`） |
+| `0x004` | Version | 2 = 现代接口，1 = 旧版 |
+| `0x008` | DeviceID | 2 = 块设备，0 = 这个槽位没接设备 |
+| `0x010` / `0x014` | DeviceFeatures / DeviceFeaturesSel | 设备支持的特性，64 位分两组读，Sel 选第几组 |
+| `0x020` / `0x024` | DriverFeatures / DriverFeaturesSel | 驱动接受的特性 |
+| `0x030`、`0x034`、`0x038`、`0x044` | QueueSel、QueueNumMax、QueueNum、QueueReady | 选队列、队列最长多少、实际用多长、启用 |
+| `0x050` | QueueNotify | 写队列号：告诉设备有新请求 |
+| `0x060` / `0x064` | InterruptStatus / InterruptACK | 为什么发中断（第 0 位：有请求做完了）、确认 |
+| `0x070` | Status | 初始化进行到哪一步 |
+| `0x080..0x0a4` | QueueDesc/Driver/Device Low/High | 描述符表、avail 环、used 环的物理地址（各 64 位） |
+| `0x0fc` | ConfigGeneration | 配置空间的版本号，读多个字的配置时用来检测有没有读到一半变了 |
+| `0x100` | 块设备的配置空间 | 第一项 `capacity`：容量，512 字节的扇区数，64 位 |
+
+### 初始化（`init`）
+
+kmain 在开分页之后（要访问 MMIO）、`plic.init` 之前（PLIC 要知道中断号）调用。逐个槽位看 MagicValue 和 DeviceID，找到块设备后按规范 3.1.1 的顺序：
+
+1. Status 写 0（复位），置上 ACKNOWLEDGE（看到设备了）、DRIVER（知道怎么驱动它）。
+2. **协商特性**：只要 `VIRTIO_F_VERSION_1`（第 32 位，在第 1 组的第 0 位，现代接口必须有），别的一个都不要，第 0 组写 0。所以没有 event idx、间接描述符、多队列、只读盘这些。设备不提供 VERSION_1 就 panic。然后置上 FEATURES_OK，再读回来确认设备接受了。
+3. **队列 0**：QueueSel = 0，确认它还没在用（QueueReady 为 0）、QueueNumMax 至少 16，QueueNum = 16，三部分的物理地址写进去，QueueReady = 1。
+4. 置上 DRIVER_OK，设备开始工作。
+5. 读容量：`capacity` 是 64 位，分两次读，前后读两次 ConfigGeneration，不一样就重读。扇区数除以 8 就是块数。
+
+### 队列
+
+```zig
+const num = 16;
+const Queue = extern struct {
+    desc: [num]Desc align(16),      // 描述符表：{ 物理地址, 长度, 标志, 下一个 }
+    avail: Avail align(2),          // 驱动 → 设备：{ flags, idx, ring[num] }
+    used: Used align(4),            // 设备 → 驱动：{ flags, idx, ring[num]{ id, len } }
+    requests: [num]Request,         // 请求头，按请求链第一个描述符的下标
+    status: [num]u8,                // 设备写回的状态字节，同上
+};
+var queue: Queue align(4096) = undefined;
+```
+
+- 现代接口的三部分只要求各自对齐（16、2、4），可以分开放；这里放在一个结构体里，一页对齐，好认。它在内核的 `.bss` 里，内核对物理内存是恒等映射，`@intFromPtr` 就是给设备的物理地址。
+- **一个请求是三个描述符串成的链**（块设备的请求格式，规范 5.2.6）：请求头 `{ type: 读 0 / 写 1, reserved, sector }`（设备读）→ 数据（4096 字节；读请求时设备往里写，带 `WRITE` 标志）→ 状态字节（设备写，0 是成功）。块号乘 8 就是扇区号。
+- `num = 16` 个描述符，一个请求用 3 个，最多同时 5 个请求在设备里。`free` 记哪些描述符空着，`alloc3` 一次拿三个。
+
+### 读写（`rw`）
+
+```zig
+pub fn rw(block: u64, data: *[block_size]u8, write: bool) void
+```
+
+1. 拿 `lock`。分配三个描述符，没有就 `proc.sleep(&free, &lock)`，等有请求做完放回描述符。
+2. 填请求头、状态字节（先写成 `0xff`）、三个描述符；`info[head].done = false`。
+3. 把链的第一个描述符的下标放进 `avail.ring[avail.idx % num]`，**`fence`**，`avail.idx += 1`，**`fence`**，写 QueueNotify。设备看到新的 `idx` 时，前面写的描述符和 ring 必须已经可见；写 QueueNotify（MMIO）之前，`idx` 也必须已经可见。
+4. `while (!info[head].done) proc.sleep(&info[head], &lock)`：进程睡着等，CPU 给别的进程。
+5. 醒来后看状态字节，不是 0 就 panic（QEMU 上只有内核给错了参数才会出现）；放回描述符，`wakeup(&free)`。
+
+队列结构通过 `*volatile Queue` 访问：设备在另一边改 `used`，编译器不能把读 `used.idx` 提到循环外面，也不能合并、省掉对描述符的写。
+
+只能由进程调用（要睡下）。数据在设备读写期间不能被别人碰：调用方（`bio`）拿着这个块的睡眠锁。
+
+### 中断（`onInterrupt`）
+
+```zig
+reg(.interrupt_ack).* = reg(.interrupt_status).* & 0x3;
+while (used_idx != used.idx) {
+    const id = used.ring[used_idx % num].id;   // 做完的请求链的第一个描述符
+    info[id].done = true;
+    proc.wakeup(&info[id]);
+    used_idx +%= 1;
+}
+```
+
+- `handleExternal` 从 PLIC claim 到磁盘的中断号时调用它（[trap.md](trap.md#分发)）。和串口一样，这个中断源发给所有 hart，谁先 claim 到谁处理（[devices.md](devices.md#plicpliczig)）。
+- 先确认、再看 used 环：确认之后设备又做完的请求会再发一次中断，不会漏。一次中断可能对应好几个做完的请求（设备可能攒着一起报），所以循环处理到 `used.idx`。
+- `used_idx`、`avail.idx` 都是 16 位、只增不减，`+%=` 回绕，对 `num` 取模就是下标（`num` 是 2 的幂，回绕时取模的结果是连续的）。
+- `wakeup` 叫醒的进程可能在别的 hart 上运行，核间中断让空闲的 hart 马上来（[process.md](process.md#核间中断)）。
+
+### 锁
+
+`virtio_disk.lock`（自旋锁）保护队列、描述符的分配、`info`、`used_idx`。`rw` 拿着它睡下（`sleep` 放开它），中断处理程序拿着它叫醒进程，所以“检查 `done` → 睡下”和“设 `done` → 叫醒”不会交错，不会丢掉叫醒。加锁顺序：`virtio_disk.lock` → 进程锁。
+
+## 睡眠锁（`sleeplock.zig`）
+
+```zig
+pub const Sleeplock = struct {
+    name: []const u8,
+    lk: Spinlock,                  // 保护 locked、holder
+    locked: bool = false,
+    holder: ?*proc.Process = null, // 拿着它的进程
+    pub fn acquire(l: *Sleeplock) void
+    pub fn release(l: *Sleeplock) void
+    pub fn holding(l: *Sleeplock) bool
+};
+```
+
+和 xv6 的一样：`acquire` 拿着 `lk` 检查 `locked`，被别人拿着就 `proc.sleep(l, &lk)` 睡下，`release` 清掉 `locked` 再 `wakeup(l)`。和自旋锁的区别：
+
+- **等锁时睡着**，不占 CPU 空转。拿着锁的进程可能正在等磁盘，拿着自旋锁等的话，别的 hart 上要同一把锁的进程都得陪着转。
+- **拿着它可以睡觉**（等磁盘、等别的睡眠锁）。自旋锁不行：`sched` 只允许拿着自己的进程锁。反过来，拿睡眠锁之前不能拿着自旋锁。
+- **只有进程能拿**：要能睡下。调度器、`kmain`、中断处理程序都不能拿，所以磁盘也只能由进程读写（`kmain` 不读盘）。
+- 记下的是拿着它的进程（`holder`，指针），不是 pid：读 pid 要拿进程锁。
+- 自己再拿一次是死锁，直接 panic（`acquire: sleeplock buf is already held by this process`）；放开不是自己拿的锁也 panic。
+- **回到 U 模式时不能拿着睡眠锁**：每个进程记着自己拿着几把（`Process.sleeplocks`，只有自己改，不用加锁），`handleTrap` 末尾和 `forkretC` 检查它是 0（`proc.assertNoLocksHeld`，和检查自旋锁放在一起）。
+
+## 缓冲区缓存（`bio.zig`）
+
+```zig
+pub const nbuf = 32;
+pub const Buf = struct {
+    lock: Sleeplock,     // 保护 valid、data
+    refcnt: u32,         // bio.lock：几个人拿着或在等
+    blockno: u64,        // bio.lock：装的是哪一块
+    valid: bool,         // data 是不是这一块在磁盘上的内容
+    node: std.DoublyLinkedList.Node,   // LRU 链表，表头是最近用过的
+    data: *align(4096) [block_size]u8,
+};
+pub const Device = struct { blocks: u64, transfer: *const fn (u64, *[block_size]u8, bool) void };
+
+pub fn init(dev: ?Device) void
+pub fn read(blockno: u64) Error!*Buf    // 拿着睡眠锁返回，内容是磁盘上的
+pub fn get(blockno: u64) Error!*Buf     // 拿着睡眠锁返回，不读磁盘（要整块覆盖时用）
+pub fn write(b: *Buf) void              // 写回磁盘，写完才返回
+pub fn release(b: *Buf) void
+pub fn blockCount() u64
+```
+
+作用有两个，和 xv6 的一样：
+
+1. **缓存**：最近用过的块留在内存里，再读不用等磁盘。
+2. **同一块在内存里只有一份，同时只有一个进程用**：`read`/`get` 返回时拿着这一块的睡眠锁，别的进程要同一块就睡着等。以后的文件系统靠这一点保证两个进程不会同时改同一个块。
+
+### 找缓冲区（`get`）
+
+拿着 `bio.lock`：
+
+1. 从表头（最近用过）往后找 `blockno` 相同、并且 `refcnt > 0` 或 `valid` 的缓冲区：这一块已经在缓存里（或者正有人在读它）。
+2. 没有的话从表尾（最久没用）往前找 `refcnt == 0` 的，改成这一块，`valid = false`。
+3. 都没有（32 个都有人拿着）就 `proc.sleep(&lru, &bio.lock)`，等有人 `release`。xv6 在这里 panic；这里每个系统调用最多同时拿一个缓冲区，等下去不会死锁。
+4. `refcnt += 1`，放开 `bio.lock`，再拿缓冲区的睡眠锁：可能要睡着等别的进程用完。
+
+`refcnt` 在放开 `bio.lock` 之前加，所以别人没法在“找到了”和“拿到睡眠锁”之间把这个缓冲区换成别的块。
+
+`read` = `get` + `valid` 为 false 时 `device.transfer(blockno, data, false)` 读进来。几个进程同时 `read` 同一块时，第一个拿到睡眠锁的去读盘，后面的醒来时看到 `valid` 已经是 true，不再读。
+
+`get` 给要整块覆盖的调用方用：`writeblock` 系统调用整块写，不用先读旧的内容。覆盖完自己把 `valid` 设成 true 再 `write`。
+
+### 写和放开
+
+- `write` 要求拿着睡眠锁、`valid` 为 true，同步写回磁盘（write-through）：返回时数据已经交给设备了。
+- `release` 放开睡眠锁，`refcnt -= 1`；减到 0 就把它挪到表头（最近用过），有人在等空闲缓冲区的话叫醒（`waiting` 计数，不用每次都扫一遍进程表）。
+
+### 磁盘是可以换的（`Device`）
+
+`bio` 不直接调用 `virtio_disk`，而是通过 `init(dev)` 交进来的 `Device`（块数和一个读写函数）。内核里 `kmain` 交进去 virtio 磁盘：
+
+```zig
+bio.init(if (virtio_disk.blocks > 0) .{ .blocks = virtio_disk.blocks, .transfer = virtio_disk.rw } else null);
+```
+
+单元测试交进去一块内存，记着读写了几次，在主机上测缓存的行为（命中不读盘、换掉的是最久没用的、拿着的缓冲区不会被换掉、`write` 写回、超出范围、没有磁盘）。以后文件系统的单元测试也可以这样在内存里跑。
+
+### 锁
+
+- `bio.lock`（自旋锁）：LRU 链表、每个缓冲区的 `refcnt`、`blockno`，`waiting`。等空闲缓冲区时拿着它睡下。
+- 每个缓冲区的睡眠锁：`valid`、`data`。拿着它读写磁盘（睡着等）。
+- 顺序：先 `bio.lock` 找到缓冲区、加 `refcnt`，放开，再拿睡眠锁；读写磁盘时拿着睡眠锁去拿 `virtio_disk.lock`。
+
+## 系统调用
+
+| 号 | 调用 | 说明 |
+| --- | --- | --- |
+| 21 | `blockcount()` | 磁盘有多少块，没有磁盘时是 0 |
+| 22 | `readblock(blockno, ptr)` | 第 `blockno` 块读进用户内存 `ptr`（4096 字节）。先 `checkUser` 检查整个目标可写（顺便复制好写时复制的页），再 `bio.read`、`copyToUser` |
+| 23 | `writeblock(blockno, ptr)` | 用户内存的 4096 字节写到第 `blockno` 块，写完才返回。先 `checkUser` 检查来源可读，再 `bio.get`（不读旧内容）、`copyFromUser`、`bio.write` |
+
+都返回 0；块号超出磁盘是 `-EINVAL`，没有磁盘是 `-ENODEV`，指针不对是 `-EFAULT`（[syscalls.md](syscalls.md#调用列表)）。先检查指针再碰缓冲区：复制到一半失败的话，缓冲区里会留下半新半旧的内容（写），或者白读一次盘（读）。shell 的 `disk` 命令打印 `blockcount`。
+
+这三个调用直接读写磁盘的块，以后有了文件系统，`writeblock` 写的块可能正被文件系统用着（和往 Linux 的 `/dev/vda` 里 `dd` 一样），推测会留给检查、调试文件系统的工具用。
+
+## 限制和以后可以做的
+
+- 只有一个队列、16 个描述符，最多同时 5 个请求在设备里；没有协商 event idx、间接描述符，每个请求都写一次 QueueNotify。
+- 设备报错直接 panic，没有把错误交回调用方。
+- 缓冲区缓存是 write-through：每次 `write` 都等磁盘写完。以后文件系统的事务可以把一批块攒着一起写。
+- 只有一把 `bio.lock`；xv6 的 lock lab 把它拆成按块号散列的几个桶，减少多核时的争用。

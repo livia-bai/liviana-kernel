@@ -10,6 +10,7 @@ const timer = @import("timer.zig");
 const proc = @import("proc.zig");
 const vm = @import("vm.zig");
 const ipi = @import("ipi.zig");
+const virtio_disk = @import("virtio_disk.zig");
 const syscall = @import("syscall.zig");
 const spinlock = @import("spinlock.zig");
 
@@ -216,7 +217,7 @@ fn handleTrap(frame: *TrapFrame) callconv(.c) void {
     // 回到 U 模式之前：被 kill 了（比如在 yield、sleep 里等着的时候，或者刚才的串口中断是 Ctrl-C）就在这里结束
     if (from_user) {
         proc.checkKilled();
-        spinlock.assertNoneHeld();
+        proc.assertNoLocksHeld();
     }
 }
 
@@ -239,7 +240,12 @@ fn handleExternal() void {
             if (uart.onInterrupt()) proc.interruptForeground();
             proc.wakeup(uart.rx_chan);
         },
-        else => uart.print("[trap] unexpected external interrupt {d}\n", .{irq}),
+        else => if (irq == virtio_disk.irq) {
+            // 磁盘做完了请求：叫醒等它的进程
+            virtio_disk.onInterrupt();
+        } else {
+            uart.print("[trap] unexpected external interrupt {d}\n", .{irq});
+        },
     }
     plic.complete(irq);
 }

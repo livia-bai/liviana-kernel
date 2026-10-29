@@ -220,6 +220,21 @@ test_step.dependOn(&b.addRunArtifact(unit_tests).step);
 - `.target = b.graph.host`：测试编译成**主机**的程序（比如 x86_64 Linux）直接运行，不是 RISC-V，所以只能测不碰硬件的代码（[testing.md](testing.md#单元测试zig-build-test)）。
 - 和内核共用同一批源文件：Zig 只编译被用到的函数，测试用不到的 CSR 读写、裸函数里的 RISC-V 汇编不会被编译，所以不影响在主机上构建。
 
+## 磁盘镜像
+
+```zig
+const disk_image = b.allocator.alloc(u8, disk_blocks * disk_block_size) catch @panic("OOM");
+for (disk_image, 0..) |*byte, n| {
+    byte.* = @intCast(((n / disk_block_size) * 131 + n % disk_block_size) % 251);
+}
+const disk = b.addWriteFiles().add("disk.img", disk_image);
+b.getInstallStep().dependOn(&b.addInstallFile(disk, "disk.img").step);
+```
+
+- 构建脚本自己算出 4 MiB 的内容（1024 块，第 b 块的第 i 个字节是 `(b * 131 + i) % 251`），交给 `WriteFile` 写进缓存目录，再装到 `zig-out/disk.img`。还没有文件系统，这个固定图案给回归测试检查读写用（[disk.md](disk.md)）；以后改成由 `mkfs` 生成。
+- 内容是确定的，缓存命中时不会重写。`InstallFile` 发现 `zig-out/disk.img` 的大小或修改时间和缓存里的不一样就重新拷一份，所以测试改写过它之后，下一次 `zig build` 会恢复原样。
+- 公式在三个地方各写了一遍：`build.zig`、`user/tests/t_disk.zig`、`tools/qemu_test.py`，改一处要三处一起改。
+
 ## 运行步骤
 
 ```zig
@@ -228,6 +243,9 @@ const qemu = b.addSystemCommand(&.{
     "-nographic", "-bios", "default", "-kernel",
 });
 qemu.addArtifactArg2(kernel, .{});
+qemu.addArgs(&.{ "-global", "virtio-mmio.force-legacy=false", "-drive" });
+qemu.addPrefixedFileArg("if=none,format=raw,id=disk,snapshot=on,file=", disk);
+qemu.addArgs(&.{ "-device", "virtio-blk-device,drive=disk,bus=virtio-mmio-bus.0" });
 qemu.addPassthruArgs();
 ```
 
@@ -239,6 +257,9 @@ qemu.addPassthruArgs();
 | `-nographic` | 不开窗口，串口接到当前终端；Ctrl-A 是 QEMU 的转义键，Ctrl-A X 退出 |
 | `-bios default` | 使用 QEMU 自带的 OpenSBI（fw_dynamic），它以 S 模式跳到 `0x8020_0000` |
 | `-kernel` + 内核路径 | `addArtifactArg2` 把内核 ELF 的路径接在后面，并让 run 依赖内核的构建 |
+| `-global virtio-mmio.force-legacy=false` | virtio-mmio 设备用现代接口（version 2）。QEMU 默认是旧版，驱动不支持（[disk.md](disk.md#qemu-的磁盘)） |
+| `-drive if=none,format=raw,id=disk,snapshot=on,file=…` | 磁盘镜像（缓存目录里生成的那份，`addPrefixedFileArg` 让 run 依赖它）。`snapshot=on`：写只进 QEMU 的临时覆盖层，退出就丢掉，镜像不变 |
+| `-device virtio-blk-device,drive=disk,bus=virtio-mmio-bus.0` | 把它接成 virtio 块设备，放在第 0 个 virtio-mmio 槽位（`0x1000_1000`，PLIC 的 1 号中断） |
 
 `addPassthruArgs()` 把 `zig build run -- ...` 里 `--` 之后的参数追加到 QEMU 命令行末尾（0.17 之前的写法是 `if (b.args) |args| run.addArgs(args)`，`b.args` 已经没有了）。
 

@@ -141,12 +141,16 @@ PLIC 把“某个 hart 的某个特权级”叫一个上下文（context）。QE
 ### 初始化
 
 ```zig
-pub fn init() void {               // 启动 hart 调用一次
-    priority(uart0_irq).* = 1;
+pub fn init(disk_irq: u32) void {  // 启动 hart 调用一次；disk_irq 是磁盘的中断源，没有磁盘时是 0
+    for ([_]u32{ uart0_irq, disk_irq }) |irq| {
+        if (irq == 0) continue;
+        priority(irq).* = 1;
+        enabled |= @as(u32, 1) << @intCast(irq);
+    }
 }
 
 pub fn initHart() void {           // 每个 hart 调用一次
-    enable().* = 1 << uart0_irq;
+    enable().* = enabled;
     threshold().* = 0;
     riscv.set(.sie, riscv.sie_seie);
 }
@@ -154,7 +158,7 @@ pub fn initHart() void {           // 每个 hart 调用一次
 
 中断源的优先级是全局的，设一次；使能位图、阈值是每个上下文的，`sie` 是每个 hart 的，每个 hart 自己设。最后一步打开 `sie.SEIE`：S 模式外部中断使能。之后只要 PLIC 有中断送给这个上下文，这个 hart 的 `sip.SEIP` 就会置位。
 
-**串口中断发给每个 hart**（和 xv6 的 `plicinithart` 一样）：每个上下文都使能了 10 号源，PLIC 把它同时送给所有 hart，谁先 `claim` 到谁处理，别的 hart 再 `claim` 时拿到 0，什么也不做。只发给一个 hart 也行，但那个 hart 正在 U 模式里跑一个死循环的进程的话，也照样会被打断，没有什么好处；发给所有 hart，空闲的 hart（在 `wfi`）能最快处理。
+**串口、磁盘中断发给每个 hart**（和 xv6 的 `plicinithart` 一样）：每个上下文都使能了串口的 10 号源和磁盘的中断源（[disk.md](disk.md#qemu-的磁盘)，QEMU 上是 1 号），PLIC 把它同时送给所有 hart，谁先 `claim` 到谁处理，别的 hart 再 `claim` 时拿到 0，什么也不做。只发给一个 hart 也行，但那个 hart 正在 U 模式里跑一个死循环的进程的话，也照样会被打断，没有什么好处；发给所有 hart，空闲的 hart（在 `wfi`）能最快处理。
 
 ### claim / complete
 
@@ -192,7 +196,7 @@ pub var ticks: u64 = 0;
 | 中断 | `scause` | 来源 | 处理 |
 | --- | --- | --- | --- |
 | S 模式时钟中断 | 中断 5 | OpenSBI 按 `setTimer` 的预约触发，每个 hart 各自的 | `timer.onInterrupt()` |
-| S 模式外部中断 | 中断 9 | PLIC，目前只有串口（10 号源），送给所有 hart | `plic.claim()` → `uart.onInterrupt()` → `plic.complete()` |
+| S 模式外部中断 | 中断 9 | PLIC：串口（10 号源）、virtio 磁盘（1 号源），送给所有 hart | `plic.claim()` → `uart.onInterrupt()` 或 `virtio_disk.onInterrupt()`（[disk.md](disk.md#中断oninterrupt)）→ `plic.complete()` |
 | S 模式软件中断 | 中断 1 | 核间中断（IPI）：别的 hart 通过 SBI 发来，叫醒空闲的 hart、打断运行着被杀进程的 hart | `ipi.onInterrupt()`：清掉 `sip.SSIP`（[process.md](process.md#核间中断)） |
 
 这三类都在 `mideleg` 里委托给了 S 模式（OpenSBI 设置的 `MIDELEG = 0x1666`）。陷阱分发的细节见 [trap.md](trap.md)。

@@ -9,7 +9,7 @@ const std = @import("std");
 const sys = @import("sys");
 const abi = sys.abi;
 
-const Command = enum { help, uptime, mem, run, ps, kill, shutdown };
+const Command = enum { help, uptime, mem, disk, run, ps, kill, shutdown };
 
 var line: [128]u8 = undefined;
 
@@ -72,6 +72,7 @@ fn execute(input: []const u8) void {
             \\help        show this message
             \\uptime      time since boot
             \\mem         free physical pages
+            \\disk        size of the disk
             \\run NAME [ARGS...]
             \\            run a user program and wait for it (without NAME: list them)
             \\run A | B   run A and B with A's output piped into B (up to 4 programs)
@@ -90,6 +91,14 @@ fn execute(input: []const u8) void {
             sys.print("{d} of {d} pages free ({d} KiB), {d} KiB each\n", .{
                 m.free_pages, m.total_pages, m.free_pages * m.page_size / 1024, m.page_size / 1024,
             });
+        },
+        .disk => {
+            const n = sys.blockCount();
+            if (n == 0) {
+                sys.print("no disk\n", .{});
+            } else {
+                sys.print("{d} blocks of {d} KiB ({d} MiB)\n", .{ n, sys.block_size / 1024, n * sys.block_size >> 20 });
+            }
         },
         .run => run(arg),
         .ps => ps(),

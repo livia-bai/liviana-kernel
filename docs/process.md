@@ -59,6 +59,7 @@ pub const Process = struct {
     files: [abi.max_fds]?*file.File = @splat(null),  // 打开的文件，下标就是 fd
     heap_start: usize = 0,             // 堆的起点（最后一个段之后的页边界）
     brk: usize = 0,                    // 堆的末尾，sbrk 调整
+    sleeplocks: u32 = 0,               // 拿着几把睡眠锁，回到 U 模式时必须是 0
 };
 
 pub var table: [max_procs]Process = @splat(.{});
@@ -205,7 +206,7 @@ scheduler → switchContext ─ret→ forkret → forkretC（放开进程锁、c
   fn forkretC() callconv(.c) void {
       current().?.lock.release();
       checkKilled();
-      spinlock.assertNoneHeld();
+      assertNoLocksHeld();   // 没拿着自旋锁，也没拿着睡眠锁
   }
   ```
 
@@ -710,6 +711,9 @@ Ctrl-C 结束的是**前台进程和它的所有子孙**：shell 用 `fork` 启�
 | `file.lock` | 文件表（每个 `File` 的引用数） | [files.md](files.md#文件表) |
 | `Pipe.lock` | 一个管道的缓冲区和两端的状态；读写的进程拿着它睡在管道上 | [files.md](files.md#管道) |
 | `uart.rx_lock` | 串口的输入缓冲区；`read` 拿着它睡在 `uart.rx_chan` 上，串口中断也要拿它 | [devices.md](devices.md#输入环形缓冲区) |
+| `virtio_disk.lock` | 磁盘的请求队列；发出请求的进程拿着它睡着等，磁盘中断拿着它叫醒 | [disk.md](disk.md#锁) |
+| `bio.lock` | 缓冲区缓存的 LRU 链表、每个缓冲区的 `refcnt`、`blockno`；等空闲缓冲区时拿着它睡下 | [disk.md](disk.md#锁-1) |
+| `Sleeplock.lk` | 一把睡眠锁的 `locked`、`holder`；等锁的进程拿着它睡下 | [disk.md](disk.md#睡眠锁sleeplockzig) |
 | `uart.tx_lock` | 串口输出：一次 `print`、一次 `write` 系统调用整段输出，不和别的 hart 的输出交错 | [devices.md](devices.md#串口uartzig) |
 
 不用锁的：`proc.next_pid`、`proc.foreground` 是原子变量；`init_proc` 只在启动时写一次；`cpus[i]`、`spinlock` 的 `held[i]`、`timer.deadline[i]` 只有 hart i 自己读写；进程的 `space`、`context`、`files`、`heap_start`、`brk` 只有进程自己读写（见[进程表](#进程表)）；内核页表启动后不再改。
@@ -722,8 +726,10 @@ Ctrl-C 结束的是**前台进程和它的所有子孙**：shell 用 `fork` 启�
 
   ```
   wait_lock → Process.lock → page.lock、file.lock、uart.tx_lock
-  timer.lock、Pipe.lock、uart.rx_lock → Process.lock
+  timer.lock、Pipe.lock、uart.rx_lock、virtio_disk.lock、bio.lock、Sleeplock.lk → Process.lock
   ```
+
+  另外有**睡眠锁**（[disk.md](disk.md#睡眠锁sleeplockzig)，现在只有缓冲区缓存的每一块）：拿着它可以睡觉，所以拿它之前不能拿着任何自旋锁；拿着它可以再去拿自旋锁（读写磁盘时拿 `virtio_disk.lock`）。回到 U 模式时也不能拿着睡眠锁（`proc.assertNoLocksHeld`）。
 
   - `wait_lock` 在进程锁前面：`fork`、`finish`、`wait`、`interruptForeground`、`info` 都是先拿 `wait_lock` 再拿进程锁。
   - 等待条件的锁在进程锁前面：`sleep` 拿着 `lock` 去拿进程锁；改条件的一方拿着 `lock` 调用 `wakeup`、`isKilled`，它们拿进程锁。`wait_lock` 也是这种用法。

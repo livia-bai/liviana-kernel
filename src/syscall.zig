@@ -14,6 +14,7 @@ const page = @import("page.zig");
 const sbi = @import("sbi.zig");
 const proc = @import("proc.zig");
 const file = @import("file.zig");
+const bio = @import("bio.zig");
 const TrapFrame = @import("trap.zig").TrapFrame;
 
 /// 返回值会写回用户程序的 a0。
@@ -42,6 +43,9 @@ pub fn dispatch(frame: *TrapFrame) usize {
         .dup => dup(args[0]),
         .pipe => pipe(args[0]),
         .sbrk => sbrk(args[0]),
+        .blockcount => bio.blockCount(),
+        .readblock => readBlock(args[0], args[1]),
+        .writeblock => writeBlock(args[0], args[1]),
         _ => abi.fail(.nosys),
     };
 }
@@ -153,6 +157,33 @@ fn sbrk(increment: usize) usize {
         error.OutOfMemory => .nomem,
         error.InvalidArgument => .inval,
     });
+}
+
+fn blockError(err: bio.Error) usize {
+    return abi.fail(switch (err) {
+        error.NoDevice => .nodev,
+        error.OutOfRange => .inval,
+    });
+}
+
+/// 读一块到用户内存。先检查整个目标范围可写（顺便复制好写时复制的页），之后的 copyToUser 一定成功。
+fn readBlock(blockno: usize, ptr: usize) usize {
+    vm.checkUser(space(), ptr, abi.block_size, true) catch return abi.fail(.fault);
+    const b = bio.read(blockno) catch |err| return blockError(err);
+    defer bio.release(b);
+    vm.copyToUser(space(), ptr, b.data) catch unreachable;
+    return 0;
+}
+
+/// 用户内存的一块写到磁盘。整块覆盖，不用先读；先检查来源可读，复制到一半失败的话缓冲区里会留下半新半旧的内容。
+fn writeBlock(blockno: usize, ptr: usize) usize {
+    vm.checkUser(space(), ptr, abi.block_size, false) catch return abi.fail(.fault);
+    const b = bio.get(blockno) catch |err| return blockError(err);
+    defer bio.release(b);
+    vm.copyFromUser(space(), b.data, ptr) catch unreachable;
+    b.valid = true;
+    bio.write(b);
+    return 0;
 }
 
 fn fork() usize {

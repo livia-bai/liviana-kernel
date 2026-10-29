@@ -21,6 +21,7 @@ const page = @import("page.zig");
 const dtb = @import("dtb.zig");
 const uart = @import("uart.zig");
 const plic = @import("plic.zig");
+const virtio_disk = @import("virtio_disk.zig");
 
 pub const user_base: usize = 0x4000_0000;
 pub const user_end: usize = 0x8000_0000;
@@ -94,6 +95,7 @@ pub fn init(memory: dtb.Region) MapError!void {
     try map(kernel_root, end, end, mem_end - end, .{ .r = true, .w = true });
     try mapMmio(uart.base, uart.mmio_size);
     try mapMmio(plic.base, plic.mmio_size);
+    try mapMmio(virtio_disk.mmio_base, virtio_disk.mmio_size);
 
     activate(kernel_root);
 }

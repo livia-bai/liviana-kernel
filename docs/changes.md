@@ -2,6 +2,15 @@
 
 每次改了内核（`src/`、`user/`、`build.zig`、链接脚本），在最上面加几行：新增了什么功能，修了什么 bug。最新的在前面。
 
+## 2026-10-29 virtio 磁盘、睡眠锁、缓冲区缓存
+
+- 新增：virtio 块设备驱动（`src/virtio_disk.zig`，照 xv6 的 `virtio_disk.c`）。现代（version 2）的 virtio-mmio 接口，启动时在 8 个槽位里找块设备，只协商 `VIRTIO_F_VERSION_1`；一个 16 项的队列，每个请求是三个描述符（请求头、4 KiB 数据、状态字节）；发出请求的进程睡着等，磁盘中断（PLIC 1 号源，发给所有 hart）叫醒它，描述符不够时也睡着等。启动日志多了 `[ok] virtio disk: 1024 blocks of 4 KiB (4 MiB), irq 1`，中断那一行末尾多了 `, disk`；没有磁盘或者只有旧版接口时打印警告，照常启动。`plic.init` 多了磁盘中断号的参数；`vm.init` 映射 virtio-mmio 区域。
+- 新增：睡眠锁（`src/sleeplock.zig`，照 xv6 的 `sleeplock.c`）：等锁时睡下，拿着可以睡觉。自己重复拿会 panic；进程记着拿着几把（`Process.sleeplocks`），回到 U 模式之前检查是 0（`proc.assertNoLocksHeld`）。
+- 新增：缓冲区缓存（`src/bio.zig`，照 xv6 的 `bio.c`）：32 个 4 KiB 的缓冲区，LRU，每块一把睡眠锁，`read`/`get`/`write`/`release`；磁盘通过 `Device` 交进来，单元测试用一块内存。缓冲区都在用时睡着等（xv6 是 panic）。
+- 新增：系统调用 `blockcount`（21）、`readblock`（22）、`writeblock`（23），错误码 `ENODEV`；`abi.block_size`；shell 的 `disk` 命令。
+- 新增：`build.zig` 生成 4 MiB 的磁盘镜像（固定图案）装到 `zig-out/disk.img`，`zig build run` 以 `snapshot=on` 接上它。
+- 新增：回归测试 `t_disk`、QEMU 测试用例 `disk`（QEMU 退出后检查镜像文件的每一块），`qemu_test.py` 每次启动接一份新拷的磁盘；缓冲区缓存、睡眠锁的单元测试。
+
 ## 2026-10-29 核间中断
 
 - 新增：核间中断（`src/ipi.zig`，经 SBI IPI 扩展的 `send_ipi`，新增 `sbi.sendIpi`；收到的是 S 模式软件中断，每个 hart 在 `ipi.initHart` 里打开 `sie.SSIE`）。调度器扫描前把自己登记为空闲；`wakeup`、`kill` 叫醒睡着的进程、`fork` 建好子进程时，给一个空闲的 hart 发核间中断，它马上来运行，不用等自己的下一个时钟中断。`kill`、Ctrl-C 杀的进程正在别的 hart 上运行时（新增进程字段 `hart`），给那个 hart 发核间中断，它马上进内核结束这个进程。多核时杀掉别的 hart 上的进程从 4～8 ms 降到约 0.3 ms，叫醒的进程开始运行从 1～7.6 ms 降到约 0.2 ms。

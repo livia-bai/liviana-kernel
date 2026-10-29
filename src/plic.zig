@@ -10,6 +10,9 @@ pub const mmio_size: usize = 0x60_0000;
 
 pub const uart0_irq: u32 = 10;
 
+/// 要接收的中断源（第 i 位是 i 号源）。init 设好，每个 hart 的 initHart 照着打开。
+var enabled: u32 = 0;
+
 /// 当前 hart 的 S 模式上下文。QEMU virt 上每个 hart 有两个 PLIC 上下文：2*hart 是 M 模式，2*hart+1 是 S 模式。
 fn context() usize {
     return 2 * hart.id() + 1;
@@ -35,15 +38,19 @@ fn claimComplete() *volatile u32 {
     return reg(0x20_0004 + 0x1000 * context());
 }
 
-/// 全局的设置，启动 hart 调用一次。
-pub fn init() void {
-    priority(uart0_irq).* = 1; // 优先级为 0 表示“永不触发”，所以至少设成 1
+/// 全局的设置，启动 hart 调用一次：打开串口，以及 disk_irq（virtio 磁盘的中断源，没有磁盘时是 0）。
+pub fn init(disk_irq: u32) void {
+    for ([_]u32{ uart0_irq, disk_irq }) |irq| {
+        if (irq == 0) continue;
+        priority(irq).* = 1; // 优先级为 0 表示“永不触发”，所以至少设成 1
+        enabled |= @as(u32, 1) << @intCast(irq);
+    }
 }
 
-/// 每个 hart 调用一次：串口中断发给每个 hart（和 xv6 一样），谁先 claim 到谁处理，
+/// 每个 hart 调用一次：串口、磁盘中断发给每个 hart（和 xv6 一样），谁先 claim 到谁处理，
 /// 别的 hart 再 claim 时拿到 0。
 pub fn initHart() void {
-    enable().* = 1 << uart0_irq;
+    enable().* = enabled;
     threshold().* = 0; // 接收所有优先级 > 0 的中断
     riscv.set(.sie, riscv.sie_seie);
 }

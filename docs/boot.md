@@ -113,7 +113,7 @@ export var boot_stacks: [hart.max][1 << boot_stack_shift]u8 align(16) = undefine
 ```
 
 - 每个 hart 一块，按 hart 编号下标：hart `i` 的栈顶是 `boot_stacks + (i + 1) * 32 KiB`（`enter_asm` 用移位算乘法）。`kmain`、`kmainSecondary` 在上面运行，之后归这个 hart 的调度器用（[process.md](process.md#栈的变化)）。
-- **大小是实测出来的**：Debug 模式下跑完全部 QEMU 测试，启动 hart 最深用了 17336 字节（`kmain` 那一串初始化，Debug 模式下栈帧很大），其他 hart 不到 2 KiB；safe 模式下分别是 3632 和 832 字节。测法和进程内核栈一样（`.bss` 清零，`shutdown` 时从栈底找第一个不为 0 的字节，临时代码）。最早给的是 16 KiB，Debug 模式下启动 hart 的栈溢出了 1 KiB 左右，踩进了紧挨着的 `proc.cpus`，所以改成 32 KiB。栈两侧没有保护页，溢出不会被发现。
+- **大小是实测出来的**：Debug 模式下跑完全部 QEMU 测试，启动 hart 最深用了 17432 字节（`kmain` 那一串初始化，Debug 模式下栈帧很大），其他 hart 约 2.2 KiB；safe 模式下分别是 3616 和 800 字节（加了磁盘之后重新量的）。测法和进程内核栈一样（`.bss` 清零，`shutdown` 时从栈底找第一个不为 0 的字节，临时代码）。最早给的是 16 KiB，Debug 模式下启动 hart 的栈溢出了 1 KiB 左右，踩进了紧挨着的 `proc.cpus`，所以改成 32 KiB。栈两侧没有保护页，溢出不会被发现。
 - `boot_stacks` 用 `export` 导出成符号，汇编里直接 `la sp, boot_stacks`。用 `"X"` 约束把 `&boot_stacks` 传进去不行：编译器会先把这个地址算进一个寄存器再代入，实测它挑了 `a0`，把 hart 编号覆盖了（函数指针 `&kmain` 用 `"X"` 就没问题，代入的是符号名）。
 - `tp` 从这里开始就是 hart 编号，内核里 `hart.id()` 直接读它（[trap.md](trap.md#tp-约定)）。之后第一次拿锁（`uart.init` 之后的打印）就要用到它。
 
@@ -128,7 +128,7 @@ export var boot_stacks: [hart.max][1 << boot_stack_shift]u8 align(16) = undefine
 | 5 | `dtb.parse(dtb_addr)` | `[ok] device tree: 128 MiB RAM at 0x80000000, timebase 10000000 Hz` | 页分配器要知道内存范围和保留区，定时器要知道时钟频率 |
 | 6 | `page.init(vm.kernelEnd(), info.memory.end(), info.reserved())` | `[ok] page allocator: N free pages (... KiB)` | 建页表需要分配页 |
 | 7 | `vm.init(info.memory)` | `[ok] Sv39 paging enabled: ...` | 写 `satp` 打开分页。恒等映射保证这一刻前后地址不变 |
-| 8 | `plic.init()`、`plic.initHart()`、`timer.init(info.timebase_hz)`、`timer.initHart()`、`ipi.initHart()` | `[ok] interrupt sources enabled: timer at 100 Hz, keyboard via UART + PLIC, IPIs` | 全局的设置（串口中断的优先级、时钟频率、由哪个 hart 计时）和这个 hart 自己的（PLIC 上下文、第一次时钟中断、`sie` 里时钟、外部、软件中断的使能位）。全局开关 `sstatus.SIE` 不在这里开，见下文 |
+| 8 | `virtio_disk.init()`、`bio.init(...)`、`plic.init(virtio_disk.irq)`、`plic.initHart()`、`timer.init(info.timebase_hz)`、`timer.initHart()`、`ipi.initHart()` | `[ok] virtio disk: 1024 blocks of 4 KiB (4 MiB), irq 1`、`[ok] interrupt sources enabled: timer at 100 Hz, keyboard via UART + PLIC, IPIs, disk` | 先找磁盘（要访问 MMIO，所以在开分页之后；只是协商、配置队列，不读写：`kmain` 不是进程，不能睡着等磁盘，[disk.md](disk.md)），PLIC 要知道它的中断号。然后是全局的设置（串口中断的优先级、时钟频率、由哪个 hart 计时）和这个 hart 自己的（PLIC 上下文、第一次时钟中断、`sie` 里时钟、外部、软件中断的使能位）。全局开关 `sstatus.SIE` 不在这里开，见下文 |
 | 9 | `startHarts(hartid, info.harts(), info.timebase_hz)` | `[ok] 4 harts running, booted on hart 0` | 启动设备树里列出的其他 hart，等它们都进了调度器（[启动其他 hart](#启动其他-hart)）。要在全局的初始化都做完之后：它们直接用页表、页分配器 |
 | 10 | `proc.userinit()` + `proc.scheduler()` | `Type 'help' for commands.`、`> ` | 和 xv6 的 `main` 一样：建好第一个进程 init，启动栈交给调度器，`kmain` 不再返回。之后的两行是 shell（init 启动的）打印的，init 和 shell 可能在任何一个 hart 上运行 |
 

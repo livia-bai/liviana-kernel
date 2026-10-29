@@ -55,8 +55,18 @@ pub const Syscall = enum(usize) {
     /// sbrk(increment) 把堆的末尾（program break）移动 increment 字节（按有符号数理解，可以为负），
     /// 返回原来的末尾。新增的内存清零；缩小时释放整页
     sbrk = 20,
+    /// blockcount() 返回磁盘有多少个块（每块 block_size 字节），没有磁盘时返回 0
+    blockcount = 21,
+    /// readblock(blockno, ptr) 把磁盘的第 blockno 块读进用户内存 ptr（block_size 字节），返回 0。
+    /// 经过缓冲区缓存，和以后的文件系统看到的是同一份（像读 Linux 的 /dev/vda）
+    readblock = 22,
+    /// writeblock(blockno, ptr) 把用户内存 ptr 的 block_size 字节写到磁盘的第 blockno 块，写完才返回 0
+    writeblock = 23,
     _,
 };
+
+/// 磁盘块的大小（缓冲区缓存、以后的文件系统都按这个大小读写），正好一页。
+pub const block_size = 4096;
 
 pub const Errno = enum(usize) {
     /// 没有权限（kill init）
@@ -65,6 +75,8 @@ pub const Errno = enum(usize) {
     noent = 2,
     /// 没有这个进程（kill、setfg）
     srch = 3,
+    /// 没有磁盘（readblock、writeblock）
+    nodev = 19,
     /// 命令行参数太多或太长（exec）
     toobig = 7,
     /// 程序不是合法的 ELF（exec）
@@ -79,7 +91,7 @@ pub const Errno = enum(usize) {
     nomem = 12,
     /// 指针指向的内存不属于用户空间，或者没有映射
     fault = 14,
-    /// 参数不对
+    /// 参数不对；块号超出磁盘（readblock、writeblock）
     inval = 22,
     /// 系统的文件表满了（pipe、fork）
     nfile = 23,

@@ -12,9 +12,10 @@
 - 多核：启动 hart 用 SBI 的 HSM 扩展启动设备树里的其他 hart（QEMU 默认 4 个，最多用 8 个），每个 hart 跑自己的调度器；核间中断叫醒空闲的 hart、打断运行着被杀进程的 hart
 - 多进程，照 xv6 的结构：时间片轮转调度（每个 hart 一个调度器循环、`sleep`/`wakeup`、`kill` 只做标记）；`fork`/`exec`/`wait`、父子进程、zombie 和孤儿回收；最多 16 个进程
 - 写时复制的 `fork`：父子进程共用物理页（页分配器记引用数），谁先写哪一页谁在缺页异常里复制一份
-- 21 个系统调用：文件描述符（`read`/`write`/`close`/`dup`）和管道（`pipe`），命令行参数（`exec` 带 `argv`），堆（`sbrk`）
+- 磁盘：virtio 块设备驱动（DMA + 中断，等磁盘时进程睡着），睡眠锁，照 xv6 的缓冲区缓存（LRU）
+- 24 个系统调用：文件描述符（`read`/`write`/`close`/`dup`）和管道（`pipe`），命令行参数（`exec` 带 `argv`），堆（`sbrk`），读写磁盘块（`readblock`/`writeblock`）
 - 用户态的 init 和 shell：init 启动 shell，shell 用 `fork` + `exec` 运行程序，可以带参数、在后台运行、用 `|` 接成管道
-- 照 xv6 加锁：每个进程一把锁、`wait_lock`、tickslock，页分配器、文件表、管道、串口的输入和输出都有自旋锁
+- 照 xv6 加锁：每个进程一把锁、`wait_lock`、tickslock，页分配器、文件表、管道、串口的输入和输出、磁盘队列、缓冲区缓存都有自旋锁，缓冲区还有睡眠锁
 
 ```
 Hello from a Zig kernel on RISC-V!
@@ -22,9 +23,10 @@ SBI: OpenSBI, spec v1.0 | hart 0 | device tree at 0x87e00000
 [ok] trap vector installed
 [trap] breakpoint at 0x8021687c, skipping it
 [ok] device tree: 128 MiB RAM at 0x80000000, timebase 10000000 Hz
-[ok] page allocator: 31772 free pages (127088 KiB)
+[ok] page allocator: 31731 free pages (126924 KiB)
 [ok] Sv39 paging enabled: kernel mapped 1:1, text r-x, rodata r--, data rw-
-[ok] interrupt sources enabled: timer at 100 Hz, keyboard via UART + PLIC, IPIs
+[ok] virtio disk: 1024 blocks of 4 KiB (4 MiB), irq 1
+[ok] interrupt sources enabled: timer at 100 Hz, keyboard via UART + PLIC, IPIs, disk
 [ok] 4 harts running, booted on hart 0
 Type 'help' for commands.
 > run hello
@@ -72,6 +74,8 @@ pid 11 spinning in U-mode without making syscalls
 zig build run                     # 编译并在 QEMU 中启动（Debug 模式，4 个 hart）
 zig build run -Doptimize=small    # 体积优化，内核代码段约 22 KB
 zig build run -- -smp 1           # 只用一个 hart
+
+# zig build run 接上一块 4 MiB 的 virtio 磁盘（zig-out/disk.img，写的内容在 QEMU 退出时丢掉）
 ```
 
 退出 QEMU：先按 `Ctrl-A`，再按 `X`；或者在 shell 里输入 `shutdown`。
@@ -93,6 +97,7 @@ shell 是用户程序（`user/sh.zig`），由 init 启动。
 | `help` | 列出命令 |
 | `uptime` | 开机时长，精度 10 ms |
 | `mem` | 物理页的使用情况 |
+| `disk` | 磁盘有多大 |
 | `run NAME [ARGS...]` | 用 `fork` + `exec` 运行用户程序 `NAME`（`hello`、`fault`、`spin`、`ticker`、`echo`、`cat`、`wc`），带上参数，等它结束，Ctrl-C 结束它；不带参数时列出所有程序 |
 | `run A \| B \| ...` | 管道：A 的输出接到 B 的输入，最多 4 个程序；Ctrl-C 结束整条管道 |
 | `run ... &` | 在后台运行，马上回到提示符 |
@@ -105,7 +110,7 @@ shell 是用户程序（`user/sh.zig`），由 init 启动。
 详细文档在 [docs/](docs/README.md)，按功能组织，每一篇都对应若干源码文件：
 
 - 整体：[总体结构](docs/architecture.md)、[构建系统](docs/build.md)、[启动流程](docs/boot.md)
-- 内核：[陷阱处理](docs/trap.md)、[串口 / PLIC / 定时器](docs/devices.md)、[CSR 和 SBI](docs/riscv-sbi.md)、[设备树](docs/devicetree.md)、[页分配器](docs/page-allocator.md)、[Sv39 分页](docs/paging.md)
+- 内核：[陷阱处理](docs/trap.md)、[串口 / PLIC / 定时器](docs/devices.md)、[CSR 和 SBI](docs/riscv-sbi.md)、[设备树](docs/devicetree.md)、[页分配器](docs/page-allocator.md)、[Sv39 分页](docs/paging.md)、[磁盘](docs/disk.md)
 - 进程和用户态：[进程](docs/process.md)、[文件和管道](docs/files.md)、[系统调用](docs/syscalls.md)、[用户程序](docs/user-programs.md)、[shell](docs/shell.md)
 - 开发：[测试与调试](docs/testing.md)、[Zig 0.17 笔记](docs/zig-0.17.md)
 - [修改记录](docs/changes.md)：每次改动新增了什么功能、修了什么 bug
@@ -132,4 +137,4 @@ tools/          QEMU 测试脚本
 
 - 从设备树读串口、PLIC 的地址和中断号
 - 按需分页（`sbrk` 先不分配，第一次访问时再分配）；内核栈两侧的保护页
-- 文件系统：现在只能运行嵌在内核里的程序
+- 文件系统（写时复制 B 树，类似 btrfs）：磁盘驱动和缓冲区缓存已经有了，现在只能运行嵌在内核里的程序

@@ -15,6 +15,8 @@ const vm = @import("vm.zig");
 const proc = @import("proc.zig");
 const hart = @import("hart.zig");
 const ipi = @import("ipi.zig");
+const virtio_disk = @import("virtio_disk.zig");
+const bio = @import("bio.zig");
 
 /// 替换标准库默认的 panic 处理。@panic、std.debug.panic 以及
 /// Debug 模式下的安全检查失败（整数溢出、数组越界等）都会走到这里。
@@ -116,12 +118,18 @@ fn kmain(hartid: usize, dtb_addr: usize) callconv(.c) noreturn {
     vm.init(info.memory) catch |err| std.debug.panic("cannot set up paging: {s}", .{@errorName(err)});
     uart.write("[ok] Sv39 paging enabled: kernel mapped 1:1, text r-x, rodata r--, data rw-\n");
 
-    plic.init();
+    // 找磁盘（要访问 MMIO，所以在开分页之后），PLIC 要知道它的中断号
+    virtio_disk.init();
+    bio.init(if (virtio_disk.blocks > 0) .{ .blocks = virtio_disk.blocks, .transfer = virtio_disk.rw } else null);
+
+    plic.init(virtio_disk.irq);
     plic.initHart();
     timer.init(info.timebase_hz);
     timer.initHart();
     ipi.initHart();
-    uart.print("[ok] interrupt sources enabled: timer at {d} Hz, keyboard via UART + PLIC, IPIs\n", .{timer.tick_hz});
+    uart.print("[ok] interrupt sources enabled: timer at {d} Hz, keyboard via UART + PLIC, IPIs{s}\n", .{
+        timer.tick_hz, if (virtio_disk.irq != 0) ", disk" else "",
+    });
 
     startHarts(hartid, info.harts(), info.timebase_hz);
 

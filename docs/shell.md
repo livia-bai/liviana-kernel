@@ -141,6 +141,7 @@ const cmd = std.meta.stringToEnum(Command, name) orelse { ... "unknown command" 
 | `help` | 列出命令 | |
 | `uptime` | 开机时长（`uptime` 系统调用，精度一个 tick） | `up 3.26s` |
 | `mem` | 物理页的使用情况（`meminfo`，[page-allocator.md](page-allocator.md)） | `31600 of 31676 pages free (126400 KiB), 4 KiB each` |
+| `disk` | 磁盘有多大（`blockcount`，[disk.md](disk.md)）；没有磁盘时打印 `no disk` | `1024 blocks of 4 KiB (4 MiB)` |
 | `run` | 列出所有用户程序（`listprog`） | `programs: init sh hello fault spin ticker echo cat wc` |
 | `run NAME [ARGS...]` | 在前台运行用户程序 `NAME`，带上参数，等它结束；Ctrl-C 结束它 | 程序自己的输出 + `[proc] pid 3 (hello) exited with code 0` |
 | `run A \| B \| ...` | 管道（[管道](#管道)） | `run echo one two three \| wc` 打印 `1 3 14` |

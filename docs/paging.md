@@ -122,6 +122,7 @@ pub fn init(memory: dtb.Region) MapError!void
 | `[__kernel_end, 内存末尾)` | 页分配器管理的内存、设备树 | RW- | `0x803d7000..0x88000000` | 到 `0x80400000` 为止用 4 KiB，之后 62 个 2 MiB |
 | 串口 | `uart.base`、`uart.mmio_size` 向上取整到页 | RW- | `0x10000000..0x10001000` | 4 KiB |
 | PLIC | `plic.base`、`plic.mmio_size` | RW- | `0x0c000000..0x0c600000` | 3 个 2 MiB |
+| virtio-mmio | `virtio_disk.mmio_base`、`virtio_disk.mmio_size`（8 个槽位） | RW- | `0x10001000..0x10009000` | 4 KiB |
 
 整张内核页表一共 5 页：
 
@@ -129,7 +130,7 @@ pub fn init(memory: dtb.Region) MapError!void
 根页表
 ├─ [0] → 第 1 级页表 A
 │        ├─ [0x60..0x62]  PLIC 的 3 个 2 MiB 叶子
-│        └─ [0x80] → 第 0 级页表（只有串口这 1 项）
+│        └─ [0x80] → 第 0 级页表（串口 1 项、virtio-mmio 8 项）
 └─ [2] → 第 1 级页表 B
          ├─ [1] → 第 0 级页表（0x8020_0000..0x8040_0000：内核镜像按段的 4 KiB 叶子 + 之后的空闲内存）
          └─ [2..63]  0x8040_0000..0x8800_0000 的 62 个 2 MiB 叶子
@@ -141,7 +142,7 @@ pub fn init(memory: dtb.Region) MapError!void
 
 - **为什么是恒等映射**：写 `satp` 的那一刻 CPU 就开始翻译地址，正在执行的代码地址必须在新页表里映射到同一个物理地址，否则下一条指令就会取错。恒等映射一次性解决这个问题，也让页分配器给出的物理地址可以继续直接当指针用（分配页表、往用户页里复制数据都靠这一点）。
 - **按段设权限**带来的保护：往代码或只读数据里写会触发写缺页（`store_page_fault`），跳到数据或空闲内存里执行会触发取指缺页。这要求各段按页对齐，见 [boot.md](boot.md#链接脚本)。开发时用一段临时代码验证过：往 `kmain` 所在的代码页写一个字，得到 `store_page_fault`。
-- **不映射的地方**：内核之前的 `0x8000_0000..0x8020_0000`（其中 `0x8000_0000..0x8006_0000` 是 OpenSBI，PMP 本来就不让 S 模式访问；后面是空着的，内核用不到）；地址 0 附近（空指针解引用变成 `load_page_fault`）；设备树里的其他外设（virtio、RTC 等，内核不用）。
+- **不映射的地方**：内核之前的 `0x8000_0000..0x8020_0000`（其中 `0x8000_0000..0x8006_0000` 是 OpenSBI，PMP 本来就不让 S 模式访问；后面是空着的，内核用不到）；地址 0 附近（空指针解引用变成 `load_page_fault`）；设备树里的其他外设（RTC、PCIe 等，内核不用）。
 - 开始映射前检查内核镜像是否完全在设备树报告的内存范围里，不在就 panic（`kernel image is outside of RAM`）。
 - **所有 hart 共用这一份内核页表**：启动 hart 在 `vm.init` 里建好、打开分页，其他 hart 启动时调用 `vm.initHart()`，只做 `activate(kernel_root)`（[boot.md](boot.md#启动其他-hart)）。内核页表启动后不再改，所以不用担心别的 hart 的 TLB 里留着旧的内核映射。
 

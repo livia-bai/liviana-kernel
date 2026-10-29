@@ -175,7 +175,7 @@ const from_user = frame.sstatus & riscv.sstatus_spp == 0;
 | 条件 | 处理 |
 | --- | --- |
 | 中断 5（时钟） | `timer.onInterrupt()`：预约这个 hart 的下一次时钟中断；在启动 hart 上还给 `timer.ticks` 加 1、叫醒 `sleep` 系统调用里的进程（[devices.md](devices.md#定时器timerzig)）。`from_user` 时 `proc.yieldTimeslice()`：当前进程的 `ticks` 加 1，时间片用完，让出 CPU，下次轮到这个进程时（可能在别的 hart 上）返回（[process.md](process.md#schedyield)） |
-| 中断 9（外部） | `handleExternal()`：PLIC claim → 串口（收字符；按过 Ctrl-C 就 `proc.interruptForeground()`；`proc.wakeup(uart.rx_chan)` 叫醒在 `read` 里等输入的进程）→ complete（[devices.md](devices.md#claim--complete)）。串口中断发给所有 hart，claim 到 0 的 hart 什么也不做 |
+| 中断 9（外部） | `handleExternal()`：PLIC claim → 串口（收字符；按过 Ctrl-C 就 `proc.interruptForeground()`；`proc.wakeup(uart.rx_chan)` 叫醒在 `read` 里等输入的进程）或者磁盘（`virtio_disk.onInterrupt()`：叫醒等请求做完的进程，[disk.md](disk.md#中断oninterrupt)）→ complete（[devices.md](devices.md#claim--complete)）。串口中断发给所有 hart，claim 到 0 的 hart 什么也不做 |
 | 中断 1（软件中断） | 核间中断：`ipi.onInterrupt()` 清掉 `sip.SSIP`，别的什么都不做。它只是让这个 hart 进一次陷阱处理程序：空闲的调度器因此醒过来去扫进程表；被打断的 U 模式进程如果被杀了，末尾的 `checkKilled` 结束它（[process.md](process.md#核间中断)） |
 | 其他中断 | `std.debug.panic("unexpected interrupt N")` |
 | 来自 U 模式的异常 8（`ecall`） | `frame.sepc += 4`，`frame.regs[10] = syscall.dispatch(frame)`（[syscalls.md](syscalls.md)） |
@@ -183,7 +183,7 @@ const from_user = frame.sstatus & riscv.sstatus_spp == 0;
 | 来自 U 模式的其他异常 | `proc.killCurrent("<异常名> at <sepc>, stval=<stval>")`（`killForFault`）：结束进程，内核照常运行 |
 | 来自 S 模式的异常 3（`ebreak`） | 打印 `[trap] breakpoint at ...`，`frame.sepc += instructionLength(frame.sepc)` 跳过它 |
 | 来自 S 模式的其他异常 | `std.debug.panic("unhandled exception: ...")`：内核自己的错，停机 |
-| 最后，`from_user` 时 | `proc.checkKilled()`：被 kill 了就在这里结束，不再回到 U 模式（[process.md](process.md#结束进程)）；`spinlock.assertNoneHeld()` |
+| 最后，`from_user` 时 | `proc.checkKilled()`：被 kill 了就在这里结束，不再回到 U 模式（[process.md](process.md#结束进程)）；`proc.assertNoLocksHeld()`：没有拿着自旋锁，当前进程也没有拿着睡眠锁 |
 
 和 xv6 的 `usertrap` 末尾一样：先处理陷阱，只在时钟中断时 `yield`，回到用户态之前检查 `killed`。
 
@@ -201,7 +201,7 @@ const from_user = frame.sstatus & riscv.sstatus_spp == 0;
 陷阱处理全程 `sstatus.SIE = 0`（硬件进陷阱时清零，`handleTrap` 里没有任何地方打开它），所以：
 
 - 不会有嵌套的陷阱，除非处理程序自己出了异常（那是内核 bug，会 panic）。
-- 系统调用都是关着中断执行的。会阻塞的系统调用（`sleep`、`read`、管道的 `write`、`wait`）不在里面开中断等，而是 `proc.sleep(chan, lock)` 切回调度器，由中断处理程序或别的进程 `wakeup` 它。以后再加阻塞的调用也照这个办法做。
+- 系统调用都是关着中断执行的。会阻塞的系统调用（`sleep`、`read`、管道的 `write`、`wait`、读写磁盘）不在里面开中断等，而是 `proc.sleep(chan, lock)` 切回调度器，由中断处理程序或别的进程 `wakeup` 它。以后再加阻塞的调用也照这个办法做。
 - 自旋锁要求拿锁时中断关着（[process.md](process.md#锁)），陷阱处理程序里随时可以拿锁。中断处理程序（`timer.onInterrupt`、`interruptForeground`、`wakeup`）也拿锁，它们不会在同一个 hart 上和被打断的代码抢同一把锁：中断只打断 U 模式和调度器开中断的那一下，那时这个 hart 什么锁都没拿；别的 hart 拿着锁的话，等它放开就是了。`handleTrap` 回到 U 模式之前检查没有拿着任何锁（`spinlock.assertNoneHeld()`），漏放的锁在这里就会被发现。
 - 进程切换（`proc.switchContext`）都发生在关中断时：调度器关着中断扫描进程表，进程这边是在陷阱处理程序里调用 `proc.sched`。
 - 中断只可能打断 U 模式，或者调度器每一轮开头开中断的那一下。每个 hart 的 `sstatus.SIE` 是它自己的，这些规矩对每个 hart 分别成立。

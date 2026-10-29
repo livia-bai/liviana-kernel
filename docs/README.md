@@ -19,6 +19,7 @@ liviana-kernel 的详细文档，按功能组织，讲这个用 Zig 写的 RISC-
 | [paging.md](paging.md) | Sv39 分页：页表格式、建立映射、内核页表、用户地址空间、`fork` 的写时复制 |
 | [user-programs.md](user-programs.md) | 用户程序：运行时（`start.zig`、`sys.zig`）、示例程序、怎么写新程序 |
 | [process.md](process.md) | 进程：进程表、ELF 加载器、`userinit`/`fork`/`exec`、命令行参数、`sbrk`、xv6 式调度（每个 hart 的 `scheduler`、`sched`/`sleep`/`wakeup`）、核间中断、切换上下文、`exit`/`wait`/`kill`、Ctrl-C、锁和加锁顺序 |
+| [disk.md](disk.md) | 磁盘：virtio 块设备驱动、睡眠锁、缓冲区缓存、读写块的系统调用 |
 | [files.md](files.md) | 文件：fd 表、文件表、串口和管道的读写 |
 | [syscalls.md](syscalls.md) | 系统调用：调用约定、调用列表、访问用户内存、怎么加新调用 |
 | [shell.md](shell.md) | shell（用户程序）：输入处理、前台和后台进程、命令 |
@@ -39,6 +40,9 @@ liviana-kernel 的详细文档，按功能组织，讲这个用 Zig 写的 RISC-
 | `src/uart.zig` | [devices.md](devices.md#串口uartzig) | [files.md](files.md#串口) |
 | `src/plic.zig` | [devices.md](devices.md#plicpliczig) | |
 | `src/timer.zig` | [devices.md](devices.md#定时器timerzig) | |
+| `src/virtio_disk.zig` | [disk.md](disk.md#virtio-块设备驱动virtio_diskzig) | [devices.md](devices.md#中断路径汇总) |
+| `src/sleeplock.zig` | [disk.md](disk.md#睡眠锁sleeplockzig) | [process.md](process.md#锁) |
+| `src/bio.zig` | [disk.md](disk.md#缓冲区缓存biozig) | [syscalls.md](syscalls.md#调用列表) |
 | `src/ipi.zig` | [process.md](process.md#核间中断) | [riscv-sbi.md](riscv-sbi.md#用到的扩展)、[trap.md](trap.md#分发) |
 | `src/dtb.zig` | [devicetree.md](devicetree.md) | |
 | `src/page.zig` | [page-allocator.md](page-allocator.md) | |

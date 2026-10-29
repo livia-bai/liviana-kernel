@@ -59,6 +59,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "t_smp", .dir = "user/tests" },
         .{ .name = "t_cow", .dir = "user/tests" },
         .{ .name = "t_ipi", .dir = "user/tests" },
+        .{ .name = "t_disk", .dir = "user/tests" },
         // 数据段没有任何权限，用来验证 ELF 加载器会拒绝它
         .{ .name = "t_noperm", .dir = "user/tests", .linker_script = "user/tests/noperm.ld" },
     };
@@ -117,6 +118,18 @@ pub fn build(b: *std.Build) void {
         b.getInstallStep().dependOn(&install.step);
     }
 
+    // 磁盘镜像：4 MiB，1024 个 4 KiB 的块，内容是固定的图案（第 b 块的第 i 个字节是 (b * 131 + i) % 251），
+    // 回归测试 t_disk 和 qemu_test.py 照着它检查读写。装到 zig-out/disk.img。
+    // 还没有文件系统，以后由 mkfs 生成。
+    const disk_blocks = 1024;
+    const disk_block_size = 4096;
+    const disk_image = b.allocator.alloc(u8, disk_blocks * disk_block_size) catch @panic("OOM");
+    for (disk_image, 0..) |*byte, n| {
+        byte.* = @intCast(((n / disk_block_size) * 131 + n % disk_block_size) % 251);
+    }
+    const disk = b.addWriteFiles().add("disk.img", disk_image);
+    b.getInstallStep().dependOn(&b.addInstallFile(disk, "disk.img").step);
+
     // zig build run：用 QEMU 的 virt 机器启动内核。
     // -bios default 使用 QEMU 自带的 OpenSBI 固件，它在 M 模式完成初始化后
     // 以 S 模式跳到 0x80200000 执行内核。按 Ctrl-A 再按 X 退出 QEMU。
@@ -134,6 +147,11 @@ pub fn build(b: *std.Build) void {
         "-kernel",
     });
     qemu.addArtifactArg2(kernel, .{});
+    // 磁盘：virtio 块设备，用现代（version 2）的 virtio-mmio 接口（QEMU 默认是旧版的）。
+    // snapshot=on：写只进临时的覆盖层，QEMU 退出就丢掉，生成的镜像不会被改
+    qemu.addArgs(&.{ "-global", "virtio-mmio.force-legacy=false", "-drive" });
+    qemu.addPrefixedFileArg("if=none,format=raw,id=disk,snapshot=on,file=", disk);
+    qemu.addArgs(&.{ "-device", "virtio-blk-device,drive=disk,bus=virtio-mmio-bus.0" });
     qemu.addPassthruArgs();
 
     const run_step = b.step("run", "Run the kernel in QEMU");

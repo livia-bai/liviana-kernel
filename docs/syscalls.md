@@ -25,6 +25,7 @@ pub const Syscall = enum(usize) {
     read = 6, fork = 7, exec = 8, wait = 9, kill = 10, getppid = 11,
     setfg = 12, procinfo = 13, meminfo = 14, listprog = 15, shutdown = 16,
     close = 17, dup = 18, pipe = 19, sbrk = 20,
+    blockcount = 21, readblock = 22, writeblock = 23,
     _,
 };
 
@@ -32,6 +33,7 @@ pub const Errno = enum(usize) {
     perm = 1,     // EPERM：杀 init
     noent = 2,    // ENOENT：没有这个程序（exec、listprog）
     srch = 3,     // ESRCH：没有这个进程（kill、setfg）
+    nodev = 19,   // ENODEV：没有磁盘（readblock、writeblock）
     toobig = 7,   // E2BIG：命令行参数太多或太长（exec）
     noexec = 8,   // ENOEXEC：程序不是合法的 ELF（exec）
     badf = 9,     // EBADF：fd 没有打开，或者方向不对（往读端写、从写端读）
@@ -39,7 +41,7 @@ pub const Errno = enum(usize) {
     again = 11,   // EAGAIN：进程表满了（fork）
     nomem = 12,   // ENOMEM：物理内存不够（fork、exec、pipe），或者堆不能再长了（sbrk）
     fault = 14,   // EFAULT：指针指向的内存不属于用户空间、没有映射，或者要写的页不可写
-    inval = 22,   // EINVAL：参数不对（wait 的 options，sbrk 缩到堆的起点下面）
+    inval = 22,   // EINVAL：参数不对（wait 的 options，sbrk 缩到堆的起点下面，块号超出磁盘）
     nfile = 23,   // ENFILE：系统的文件表满了（pipe）
     mfile = 24,   // EMFILE：进程的 fd 表满了（dup、pipe）
     pipe = 32,    // EPIPE：管道的读端都关了（write）
@@ -52,6 +54,7 @@ pub const max_fds = 16;                  // 每个进程的 fd 表大小
 pub const stdin = 0, stdout = 1, stderr = 2;
 pub const max_args = 16;                 // exec 最多传几个参数
 pub const max_arg_bytes = 1024;          // 参数加起来最多多少字节
+pub const block_size = 4096;             // 磁盘块的大小，正好一页
 pub const Arg = extern struct { ptr: usize, len: usize };   // 一个命令行参数（不以 0 结尾）
 pub const wait_any: usize = 0 -% 1;   // wait 的 pid：任意一个子进程
 pub const wait_nohang: usize = 1;     // wait 的 options：不阻塞
@@ -96,6 +99,9 @@ pub fn errnoOf(ret: usize) ?Errno      // 返回值在 [-4095, -1] 内时取出�
 | 18 | `dup` | `a0` = fd | 新的 fd；`-EBADF`、`-EMFILE` | 编号最小的空闲 fd 指向同一个文件 |
 | 19 | `pipe` | `a0` = 两个 `u32` 的地址 | 0；`-EFAULT`、`-EMFILE`、`-ENFILE`、`-ENOMEM` | 创建管道，读端、写端的 fd 写进 `a0` 指向的地方（[files.md](files.md#管道)） |
 | 20 | `sbrk` | `a0` = 增量（有符号） | 原来的堆末尾；`-ENOMEM`、`-EINVAL` | 堆变大或变小（[process.md](process.md#sbrk堆)）。`sbrk(0)` 只查询 |
+| 21 | `blockcount` | 无 | 磁盘的块数，没有磁盘时是 0 | 每块 `abi.block_size` = 4096 字节（[disk.md](disk.md#系统调用)） |
+| 22 | `readblock` | `a0` = 块号，`a1` = 缓冲区地址 | 0；`-EINVAL`（块号超出磁盘）、`-ENODEV`、`-EFAULT` | 经过缓冲区缓存读一块，4096 字节写进缓冲区 |
+| 23 | `writeblock` | `a0` = 块号，`a1` = 缓冲区地址 | 0；`-EINVAL`、`-ENODEV`、`-EFAULT` | 缓冲区的 4096 字节写到这一块，写完才返回 |
 | 其他 | | | `-ENOSYS` | |
 
 ### 分发
@@ -256,6 +262,11 @@ pub fn close(fd: Fd) error{ BadFd, Unexpected }!void
 pub fn dup(fd: Fd) error{ BadFd, TooManyOpenFiles, Unexpected }!Fd
 pub fn pipe() error{ TooManyOpenFiles, SystemFdQuotaExceeded, OutOfMemory, Unexpected }![2]Fd   // { 读端, 写端 }
 pub fn sbrk(increment: isize) error{ OutOfMemory, InvalidArgument, Unexpected }!usize
+pub const block_size = abi.block_size;
+pub fn blockCount() u64
+pub fn readBlock(n: u64, buf: *[block_size]u8) BlockError!void
+pub fn writeBlock(n: u64, buf: *const [block_size]u8) BlockError!void
+// BlockError = error{ NoDevice, OutOfRange, BadAddress, Unexpected }
 pub fn fork() error{ TooManyProcesses, OutOfMemory, Unexpected }!usize
 pub fn exec(name: []const u8, args: []const []const u8) ExecError!noreturn
 pub fn execRaw(name: []const u8, args: []const abi.Arg) ExecError!noreturn
