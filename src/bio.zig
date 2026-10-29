@@ -110,13 +110,20 @@ fn find(blockno: u64) ?*Buf {
 
 /// 块 blockno 的缓冲区，拿着睡眠锁返回，内容是磁盘上的（不在缓存里就读进来）。
 pub fn read(blockno: u64) Error!*Buf {
-    const dev = try check(blockno);
     const b = try get(blockno);
-    if (!b.valid) {
-        dev.transfer(blockno, b.data, false);
-        b.valid = true;
-    }
+    _ = load(b);
     return b;
+}
+
+/// get 拿到的缓冲区内容无效的话从磁盘读进来。返回这次是不是真的读了磁盘：
+/// 文件系统只在读盘时验校验和，缓存里的内容验过了就不用每次都算（ctree.zig）。
+/// 发现内容不对的调用方把 valid 设回 false，下次再读盘。
+pub fn load(b: *Buf) bool {
+    std.debug.assert(b.lock.holding());
+    if (b.valid) return false;
+    device.?.transfer(b.blockno, b.data, false);
+    b.valid = true;
+    return true;
 }
 
 /// 把缓冲区写回磁盘，写完才返回。调用方拿着它的睡眠锁。

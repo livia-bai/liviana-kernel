@@ -162,6 +162,7 @@ pub const Device = struct { blocks: u64, transfer: *const fn (u64, *[block_size]
 pub fn init(dev: ?Device) void
 pub fn read(blockno: u64) Error!*Buf    // 拿着睡眠锁返回，内容是磁盘上的
 pub fn get(blockno: u64) Error!*Buf     // 拿着睡眠锁返回，不读磁盘（要整块覆盖时用）
+pub fn load(b: *Buf) bool               // 内容无效就从磁盘读进来，返回这次是不是真的读了盘
 pub fn write(b: *Buf) void              // 写回磁盘，写完才返回
 pub fn release(b: *Buf) void
 pub fn blockCount() u64
@@ -183,7 +184,7 @@ pub fn blockCount() u64
 
 `refcnt` 在放开 `bio.lock` 之前加，所以别人没法在“找到了”和“拿到睡眠锁”之间把这个缓冲区换成别的块。
 
-`read` = `get` + `valid` 为 false 时 `device.transfer(blockno, data, false)` 读进来。几个进程同时 `read` 同一块时，第一个拿到睡眠锁的去读盘，后面的醒来时看到 `valid` 已经是 true，不再读。
+`read` = `get` + `load`：`valid` 为 false 时 `device.transfer(blockno, data, false)` 读进来。`load` 返回这次是不是真的读了盘，写时复制 B 树只在读盘时验节点的校验和（[btree.md](btree.md#节点格式btreezig)）；发现内容不对的调用方把 `valid` 设回 false，下次重新读盘。几个进程同时 `read` 同一块时，第一个拿到睡眠锁的去读盘，后面的醒来时看到 `valid` 已经是 true，不再读。
 
 `get` 给要整块覆盖的调用方用：`writeblock` 系统调用整块写，不用先读旧的内容。覆盖完自己把 `valid` 设成 true 再 `write`。
 

@@ -14,4 +14,6 @@ test {
     _ = @import("ipi.zig");
     _ = @import("sleeplock.zig");
     _ = @import("bio.zig");
+    _ = @import("btree.zig");
+    _ = @import("ctree.zig");
 }
