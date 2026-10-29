@@ -99,7 +99,7 @@ pub fn free(page: *align(size) Page) void {
 
 ## 并发
 
-空闲链表和 `free_pages` 由一把自旋锁 `page.lock` 保护（[process.md](process.md#锁)），为多核做准备：几个 hart 会同时分配、释放。`alloc` 只在锁里摘下一页，清零放在锁外面（这一页已经是自己的了），持锁的时间很短。
+空闲链表和 `free_pages` 由一把自旋锁 `page.lock` 保护（[process.md](process.md#锁)）：几个 hart 会同时分配、释放。它是“叶子”锁，拿着进程锁、`wait_lock` 时也可以分配、释放页（`fork`、`reap`）。`meminfo` 系统调用不拿锁读 `free_pages`，别的 hart 正在分配、释放时读到的是某一瞬间前后的值，只用来显示。`alloc` 只在锁里摘下一页，清零放在锁外面（这一页已经是自己的了），持锁的时间很短。
 
 拿锁时中断必须关着（`Spinlock.acquire` 检查）。现在分配器只在启动阶段和系统调用里调用（`kmain`、`fork`、`exec`、`wait`、`sbrk`、`pipe`），从不在中断处理程序里调用，内核代码又都关着中断运行，所以满足。`kmain` 在创建 init 时就会分配页，这也是 `kmain` 不再打开 `sstatus.SIE` 的原因之一（[boot.md](boot.md#kmain-的初始化顺序)）。`meminfo` 系统调用读 `free_pages` 不拿锁：只是读一个数，读到稍旧的值也没关系。
 

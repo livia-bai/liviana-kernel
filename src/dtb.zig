@@ -30,9 +30,16 @@ pub const Info = struct {
     /// 不能分配出去的内存：设备树自己、内存保留块里的条目、/reserved-memory 的子节点。
     reserved_buf: [max_reserved]Region,
     reserved_len: usize,
+    /// 各个 hart 的编号：/cpus 下 device_type = "cpu"、没有被禁用（status 不是 "disabled"）的节点的 reg。
+    harts_buf: [max_harts]u32,
+    harts_len: usize,
 
     pub fn reserved(info: *const Info) []const Region {
         return info.reserved_buf[0..info.reserved_len];
+    }
+
+    pub fn harts(info: *const Info) []const u32 {
+        return info.harts_buf[0..info.harts_len];
     }
 };
 
@@ -43,6 +50,7 @@ pub const Error = error{
     BadToken,
     TooDeep,
     TooManyReserved,
+    TooManyHarts,
     UnsupportedCells,
     NoMemory,
     NoTimebase,
@@ -50,6 +58,7 @@ pub const Error = error{
 
 const magic: u32 = 0xd00dfeed;
 const max_reserved = 16;
+const max_harts = 32;
 const max_depth = 16;
 
 const Token = enum(u32) {
@@ -93,6 +102,10 @@ const Node = struct {
     size_cells: u32 = 1,
     /// device_type = "memory"
     is_memory: bool = false,
+    /// device_type = "cpu"
+    is_cpu: bool = false,
+    /// status = "disabled"
+    disabled: bool = false,
     reg: ?[]const u8 = null,
 };
 
@@ -127,6 +140,8 @@ pub fn parseBlob(blob: []const u8) Error!Info {
         .timebase_hz = 0,
         .reserved_buf = undefined,
         .reserved_len = 0,
+        .harts_buf = undefined,
+        .harts_len = 0,
     };
     try addReserved(&info, .{ .base = @intFromPtr(blob.ptr), .size = total });
 
@@ -170,6 +185,12 @@ pub fn parseBlob(blob: []const u8) Error!Info {
                     if (depth == 3 and std.mem.eql(u8, parent.name, "reserved-memory")) {
                         try addReservedReg(&info, node.reg.?, parent);
                     }
+                    // /cpus/cpu@N 的 reg 就是 hart 编号，按 /cpus 的 #address-cells 读（QEMU 上是 1）
+                    if (depth == 3 and std.mem.eql(u8, parent.name, "cpus") and node.is_cpu and !node.disabled) {
+                        if (info.harts_len == max_harts) return error.TooManyHarts;
+                        info.harts_buf[info.harts_len] = @truncate(try readCells(node.reg.?, 0, parent.address_cells));
+                        info.harts_len += 1;
+                    }
                 }
                 depth -= 1;
             },
@@ -203,6 +224,9 @@ fn handleProp(info: *Info, path: []Node, name: []const u8, value: []const u8) Er
         node.size_cells = try readBe(u32, value, 0);
     } else if (std.mem.eql(u8, name, "device_type")) {
         node.is_memory = std.mem.eql(u8, value, "memory\x00");
+        node.is_cpu = std.mem.eql(u8, value, "cpu\x00");
+    } else if (std.mem.eql(u8, name, "status")) {
+        node.disabled = std.mem.eql(u8, value, "disabled\x00");
     } else if (std.mem.eql(u8, name, "reg")) {
         node.reg = value;
     } else if (std.mem.eql(u8, name, "timebase-frequency")) {
@@ -327,7 +351,20 @@ fn testTree(f: *TestFdt, comptime with_timebase: bool) []const u8 {
     f.propCells("#size-cells", &.{0});
     if (with_timebase) f.propCells("timebase-frequency", &.{10_000_000});
     f.beginNode("cpu@0");
+    f.prop("device_type", "cpu\x00");
     f.propCells("reg", &.{0});
+    f.prop("status", "okay\x00");
+    f.endNode();
+    f.beginNode("cpu@1");
+    f.propCells("reg", &.{1}); // reg 写在 device_type 前面
+    f.prop("device_type", "cpu\x00");
+    f.endNode();
+    f.beginNode("cpu@2");
+    f.prop("device_type", "cpu\x00");
+    f.propCells("reg", &.{2});
+    f.prop("status", "disabled\x00");
+    f.endNode();
+    f.beginNode("cpu-map"); // 不是 cpu 节点（没有 device_type），也没有 reg
     f.endNode();
     f.endNode();
     f.endNode();
@@ -340,6 +377,8 @@ test "解析 QEMU virt 风格的设备树" {
     const info = try parseBlob(blob);
     try std.testing.expectEqual(Region{ .base = 0x8000_0000, .size = 128 << 20 }, info.memory);
     try std.testing.expectEqual(10_000_000, info.timebase_hz);
+    // hart：被禁用的 cpu@2 和不是 cpu 的 cpu-map 不算
+    try std.testing.expectEqualSlices(u32, &.{ 0, 1 }, info.harts());
     // 保留区：设备树自己、内存保留块里的一项、/reserved-memory 的子节点
     try std.testing.expectEqualSlices(Region, &.{
         .{ .base = @intFromPtr(blob.ptr), .size = blob.len },

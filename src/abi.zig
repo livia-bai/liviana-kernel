@@ -93,7 +93,7 @@ pub const Errno = enum(usize) {
 };
 
 /// 进程表的大小：最多同时有这么多个进程（包括 init、shell 和还没被回收的 zombie）。
-pub const max_procs = 8;
+pub const max_procs = 16;
 
 /// 每个进程最多同时打开多少个文件（fd 的范围是 0..max_fds）。
 pub const max_fds = 16;

@@ -1,10 +1,11 @@
 //! 进程和调度，照 xv6 的结构写：
 //!
-//! - 调度器 scheduler() 在启动栈上永远循环，依次扫描进程表，遇到 runnable 的进程就切过去，
-//!   等它切回来再接着往下扫。它只管调度，别的什么都不做。
-//! - 进程要让出 CPU 时，先改自己的状态，再调用 sched() 切回调度器：yield（时间片用完）、
+//! - 每个 hart 有自己的调度器 scheduler()，在这个 hart 的启动栈上永远循环，依次扫描进程表，
+//!   遇到 runnable 的进程就切过去，等它切回来再接着往下扫。它只管调度，别的什么都不做。
+//!   进程不绑定 hart：这次在哪个 hart 上让出 CPU，下次可能在另一个 hart 上接着运行。
+//! - 进程要让出 CPU 时，先拿上自己的锁、改自己的状态，再调用 sched() 切回调度器：yield（时间片用完）、
 //!   sleep（等某件事）、exit 都是这样。
-//! - 等待用 sleep(chan) / wakeup(chan)：chan 是任意一个地址，代表“在等什么”。sleep 系统调用睡在
+//! - 等待用 sleep(chan, lock) / wakeup(chan)：chan 是任意一个地址，代表“在等什么”。sleep 系统调用睡在
 //!   &timer.ticks 上，read 等键盘睡在 uart.rx_chan 上，wait 等子进程睡在自己的 Process 上。
 //! - 进程之间有父子关系：fork 复制当前进程，exec 换掉地址空间，exit 之后变成 zombie，等父进程 wait 回收。
 //!   第一个进程 init（pid 1）由 kmain 创建，父进程先结束的孤儿交给它回收。
@@ -19,10 +20,13 @@
 //!   栈底下面一页      不映射，栈溢出时触发缺页异常，而不是悄悄踩坏别的数据
 //!   0x8000_0000 往下  16 KiB 用户栈，可读写。最顶上放着 exec 传进来的命令行参数
 //!
-//! 锁：现在只有一个 hart，进程表、current、调度器的上下文都没有加锁，靠“内核全程关中断”保证不被打断。
-//! 多核时要像 xv6 那样给每个进程加锁（state、chan、killed 等）、给父子关系加 wait_lock，
-//! current 和 scheduler_context 改成每个 hart 一份。等待已经统一成 sleep(chan, lock) 的写法，
-//! 等的条件由传进来的锁保护（管道、键盘），到时候 sleep 内部再补上进程锁就行。
+//! 锁（照 xv6 的 proc.c，详见 docs/process.md 的“锁”一节）：
+//! - 每个进程的 lock 保护它的 state、chan、killed、xstatus、pid、ticks、name。调度器拿着它切到进程，
+//!   进程拿着它切回调度器，所以“改状态 + 切换”在别的 hart 看来是一步完成的。
+//! - wait_lock 保护所有进程的 parent，wait 拿着它睡在自己身上。加锁顺序：wait_lock 在前，进程锁在后；
+//!   别的锁（管道、串口、ticks）也都在进程锁前面拿，进程锁之后只会再拿页分配器、文件表这种不再往下拿锁的。
+//! - 其他字段（space、context、files、heap_start、brk）只有进程自己会读写（没有线程），不用加锁；
+//!   父进程 wait 回收 zombie 时它已经不再运行了。
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -35,6 +39,7 @@ const vm = @import("vm.zig");
 const trap = @import("trap.zig");
 const abi = @import("abi.zig");
 const file = @import("file.zig");
+const hart = @import("hart.zig");
 const spinlock = @import("spinlock.zig");
 const Spinlock = spinlock.Spinlock;
 
@@ -70,24 +75,29 @@ pub const max_procs = abi.max_procs;
 pub const State = abi.ProcState;
 
 pub const Process = struct {
+    /// 保护下面标着“lock”的字段。槽位一直在，锁也一直在：回收时不能连锁一起清掉（见 fill）
+    lock: Spinlock = .init("proc"),
+    /// lock
     state: State = .unused,
+    /// lock
     pid: usize = 0,
+    /// lock（exec 会改，procinfo 要读）
     name: []const u8 = "",
     /// 这个进程的根页表
     space: *vm.PageTable = undefined,
-    /// 父进程。init 没有父进程；父进程先结束时，子进程交给 init（见 finish）
+    /// wait_lock。父进程。init 没有父进程；父进程先结束时，子进程交给 init（见 finish）
     parent: ?*Process = null,
     /// 不在运行时，它的内核上下文保存在这里（见 switchContext）
     context: Context = undefined,
-    /// sleeping 时等的“通道”，wakeup 用同一个地址叫醒它
+    /// lock。sleeping 时等的“通道”，wakeup 用同一个地址叫醒它
     chan: ?*const anyopaque = null,
-    /// 被 kill 了的话是原因。进程回到 U 模式之前看到它就自己结束（见 checkKilled）
+    /// lock。被 kill 了的话是原因。进程回到 U 模式之前看到它就自己结束（见 checkKilled）
     killed: ?[]const u8 = null,
-    /// zombie 的结束状态，父进程 wait 时取走：正常退出时是退出码，被杀时是 abi.killed_status
+    /// lock。zombie 的结束状态，父进程 wait 时取走：正常退出时是退出码，被杀时是 abi.killed_status
     xstatus: u32 = 0,
-    /// 在 U 模式运行期间来过的时钟中断数，大致就是用掉的 CPU 时间（单位 10 ms）
+    /// lock。在 U 模式运行期间来过的时钟中断数，大致就是用掉的 CPU 时间（单位 10 ms）
     ticks: u64 = 0,
-    /// 打开的文件，下标就是 fd。只有进程自己会改（没有线程），不用加锁
+    /// 打开的文件，下标就是 fd
     files: [abi.max_fds]?*file.File = @splat(null),
     /// 堆的起点（程序最后一个段之后的页边界）和当前的末尾，见 sbrk
     heap_start: usize = 0,
@@ -97,18 +107,34 @@ pub const Process = struct {
 /// 进程表。槽位 i 的进程用 kernel_stacks[i] 作内核栈。
 pub var table: [max_procs]Process = @splat(.{});
 
-/// 正在运行的进程。在调度器里时为 null。
-pub var current: ?*Process = null;
-var next_pid: usize = 1;
+/// 保护所有进程的 parent 字段（xv6 的 wait_lock）。见文件开头的加锁顺序。
+var wait_lock: Spinlock = .init("wait");
 
-/// 第一个进程。孤儿交给它回收，它自己不能结束。
+/// 每个 hart 自己的状态（xv6 的 struct cpu），按 hart 编号下标。只有这个 hart 自己读写自己那一项。
+const Cpu = struct {
+    /// 正在这个 hart 上运行的进程，在调度器里时为 null
+    proc: ?*Process = null,
+    /// 调度器切到进程时保存的上下文，进程调用 sched() 时切回这里
+    context: Context = undefined,
+};
+var cpus: [hart.max]Cpu = @splat(.{});
+
+/// 当前 hart 上正在运行的进程，在调度器里时为 null。
+/// 关着中断读：进程只在关着中断时切换，读到的值在开中断之前都不会变。
+pub fn current() ?*Process {
+    return cpus[hart.id()].proc;
+}
+
+var next_pid: std.atomic.Value(usize) = .init(1);
+
+/// 第一个进程。孤儿交给它回收，它自己不能结束。userinit 设置之后不再改。
 var init_proc: ?*Process = null;
 
-/// 前台进程的 pid，0 表示没有。shell 用 setfg 系统调用设置，按 Ctrl-C 时内核杀掉它。
-pub var foreground: usize = 0;
+/// 前台进程的 pid，0 表示没有。shell 用 setfg 系统调用设置，按 Ctrl-C 时内核杀掉它（可能在另一个 hart 上）。
+var foreground: std.atomic.Value(usize) = .init(0);
 
 /// 每个进程陷入内核时用的栈，静态分配：页分配器只能一页一页地给，给不出连续的 16 KiB。
-/// 实测 Debug 模式下跑完全部 QEMU 测试，最深用了约 6.3 KiB。
+/// 实测 Debug 模式下跑完全部 QEMU 测试，最深用了约 8.2 KiB。
 var kernel_stacks: [max_procs][16 * 1024]u8 align(16) = undefined;
 
 /// 切换时保存的内核上下文。按 C 调用约定，跨函数调用需要保持不变的只有
@@ -119,14 +145,22 @@ const Context = extern struct {
     s: [12]usize,
 };
 
-/// 调度器切到进程时保存的上下文，进程调用 sched() 时切回这里。
-var scheduler_context: Context = undefined;
-
+/// 找一个空槽位，拿着它的锁返回（对应 xv6 的 allocproc）。拿着锁，别的 hart 就看不到它半填好的样子。
 fn allocSlot() error{TooManyProcesses}!*Process {
     for (&table) |*p| {
+        p.lock.acquire();
         if (p.state == .unused) return p;
+        p.lock.release();
     }
     return error.TooManyProcesses;
+}
+
+/// 把 p 除了锁以外的字段都换成 new 的（填一个新进程、回收时清空）。调用方拿着 p.lock：
+/// 直接 `p.* = .{...}` 会连锁一起覆盖，别的 hart 可能正在等这把锁。
+fn fill(p: *Process, new: Process) void {
+    inline for (comptime std.meta.fieldNames(Process)) |name| {
+        if (comptime !std.mem.eql(u8, name, "lock")) @field(p, name) = @field(new, name);
+    }
 }
 
 /// 进程从 U 模式陷入时的 TrapFrame，总在它的内核栈最顶端（trapEntry 从 sscratch = 栈顶开始压栈，
@@ -162,26 +196,30 @@ pub const SpawnError = error{ TooManyProcesses, OutOfMemory, BadElf, TooManyFile
 
 /// 创建第一个进程 init（对应 xv6 的 userinit）：加载嵌在内核里的 init 程序，命令行参数是 "init"，
 /// 打开串口作为 0、1、2 号 fd，状态为 runnable。kmain 在启动调度器之前调用。
+/// 这时别的 hart 已经在调度器里了，放开 init 的锁之后它可能立刻在别的 hart 上运行。
 pub fn userinit() SpawnError!void {
     const program = find("init") orelse @panic("no init program (see build.zig)");
-    const p = try allocSlot();
     const image = try loadImage(program, &.{"init"});
     errdefer vm.destroyUserSpace(image.space);
     const console = try file.openConsole();
-    p.* = .{
+    const p = try allocSlot();
+    defer p.lock.release();
+    var files: [abi.max_fds]?*file.File = @splat(null);
+    files[abi.stdin] = console;
+    files[abi.stdout] = file.dup(console);
+    files[abi.stderr] = file.dup(console);
+    startFrame(frameOf(p), image);
+    fill(p, .{
         .state = .runnable,
-        .pid = next_pid,
+        .pid = next_pid.fetchAdd(1, .monotonic),
         .name = program.name,
         .space = image.space,
         .context = firstContext(p),
+        .files = files,
         .heap_start = image.brk,
         .brk = image.brk,
-    };
-    p.files[abi.stdin] = console;
-    p.files[abi.stdout] = file.dup(console);
-    p.files[abi.stderr] = file.dup(console);
-    startFrame(frameOf(p), image);
-    next_pid += 1;
+    });
+    // 在放开锁之前设置：别的 hart 要先拿到这把锁才能运行 init，那时一定看得到 init_proc
     init_proc = p;
 }
 
@@ -191,26 +229,35 @@ pub const ForkError = error{ TooManyProcesses, OutOfMemory };
 /// TrapFrame 也是复制的，所以它被调度后从同一个 ecall 之后继续执行，只是 a0（fork 的返回值）是 0。
 /// 打开的文件和父进程共用（引用数加 1）。
 /// 由系统调用处理程序调用：这时 handleTrap 已经把父进程 TrapFrame 里的 sepc 加过 4 了。
+///
+/// 先复制地址空间（不拿锁，可能要很久），再拿着 wait_lock 和子进程的锁一次填好所有字段：
+/// 子进程从别的 hart 看来要么还不存在，要么已经完整地 runnable 了。
 pub fn fork() ForkError!usize {
-    const parent = current.?;
-    const child = try allocSlot();
+    const parent = current().?;
     const space = try vm.cloneUserSpace(parent.space);
+    errdefer vm.destroyUserSpace(space);
+    wait_lock.acquire();
+    defer wait_lock.release();
+    const child = try allocSlot();
+    defer child.lock.release();
     const frame = frameOf(child);
     frame.* = frameOf(parent).*;
     frame.regs[10] = 0;
-    child.* = .{
+    var files: [abi.max_fds]?*file.File = undefined;
+    for (&files, parent.files) |*c, f| c.* = if (f) |x| file.dup(x) else null;
+    const pid = next_pid.fetchAdd(1, .monotonic);
+    fill(child, .{
         .state = .runnable,
-        .pid = next_pid,
+        .pid = pid,
         .name = parent.name,
         .space = space,
         .parent = parent,
         .context = firstContext(child),
+        .files = files,
         .heap_start = parent.heap_start,
         .brk = parent.brk,
-    };
-    for (&child.files, parent.files) |*c, f| c.* = if (f) |x| file.dup(x) else null;
-    next_pid += 1;
-    return child.pid;
+    });
+    return pid;
 }
 
 pub const ExecError = error{ NoSuchProgram, OutOfMemory, BadElf };
@@ -219,7 +266,7 @@ pub const ExecError = error{ NoSuchProgram, OutOfMemory, BadElf };
 /// 个数和总长度由调用方检查过）。成功时 TrapFrame 已经改成从新程序的入口开始，系统调用返回后就进入新程序；
 /// 失败时原来的地址空间和 TrapFrame 都不变，系统调用照常返回错误。pid、父进程、ticks、打开的文件不变。
 pub fn exec(name: []const u8, args: []const []const u8) ExecError!void {
-    const p = current.?;
+    const p = current().?;
     const program = find(name) orelse return error.NoSuchProgram;
     const image = try loadImage(program, args);
     // 先切到新的地址空间，才能释放正在用的旧页表
@@ -227,7 +274,9 @@ pub fn exec(name: []const u8, args: []const []const u8) ExecError!void {
     p.space = image.space;
     vm.activate(image.space);
     vm.destroyUserSpace(old);
+    p.lock.acquire();
     p.name = program.name;
+    p.lock.release();
     p.heap_start = image.brk;
     p.brk = image.brk;
     startFrame(frameOf(p), image);
@@ -279,7 +328,7 @@ pub const SbrkError = error{ OutOfMemory, InvalidArgument };
 /// 堆按页映射：变大时把新跨进来的页映射上（清零、可读写），变小时把整个落在新末尾之后的页释放掉。
 /// 不能小于堆的起点（InvalidArgument），不能长进栈下面的保护页（OutOfMemory）。失败时什么都不变。
 pub fn sbrk(increment: isize) SbrkError!usize {
-    const p = current.?;
+    const p = current().?;
     const old = p.brk;
     const new = if (increment >= 0)
         std.math.add(usize, old, @intCast(increment)) catch return error.OutOfMemory
@@ -298,60 +347,91 @@ pub fn sbrk(increment: isize) SbrkError!usize {
 }
 
 /// 新进程（init 和 fork 出来的子进程）第一次被调度时从这里开始（对应 xv6 的 forkret），sp 指向它的 TrapFrame。
-/// 和陷阱返回一样，进入 U 模式之前先检查是不是已经被杀了，然后经 trapExit 进入 U 模式。
-/// checkKilled 是普通函数，只用 sp 以下的栈，不会碰到 TrapFrame。
+/// 调度器是拿着进程锁切过来的，先在 forkretC 里放开；和陷阱返回一样，进入 U 模式之前先检查是不是已经被杀了，
+/// 然后经 trapExit 进入 U 模式。forkretC 是普通函数，只用 sp 以下的栈，不会碰到 TrapFrame。
 fn forkret() callconv(.naked) noreturn {
     asm volatile (
-        \\call %[checkKilled]
+        \\call %[forkretC]
         \\tail %[trapExit]
         :
-        : [checkKilled] "X" (&checkKilled),
+        : [forkretC] "X" (&forkretC),
           [trapExit] "X" (&trap.trapExit),
     );
 }
 
-/// 调度器（对应 xv6 的 scheduler()）。kmain 初始化完之后调用，在启动栈上永远循环：
+fn forkretC() callconv(.c) void {
+    current().?.lock.release();
+    checkKilled();
+    spinlock.assertNoneHeld();
+}
+
+/// 调度器（对应 xv6 的 scheduler()）。每个 hart 初始化完之后调用，在这个 hart 的启动栈上永远循环：
 /// 依次扫描进程表，遇到 runnable 的就切过去运行，等它调用 sched() 切回来，再接着往下扫。
-/// 所以每个 runnable 的进程每一圈运行一次，自然就是轮转。
+/// 所以每个 runnable 的进程每一圈运行一次，自然就是轮转。几个 hart 的调度器同时扫同一张进程表，
+/// 靠进程锁保证一个进程同一时刻只在一个 hart 上运行：拿着锁检查 runnable、改成 running，
+/// 一直拿到进程切回来为止（锁在中间由进程那一边放开、再拿上，见 sched 的调用方）。
 pub fn scheduler() noreturn {
+    const c = &cpus[hart.id()];
     while (true) {
         // 进程和调度器都是关着中断运行的，中断只在这里打开一下：处理挂起的中断（它们可能叫醒进程），
         // 再关上。关着中断扫描、wfi：扫完发现没有可运行的进程、正要 wfi 时来了中断的话，
         // 中断保持挂起，wfi 立刻返回（wfi 只看 sie，不看 sstatus.SIE），不会白睡一觉。
+        // 别的 hart 叫醒了进程的话，这个 hart 要等到自己的下一个时钟中断（最多 10 ms）才会去看。
         riscv.enableInterrupts();
         riscv.disableInterrupts();
+        hart.checkPanic();
         var found = false;
         for (&table) |*p| {
+            p.lock.acquire();
+            defer p.lock.release();
             if (p.state != .runnable) continue;
             p.state = .running;
-            current = p;
+            c.proc = p;
             vm.activate(p.space);
-            switchContext(&scheduler_context, &p.context);
-            // 进程让出了 CPU。切回内核页表：它可能已经结束，父进程回收它时要释放它的页表
+            switchContext(&c.context, &p.context);
+            // 进程让出了 CPU，切回来时又拿着它的锁。先切回内核页表再放开锁：它可能已经结束，
+            // 父进程拿到它的锁才能回收它、释放它的页表，那时这个 hart 不能还在用这张页表
             vm.activate(vm.kernel_root);
-            current = null;
+            c.proc = null;
             found = true;
         }
         if (!found) riscv.wfi();
     }
 }
 
-/// 当前进程切回调度器（对应 xv6 的 sched()）。调用前要先把自己的状态改掉（不再是 running）。
-/// 等调度器下次挑中这个进程时，switchContext 才返回，从这里接着往下执行。
+/// 当前进程切回调度器（对应 xv6 的 sched()）。调用前要拿着自己的锁（不能拿着别的锁），
+/// 并且已经把自己的状态改掉（不再是 running）。等调度器下次挑中这个进程时（可能在别的 hart 上），
+/// switchContext 才返回，从这里接着往下执行，那时又拿着自己的锁。
 fn sched() void {
     // 单元测试在主机上运行，不会走到这里（管道等的测试只走不需要等待的路径），但会被编译
     if (comptime !builtin.cpu.arch.isRISCV()) @panic("sched() in a unit test");
-    const p = current.?;
+    const p = current().?;
+    if (!p.lock.holding()) @panic("sched: not holding the process lock");
+    // 拿着别的锁切走的话，别的进程再拿这把锁就会死锁
+    if (spinlock.heldCount() != 1) std.debug.panic("sched: {d} spinlocks held", .{spinlock.heldCount()});
     std.debug.assert(p.state != .running);
     std.debug.assert(riscv.read(.sstatus) & riscv.sstatus_sie == 0);
-    spinlock.assertNoneHeld(); // 拿着锁切走的话，别的进程再拿这把锁就会死锁
-    switchContext(&p.context, &scheduler_context);
+    // 不能缓存 cpus[hart.id()]：切回来时可能已经在另一个 hart 上了
+    switchContext(&p.context, &cpus[hart.id()].context);
 }
 
-/// 当前进程让出 CPU，别的 runnable 进程先运行，轮到它时返回。由陷阱处理程序调用（关着中断）。
+/// 当前进程让出 CPU，别的 runnable 进程先运行，轮到它时返回。yield 系统调用用。
 pub fn yield() void {
-    current.?.state = .runnable;
+    const p = current().?;
+    p.lock.acquire();
+    p.state = .runnable;
     sched();
+    p.lock.release();
+}
+
+/// 时钟中断打断了 U 模式的当前进程：记一个 tick，让出 CPU。由陷阱处理程序调用（关着中断）。
+pub fn yieldTimeslice() void {
+    const p = current().?;
+    p.lock.acquire();
+    p.ticks += 1;
+    p.state = .runnable;
+    sched();
+    p.lock.release();
 }
 
 /// 当前进程睡在 chan 上，直到别人调用 wakeup(chan)。
@@ -359,37 +439,44 @@ pub fn yield() void {
 /// 醒来不代表等的条件已经满足（同一个 chan 上可能有好几个进程在等不同的东西，也可能被 kill 叫醒），
 /// 所以调用方要在循环里检查条件：`while (!条件) sleep(chan, lock);`。
 ///
-/// lock 是保护这个条件的锁，调用方拿着它检查条件、拿着它调用 sleep；sleep 睡下之后放开它，
-/// 醒来再重新拿上（xv6 的写法）。这样“检查完条件、还没睡下”的时候，改条件的一方（要先拿这把锁）
-/// 插不进来，不会丢掉 wakeup（lost wakeup）。现在只有一个 hart、全程关中断，这一点本来就成立；
-/// 多核时还要在这里拿上进程自己的锁，直到切回调度器为止。条件没有锁保护的（时钟 tick、wait）传 null。
-pub fn sleep(chan: *const anyopaque, lock: ?*Spinlock) void {
-    const p = current.?;
+/// lock 是保护这个条件的锁，调用方拿着它检查条件、拿着它调用 sleep；sleep 先拿上自己的进程锁，
+/// 再放开 lock，睡下、切走之后调度器才放开进程锁；醒来先放开进程锁，再重新拿上 lock（xv6 的写法）。
+/// 改条件的一方要先拿 lock，wakeup 要拿进程锁，所以从“检查完条件”到“切走”之间它插不进来，
+/// 不会丢掉 wakeup（lost wakeup），也不会在这个进程还没切走时就被另一个 hart 的调度器运行。
+pub fn sleep(chan: *const anyopaque, lock: *Spinlock) void {
+    const p = current().?;
+    p.lock.acquire();
+    lock.release();
     p.chan = chan;
     p.state = .sleeping;
-    if (lock) |l| l.release();
     sched();
     p.chan = null;
-    if (lock) |l| l.acquire();
+    p.lock.release();
+    lock.acquire();
 }
 
 /// 叫醒所有睡在 chan 上的进程。只改状态，不切换，中断处理程序里也能调用。
+/// 跳过当前进程：它在运行，不会在睡；调用方可能还拿着它的锁。
 pub fn wakeup(chan: *const anyopaque) void {
+    const me = current();
     for (&table) |*p| {
+        if (p == me) continue;
+        p.lock.acquire();
+        defer p.lock.release();
         if (p.state == .sleeping and p.chan == chan) p.state = .runnable;
     }
 }
 
 /// 当前进程调用了 exit。由系统调用处理程序调用，不返回。
 pub fn exit(code: u8) noreturn {
-    const p = current.?;
+    const p = current().?;
     uart.print("[proc] pid {d} ({s}) exited with code {d}\n", .{ p.pid, p.name, code });
     finish(p, code);
 }
 
 /// 强行结束当前进程。由陷阱处理程序调用，不返回。
 pub fn killCurrent(comptime reason: []const u8, args: anytype) noreturn {
-    const p = current.?;
+    const p = current().?;
     uart.print("[proc] pid {d} ({s}) killed: " ++ reason ++ "\n", .{ p.pid, p.name } ++ args);
     finish(p, abi.killed_status);
 }
@@ -397,15 +484,20 @@ pub fn killCurrent(comptime reason: []const u8, args: anytype) noreturn {
 /// 当前进程是否被 kill 了。等待的循环里用它提前返回，回到陷阱处理程序后结束。
 /// 单元测试里没有当前进程，返回 false。
 pub fn isKilled() bool {
-    const p = current orelse return false;
+    const p = current() orelse return false;
+    p.lock.acquire();
+    defer p.lock.release();
     return p.killed != null;
 }
 
 /// 当前进程被 kill 过的话就结束它，否则返回。陷阱处理程序回到 U 模式之前、新进程第一次进入 U 模式之前调用，
 /// 所以被杀的进程不会再执行一条用户指令。
-pub fn checkKilled() callconv(.c) void {
-    const p = current.?;
-    if (p.killed) |reason| killCurrent("{s}", .{reason});
+pub fn checkKilled() void {
+    const p = current().?;
+    p.lock.acquire();
+    const reason = p.killed;
+    p.lock.release();
+    if (reason) |r| killCurrent("{s}", .{r});
 }
 
 /// 结束当前进程（对应 xv6 的 exit 的后半部分）：关掉打开的文件，子进程交给 init，自己变成 zombie，
@@ -419,87 +511,137 @@ fn finish(p: *Process, status: u32) noreturn {
         if (f.*) |x| file.close(x);
         f.* = null;
     }
+    wait_lock.acquire();
     reparent(p, init);
+    // 父进程可能在 wait 里睡着。它要拿 wait_lock 才能检查子进程，所以先叫醒、后改状态也不会漏掉
+    wakeup(p.parent.?);
+    p.lock.acquire();
     p.xstatus = status;
     p.state = .zombie;
-    wakeup(p.parent.?);
+    wait_lock.release();
+    // 拿着自己的锁切走，调度器换回内核页表之后才放开：父进程要拿到这把锁才能回收它
     sched();
     unreachable; // 调度器不会再切回已经结束的进程
 }
 
-/// 把 p 的子进程都交给 init。交过去的可能已经是 zombie，所以叫醒 init 来回收。
+/// 把 p 的子进程都交给 init。交过去的可能已经是 zombie，所以叫醒 init 来回收。调用方拿着 wait_lock。
 fn reparent(p: *Process, init: *Process) void {
+    std.debug.assert(wait_lock.holding());
     for (&table) |*c| {
-        if (c.state != .unused and c.parent == p) {
+        // 空槽位的 parent 是 null（回收时清掉的），不会等于 p
+        if (c.parent == p) {
             c.parent = init;
             wakeup(init);
         }
     }
 }
 
-pub const WaitError = error{NoChildren};
+pub const WaitError = error{ NoChildren, BadAddress };
 
-/// 找一个已经结束的子进程（对应 xv6 的 wait）。pid 为 abi.wait_any 时找任意一个子进程，否则只找这个 pid。
-/// 有子进程但都还没结束时，睡在自己身上等子进程的 finish 叫醒；nohang 时不等，返回 null。
+/// 等一个子进程结束并回收它（对应 xv6 的 wait），返回它的 pid。pid 为 abi.wait_any 时等任意一个子进程，
+/// 否则只等这一个。status_ptr 不为 0 时先把结束状态写进当前进程的这个地址，写不进去就返回 BadAddress，
+/// 不回收（子进程还在，可以再 wait 一次）。
+/// 有子进程但都还没结束时，拿着 wait_lock 睡在自己身上，等子进程的 finish 叫醒；nohang 时不等，返回 null。
 /// 被 kill 了也返回 null，回到陷阱处理程序后结束。
-/// 返回的 zombie 还没有回收：调用方取走 xstatus 后调用 reap。
-pub fn waitChild(pid: usize, nohang: bool) WaitError!?*Process {
-    const p = current.?;
+pub fn wait(pid: usize, nohang: bool, status_ptr: usize) WaitError!?usize {
+    const p = current().?;
+    wait_lock.acquire();
+    defer wait_lock.release();
     while (true) {
-        if (try findZombieChild(p, pid)) |c| return c;
-        if (nohang or p.killed != null) return null;
-        sleep(p, null);
+        if (try findZombieChild(p, pid)) |c| {
+            defer c.lock.release();
+            if (status_ptr != 0) {
+                vm.copyToUser(p.space, status_ptr, std.mem.asBytes(&c.xstatus)) catch return error.BadAddress;
+            }
+            const child_pid = c.pid;
+            reap(c);
+            return child_pid;
+        }
+        if (nohang or isKilled()) return null;
+        sleep(p, &wait_lock);
     }
 }
 
-/// 在 p 的子进程（pid 为 abi.wait_any 时是全部，否则只看这一个）里找一个 zombie。
-/// 有符合条件的子进程但都还没结束时返回 null，一个都没有时返回 NoChildren。
+/// 在 p 的子进程（pid 为 abi.wait_any 时是全部，否则只看这一个）里找一个 zombie，拿着它的锁返回。
+/// 有符合条件的子进程但都还没结束时返回 null，一个都没有时返回 NoChildren。调用方拿着 wait_lock，
+/// 所以 parent 字段不会变；子进程的状态要拿它的锁才能看。
 fn findZombieChild(p: *Process, pid: usize) WaitError!?*Process {
+    std.debug.assert(wait_lock.holding());
     var have_kids = false;
     for (&table) |*c| {
-        if (c.state == .unused or c.parent != p) continue;
-        if (pid != abi.wait_any and c.pid != pid) continue;
-        have_kids = true;
-        if (c.state == .zombie) return c;
+        if (c.parent != p) continue;
+        c.lock.acquire();
+        if (pid == abi.wait_any or c.pid == pid) {
+            have_kids = true;
+            if (c.state == .zombie) return c;
+        }
+        c.lock.release();
     }
     return if (have_kids) null else error.NoChildren;
 }
 
 /// 回收 zombie：释放地址空间（所有用户页和页表），腾出槽位。内核栈是静态的，留给下一个用这个槽位的进程。
-pub fn reap(c: *Process) void {
+/// 调用方拿着 wait_lock（清 parent）和 c.lock。c 已经不在任何 hart 上运行了：它是拿着自己的锁切回调度器的，
+/// 调度器换回内核页表之后才放开这把锁，所以这里拿得到锁时，它的页表和内核栈都没人在用了。
+fn reap(c: *Process) void {
     std.debug.assert(c.state == .zombie);
     for (c.files) |f| std.debug.assert(f == null); // finish 关掉了
     vm.destroyUserSpace(c.space);
-    c.* = .{};
+    fill(c, .{});
 }
 
 pub const KillError = error{ NoSuchProcess, PermissionDenied };
 
 /// 杀掉进程 pid（对应 xv6 的 kill()）：只记下原因，在睡的叫醒，不当场结束它——
-/// 它可能停在内核栈上的任何地方（sleep 里、yield 里），只有它自己知道怎么安全地收尾。
-/// 它下一次被调度、回到 U 模式之前会在 checkKilled 里结束。只改标志和状态，中断处理程序里也能调用（Ctrl-C）。
+/// 它可能停在内核栈上的任何地方（sleep 里、yield 里），也可能正在另一个 hart 上运行，
+/// 只有它自己知道怎么安全地收尾。它下一次回到 U 模式之前会在 checkKilled 里结束：
+/// 正在另一个 hart 的 U 模式里运行的，最晚等到那个 hart 的下一个时钟中断。
+/// 只改标志和状态，中断处理程序里也能调用。
 /// init 不能杀：它结束内核就 panic。已经结束的进程（zombie）照常返回成功，什么也不变。
 pub fn kill(pid: usize, reason: []const u8) KillError!void {
-    const p = findPid(pid) orelse return error.NoSuchProcess;
+    const p = lockPid(pid) orelse return error.NoSuchProcess;
+    defer p.lock.release();
     if (p == init_proc) return error.PermissionDenied;
+    markKilled(p, reason);
+}
+
+/// 调用方拿着 p.lock。同一个进程被杀两次，保留第一次的原因。
+fn markKilled(p: *Process, reason: []const u8) void {
     if (p.killed == null) p.killed = reason;
     if (p.state == .sleeping) p.state = .runnable;
+}
+
+/// 设置前台进程（setfg 系统调用），pid 为 0 表示没有。
+pub fn setForeground(pid: usize) error{NoSuchProcess}!void {
+    if (pid != 0) {
+        const p = lockPid(pid) orelse return error.NoSuchProcess;
+        p.lock.release();
+    }
+    foreground.store(pid, .monotonic);
 }
 
 /// 用户按了 Ctrl-C：杀掉前台进程和它的所有子孙进程（shell 运行管道时，各个阶段都是前台进程的子进程）。
 /// 没有前台进程（或者它已经结束了）时什么也不做，所以在 shell 里随手按的 Ctrl-C 不会留到下一个程序。
 /// 由串口的中断处理程序调用，和 xv6 的 consoleintr 处理控制字符一样。
-/// kill 只做标记，标记的时候谁也没有结束，父子关系还是完整的，一遍就能找全。
+/// 拿着 wait_lock 扫描：父子关系在这期间不会变，前台进程也不会被回收，一遍就能找全。
 pub fn interruptForeground() void {
-    const fg = findPid(foreground) orelse return;
-    if (fg.state == .zombie or fg == init_proc) return;
+    wait_lock.acquire();
+    defer wait_lock.release();
+    const fg = lockPid(foreground.load(.monotonic)) orelse return;
+    const alive = fg.state != .zombie and fg != init_proc;
+    fg.lock.release();
+    if (!alive) return;
     uart.write("^C\n");
     for (&table) |*p| {
-        if (p.state != .unused and isDescendant(p, fg)) kill(p.pid, "interrupted by Ctrl-C") catch unreachable;
+        // 空槽位的 parent 是 null，除非它就是 fg，否则不算 fg 的子孙
+        if (!isDescendant(p, fg)) continue;
+        p.lock.acquire();
+        defer p.lock.release();
+        if (p.state != .unused) markKilled(p, "interrupted by Ctrl-C");
     }
 }
 
-/// p 是不是 ancestor 自己或者它的子孙。
+/// p 是不是 ancestor 自己或者它的子孙。调用方拿着 wait_lock。
 fn isDescendant(p: *Process, ancestor: *Process) bool {
     var q: ?*Process = p;
     while (q) |x| : (q = x.parent) {
@@ -508,12 +650,43 @@ fn isDescendant(p: *Process, ancestor: *Process) bool {
     return false;
 }
 
-pub fn findPid(pid: usize) ?*Process {
+/// 找到进程 pid，拿着它的锁返回。pid 为 0 或者没有这个进程时返回 null。
+fn lockPid(pid: usize) ?*Process {
     if (pid == 0) return null;
     for (&table) |*p| {
+        p.lock.acquire();
         if (p.state != .unused and p.pid == pid) return p;
+        p.lock.release();
     }
     return null;
+}
+
+/// 当前进程的父进程的 pid，init 返回 0（getppid 系统调用）。
+pub fn parentPid() usize {
+    wait_lock.acquire();
+    defer wait_lock.release();
+    // 拿着 wait_lock，父进程不会被回收，它的 pid 不会变
+    return if (current().?.parent) |q| q.pid else 0;
+}
+
+/// 进程表第 i 个槽位的进程信息（procinfo 系统调用），空槽位返回 null。
+pub fn info(i: usize) ?abi.ProcInfo {
+    wait_lock.acquire();
+    defer wait_lock.release();
+    const p = &table[i];
+    p.lock.acquire();
+    defer p.lock.release();
+    if (p.state == .unused) return null;
+    var result: abi.ProcInfo = .{
+        .pid = p.pid,
+        .ppid = if (p.parent) |q| q.pid else 0,
+        .ticks = p.ticks,
+        .state = p.state,
+        .name_len = @intCast(@min(p.name.len, 16)),
+        .name = @splat(0),
+    };
+    @memcpy(result.name[0..result.name_len], p.name[0..result.name_len]);
+    return result;
 }
 
 /// 把当前的内核上下文保存到 from，再恢复 to 里保存的上下文：恢复出来的 ra、sp 是别处
@@ -716,8 +889,9 @@ test "ELF 加载器拒绝坏文件" {
 /// 测试用：清空进程表和全局状态。
 fn testReset() void {
     table = @splat(.{});
-    current = null;
+    cpus = @splat(.{});
     init_proc = null;
+    foreground.store(0, .monotonic);
 }
 
 test "wakeup 只叫醒睡在同一个通道上的进程；kill 只做标记，叫醒在睡的进程，不能杀 init" {
@@ -751,6 +925,35 @@ test "wakeup 只叫醒睡在同一个通道上的进程；kill 只做标记，�
     try expectEqual(null, table[0].killed);
     try std.testing.expectError(error.NoSuchProcess, kill(99, "x"));
     try std.testing.expectError(error.NoSuchProcess, kill(0, "x"));
+    for (&table) |*p| try std.testing.expect(!p.lock.holding()); // 都放开了
+}
+
+test "setfg 检查 pid；Ctrl-C 找的是前台进程和它的子孙，没有前台进程时什么也不做" {
+    const expectEqual = std.testing.expectEqual;
+    testReset();
+    defer testReset();
+    const init = &table[0];
+    init.* = .{ .state = .sleeping, .pid = 1 };
+    table[1] = .{ .state = .sleeping, .pid = 2, .parent = init }; // sh
+    table[2] = .{ .state = .sleeping, .pid = 3, .parent = &table[1] }; // 前台的管道组长
+    table[3] = .{ .state = .runnable, .pid = 4, .parent = &table[2] };
+    table[4] = .{ .state = .sleeping, .pid = 5, .parent = &table[3] }; // 孙进程
+    table[5] = .{ .state = .runnable, .pid = 6, .parent = &table[1] }; // 后台进程
+    init_proc = init;
+
+    interruptForeground(); // 没有前台进程
+    for (table[0..6]) |p| try expectEqual(null, p.killed);
+
+    try setForeground(3);
+    try std.testing.expectError(error.NoSuchProcess, setForeground(99));
+    try expectEqual(3, foreground.load(.monotonic));
+    // interruptForeground 会打印 ^C，单元测试里没有串口，只测找子孙的部分
+    wait_lock.acquire();
+    defer wait_lock.release();
+    for (table[0..6], [_]bool{ false, false, true, true, true, false }) |*p, expected| {
+        try expectEqual(expected, isDescendant(p, &table[2]));
+    }
+    try expectEqual(false, isDescendant(&table[6], &table[2])); // 空槽位
 }
 
 test "wait 只找自己的子进程，按 pid 挑；子进程结束时交给 init" {
@@ -767,8 +970,16 @@ test "wait 只找自己的子进程，按 pid 挑；子进程结束时交给 ini
     table[4] = .{ .state = .zombie, .pid = 5, .parent = init }; // 不是 sh 的子进程
     init_proc = init;
 
-    try expectEqual(&table[3], (try findZombieChild(sh, abi.wait_any)).?);
-    try expectEqual(&table[3], (try findZombieChild(sh, 4)).?);
+    wait_lock.acquire();
+    defer wait_lock.release();
+    // 找到的 zombie 是拿着锁返回的
+    const z = (try findZombieChild(sh, abi.wait_any)).?;
+    try expectEqual(&table[3], z);
+    try std.testing.expect(z.lock.holding());
+    z.lock.release();
+    const z4 = (try findZombieChild(sh, 4)).?;
+    try expectEqual(&table[3], z4);
+    z4.lock.release();
     try expectEqual(null, try findZombieChild(sh, 3)); // 还在运行
     try std.testing.expectError(error.NoChildren, findZombieChild(sh, 5)); // 别人的子进程
     try std.testing.expectError(error.NoChildren, findZombieChild(sh, 99));
@@ -780,5 +991,18 @@ test "wait 只找自己的子进程，按 pid 挑；子进程结束时交给 ini
     try expectEqual(init, table[3].parent.?);
     try expectEqual(.runnable, init.state);
     try std.testing.expectError(error.NoChildren, findZombieChild(sh, abi.wait_any));
-    try expectEqual(&table[3], (try findZombieChild(init, abi.wait_any)).?);
+    const z5 = (try findZombieChild(init, abi.wait_any)).?;
+    try expectEqual(&table[3], z5);
+    z5.lock.release();
+    for (&table) |*p| try std.testing.expect(!p.lock.holding());
+}
+
+test "fill 换掉除了锁以外的所有字段" {
+    var p: Process = .{ .state = .zombie, .pid = 7, .name = "x", .ticks = 3, .heap_start = 1, .brk = 2 };
+    p.lock.acquire();
+    fill(&p, .{});
+    try std.testing.expect(p.lock.holding());
+    try std.testing.expectEqual(.unused, p.state);
+    try std.testing.expectEqual(0, p.pid + p.ticks + p.heap_start + p.brk);
+    p.lock.release();
 }

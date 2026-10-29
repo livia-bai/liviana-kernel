@@ -1,5 +1,6 @@
-//! 内核入口。OpenSBI 以 S 模式跳到 _start，此时 a0 = 当前 hart 编号，a1 = 设备树（DTB）地址；
-//! 分页关闭（虚拟地址 = 物理地址），中断关闭，还没有栈。
+//! 内核入口。OpenSBI 只启动一个 hart（启动 hart），以 S 模式跳到 _start，此时 a0 = 它的 hart 编号，
+//! a1 = 设备树（DTB）地址；分页关闭（虚拟地址 = 物理地址），中断关闭，还没有栈。
+//! 别的 hart 由 kmain 用 SBI 的 HSM 扩展启动，从 secondaryEntry 进来。
 
 const std = @import("std");
 const riscv = @import("riscv.zig");
@@ -12,6 +13,7 @@ const dtb = @import("dtb.zig");
 const page = @import("page.zig");
 const vm = @import("vm.zig");
 const proc = @import("proc.zig");
+const hart = @import("hart.zig");
 
 /// 替换标准库默认的 panic 处理。@panic、std.debug.panic 以及
 /// Debug 模式下的安全检查失败（整数溢出、数组越界等）都会走到这里。
@@ -20,18 +22,38 @@ pub const panic = std.debug.FullPanic(kernelPanic);
 fn kernelPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
     _ = first_trace_addr;
     riscv.disableInterrupts();
-    uart.print("\n!!! KERNEL PANIC: {s}\n", .{msg});
+    // 别的 hart 下一次输出、等锁或者调度时会看到，自己停下
+    hart.beginPanic();
+    uart.print("\n!!! KERNEL PANIC on hart {d}: {s}\n", .{ hart.id(), msg });
     uart.write("system halted.\n");
-    // 把 sie 也清零再 wfi：时钟中断没人再预约，会一直挂着，它在 sie 里还使能的话，
-    // wfi 每次都立刻返回，停机就成了忙等（QEMU 占满一个 CPU 核）
-    riscv.write(.sie, 0);
-    while (true) riscv.wfi();
+    hart.halt();
 }
+
+/// 每个 hart 的启动栈（32 KiB），按 hart 编号下标。kmain / kmainSecondary 在上面运行，之后归这个 hart 的调度器用。
+/// 实测 Debug 模式下跑完全部 QEMU 测试，启动 hart 最深用了约 17 KiB（kmain 那一串初始化），
+/// 其他 hart 不到 2 KiB；safe 模式下分别约 3.6 KiB 和 0.8 KiB。
+const boot_stack_shift = 15;
+/// 导出成符号，汇编里按名字取地址：用 "X" 约束传进去的话，编译器会先把地址算进一个寄存器（这里占了 a0）。
+export var boot_stacks: [hart.max][1 << boot_stack_shift]u8 align(16) = undefined;
+
+/// 把 a0（hart 编号）放进 tp（见 hart.zig），sp 指向这个 hart 的启动栈的顶端：
+/// boot_stacks + (a0 + 1) * 栈的大小。
+const enter_asm =
+    \\mv tp, a0
+    \\la sp, boot_stacks
+    \\addi t0, a0, 1
+    \\slli t0, t0, %[shift]
+    \\add sp, sp, t0
+    \\
+;
 
 export fn _start() linksection(".text.boot") callconv(.naked) noreturn {
     asm volatile (
-        \\la sp, __stack_top
-        // 清零 .bss：初值为 0 的全局变量都在这里，ELF 文件里不占空间，需要自己清
+    // hart 编号太大的话没有启动栈可用，停在这里（QEMU virt 的编号从 0 开始，不会走到这里）
+        \\li t0, %[max]
+        \\bgeu a0, t0, 3f
+        // 清零 .bss：初值为 0 的全局变量都在这里，ELF 文件里不占空间，需要自己清。
+        // 启动栈也在 .bss 里，所以先清零、再用栈。只有启动 hart 做这件事，别的 hart 从 secondaryEntry 进来
         \\la t0, __bss_start
         \\la t1, __bss_end
         \\1:
@@ -40,10 +62,27 @@ export fn _start() linksection(".text.boot") callconv(.naked) noreturn {
         \\addi t0, t0, 8
         \\j 1b
         \\2:
+    ++ enter_asm ++
         // a0、a1 没动过，原样作为参数传给 kmain
         \\tail %[kmain]
+        \\3:
+        \\wfi
+        \\j 3b
         :
         : [kmain] "X" (&kmain),
+          [shift] "i" (boot_stack_shift),
+          [max] "i" (hart.max),
+    );
+}
+
+/// 别的 hart 的入口：SBI 的 hart_start 让它从这里开始执行，a0 = 它的 hart 编号，
+/// 分页关闭、中断关闭（见 startHarts）。
+fn secondaryEntry() callconv(.naked) noreturn {
+    asm volatile (enter_asm ++
+            \\tail %[kmainSecondary]
+        :
+        : [kmainSecondary] "X" (&kmainSecondary),
+          [shift] "i" (boot_stack_shift),
     );
 }
 
@@ -76,14 +115,62 @@ fn kmain(hartid: usize, dtb_addr: usize) callconv(.c) noreturn {
     vm.init(info.memory) catch |err| std.debug.panic("cannot set up paging: {s}", .{@errorName(err)});
     uart.write("[ok] Sv39 paging enabled: kernel mapped 1:1, text r-x, rodata r--, data rw-\n");
 
-    plic.init(hartid);
+    plic.init();
+    plic.initHart();
     timer.init(info.timebase_hz);
+    timer.initHart();
     uart.print("[ok] interrupt sources enabled: timer at {d} Hz, keyboard via UART + PLIC\n", .{timer.tick_hz});
 
+    startHarts(hartid, info.harts(), info.timebase_hz);
+
     // 和 xv6 的 main 一样：建好第一个进程 init，然后启动栈就交给调度器，永远不回来。
-    // init 再启动 shell（user/init.zig、user/sh.zig）。
+    // init 再启动 shell（user/init.zig、user/sh.zig）。别的 hart 已经在各自的调度器里等着了，
+    // init 可能在任何一个 hart 上运行。
     // 全局的中断开关 sstatus.SIE 这里不开：内核代码都关着中断运行（拿锁时也要求这样，见 spinlock.zig），
     // 调度器每一轮开头才开一下。
     proc.userinit() catch |err| std.debug.panic("cannot start init: {s}", .{@errorName(err)});
+    proc.scheduler();
+}
+
+/// 做完了自己那份初始化、进了调度器的 hart 数（不算启动 hart）。
+var harts_online: std.atomic.Value(usize) = .init(0);
+
+/// 用 SBI 的 HSM 扩展启动设备树里列出的其他 hart，一个一个来：等上一个报到了再启动下一个，
+/// 这样启动日志的顺序是固定的。每个最多等一秒，等不到就 panic。
+fn startHarts(self: usize, ids: []const u32, timebase_hz: u64) void {
+    var started: usize = 0;
+    for (ids) |id| {
+        if (id == self) continue;
+        if (id >= hart.max) {
+            uart.print("[warn] hart {d} not started: at most {d} harts are supported\n", .{ id, hart.max });
+            continue;
+        }
+        // 新的 hart 要看到这个 hart 之前写的所有东西（页表、页分配器、各个模块的初始化）。
+        // SBI 规范没有说 hart_start 本身会保证这一点，所以先自己做一次 fence
+        asm volatile ("fence rw, rw" ::: .{ .memory = true });
+        const err = sbi.hartStart(id, @intFromPtr(&secondaryEntry), 0);
+        if (err != 0) {
+            uart.print("[warn] cannot start hart {d}: SBI error {d}\n", .{ id, err });
+            continue;
+        }
+        started += 1;
+        const deadline = riscv.read(.time) + timebase_hz;
+        while (harts_online.load(.acquire) < started) {
+            if (riscv.read(.time) > deadline) std.debug.panic("hart {d} did not come online", .{id});
+            std.atomic.spinLoopHint();
+        }
+    }
+    const n = started + 1;
+    uart.print("[ok] {d} hart{s} running, booted on hart {d}\n", .{ n, if (n == 1) "" else "s", self });
+}
+
+/// 其他 hart 的初始化（kmain 的每个 hart 一份的部分），然后进入调度器。全局的东西启动 hart 都已经做好了。
+fn kmainSecondary() callconv(.c) noreturn {
+    riscv.clear(.sstatus, riscv.sstatus_fs); // 见 kmain
+    trap.init();
+    vm.initHart();
+    plic.initHart();
+    timer.initHart();
+    _ = harts_online.fetchAdd(1, .release);
     proc.scheduler();
 }

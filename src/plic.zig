@@ -2,6 +2,7 @@
 //! 寄存器布局见 RISC-V PLIC 规范，地址和中断号来自 QEMU virt 机器。
 
 const riscv = @import("riscv.zig");
+const hart = @import("hart.zig");
 
 pub const base: usize = 0x0c00_0000;
 /// 寄存器区域的大小，见设备树 plic 节点的 reg。分页时要整块映射。
@@ -9,8 +10,10 @@ pub const mmio_size: usize = 0x60_0000;
 
 pub const uart0_irq: u32 = 10;
 
-/// QEMU virt 上每个 hart 有两个 PLIC 上下文：2*hart 是 M 模式，2*hart+1 是 S 模式。
-var context: usize = undefined;
+/// 当前 hart 的 S 模式上下文。QEMU virt 上每个 hart 有两个 PLIC 上下文：2*hart 是 M 模式，2*hart+1 是 S 模式。
+fn context() usize {
+    return 2 * hart.id() + 1;
+}
 
 fn reg(offset: usize) *volatile u32 {
     return @ptrFromInt(base + offset);
@@ -21,20 +24,25 @@ fn priority(irq: u32) *volatile u32 {
 }
 
 fn enable() *volatile u32 {
-    return reg(0x2000 + 0x80 * context);
+    return reg(0x2000 + 0x80 * context());
 }
 
 fn threshold() *volatile u32 {
-    return reg(0x20_0000 + 0x1000 * context);
+    return reg(0x20_0000 + 0x1000 * context());
 }
 
 fn claimComplete() *volatile u32 {
-    return reg(0x20_0004 + 0x1000 * context);
+    return reg(0x20_0004 + 0x1000 * context());
 }
 
-pub fn init(hartid: usize) void {
-    context = 2 * hartid + 1;
+/// 全局的设置，启动 hart 调用一次。
+pub fn init() void {
     priority(uart0_irq).* = 1; // 优先级为 0 表示“永不触发”，所以至少设成 1
+}
+
+/// 每个 hart 调用一次：串口中断发给每个 hart（和 xv6 一样），谁先 claim 到谁处理，
+/// 别的 hart 再 claim 时拿到 0。
+pub fn initHart() void {
     enable().* = 1 << uart0_irq;
     threshold().* = 0; // 接收所有优先级 > 0 的中断
     riscv.set(.sie, riscv.sie_seie);

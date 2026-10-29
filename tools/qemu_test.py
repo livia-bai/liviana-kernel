@@ -6,6 +6,7 @@
   python3 tools/qemu_test.py --changed        # 只跑和未提交的改动有关的用例
   python3 tools/qemu_test.py shell fork       # 只跑指定的用例
   python3 tools/qemu_test.py --all-modes      # 四种优化模式都跑（改了汇编、中断、页表、进出 U 模式时用）
+  python3 tools/qemu_test.py --smp 4          # 只用 4 个 hart 跑（可以给几个；默认 1 和 4 各跑一遍）
 
 每种模式只构建一次（带上 user/tests/ 里的测试程序），所有用例共用一次启动。启动日志每次都检查；
 结束时比较前后两次 mem 的空闲页数（不能漏页）、shutdown 后 QEMU 的退出码必须为 0、输出里不能有 KERNEL PANIC。
@@ -21,7 +22,8 @@ import time
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 MODES = ["debug", "safe", "fast", "small"]
-QEMU = ["qemu-system-riscv64", "-machine", "virt", "-smp", "1", "-m", "128M", "-nographic", "-bios", "default"]
+QEMU = ["qemu-system-riscv64", "-machine", "virt", "-m", "128M", "-nographic", "-bios", "default"]
+DEFAULT_SMP = [1, 4]  # 单核、多核各跑一遍；4 和 build.zig 里 zig build run 用的一样
 
 BOOT_TIMEOUT = 60  # 秒：从启动 QEMU 到出现第一个提示符
 COMMAND_TIMEOUT = 60  # 秒：每条命令从发出到出现下一个提示符
@@ -33,7 +35,7 @@ TIMEBASE_HZ = 10_000_000  # QEMU virt 的 time CSR 频率
 # 用户地址空间里栈下面那一页保护页（src/proc.zig）
 GUARD_PAGE = (0x7FFFB000, 0x7FFFC000)
 USER_SPACE = (0x40000000, 0x80000000)
-MAX_PROCS = 8  # src/abi.zig 的 max_procs，其中两个槽位是 init 和 sh
+MAX_PROCS = 16  # src/abi.zig 的 max_procs，其中两个槽位是 init 和 sh
 SPIN_STARTED = re.compile(r"pid (\d+) spinning in U-mode")
 
 
@@ -44,13 +46,14 @@ class Failure(Exception):
 class Qemu:
     """启动 QEMU，后台线程持续读取串口输出；按提示符一条一条地发命令。"""
 
-    def __init__(self, kernel):
+    def __init__(self, kernel, smp):
         self.proc = subprocess.Popen(
-            QEMU + ["-kernel", kernel],
+            QEMU + ["-smp", str(smp), "-kernel", kernel],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
         )
+        self.smp = smp
         self.raw = bytearray()
         self.cond = threading.Condition()
         self.reader = threading.Thread(target=self._read, daemon=True)
@@ -238,10 +241,12 @@ def ps_table(q, c):
     rows = [(int(m.group(1)), int(m.group(2)), m.group(3), int(m.group(4)), m.group(5))
             for m in re.finditer(r"^ *(\d+) +(\d+) (\w+) +(\d+) (\w+)$", out, re.M)]
     init = [r for r in rows if r[4] == "init"]
-    sh = [r for r in rows if r[4] == "sh"]
+    # shell 是 init 的子进程。别的叫 sh 的是它 fork 出来、还没 exec 的子进程（多核时 ps 可能正好看到），
+    # 或者管道的组长，算作普通进程
+    sh = [r for r in rows if r[4] == "sh" and r[1] == 1]
     c.expect([r[:3] for r in init] == [(1, 0, "sleeping")], f"ps: expected init as pid 1, sleeping: {rows}")
-    c.expect(len(sh) == 1 and sh[0][1:3] == (1, "running"), f"ps: expected one running sh, child of init: {rows}")
-    return {r[0]: (r[2], r[3], r[4]) for r in rows if r[4] not in ("init", "sh")}
+    c.expect(len(sh) == 1 and sh[0][2] == "running", f"ps: expected one running sh, child of init: {rows}")
+    return {r[0]: (r[2], r[3], r[4]) for r in rows if r not in init + sh}
 
 
 def case_sched(q, c, mode):
@@ -257,12 +262,14 @@ def case_sched(q, c, mode):
     c.contains(out, r"yield ok", "run t_sleep")
     exited(c, out, "t_sleep", 0)
 
-    # 两个后台进程都分到了 CPU：时间片轮转，0.5 秒里各自至少拿到几个 tick
+    # 两个后台进程都分到了 CPU：0.5 秒里各自至少拿到几个 tick。单核时靠时间片轮转，状态是 runnable；
+    # 多核时它们可能正在别的 hart 上运行
     before = ps_table(q, c)
     time.sleep(SPIN_SECONDS)
     after = ps_table(q, c)
     for pid in spinners:
-        c.expect(after.get(pid, ("", 0, ""))[0] == "runnable", f"ps: spin (pid {pid}) not listed as runnable: {after}")
+        c.expect(after.get(pid, ("", 0, ""))[0] in ("runnable", "running"),
+                 f"ps: spin (pid {pid}) not listed as runnable or running: {after}")
         got = after.get(pid, ("", 0, ""))[1] - before.get(pid, ("", 0, ""))[1]
         c.expect(got >= MIN_SPIN_TICKS // 2, f"ps: spin (pid {pid}) got only {got} ticks in {SPIN_SECONDS}s")
 
@@ -438,9 +445,31 @@ def case_sbrk(q, c, mode):
     check_counts(c, q.command("run t_sbrk"), "t_sbrk")
 
 
+def case_smp(q, c, mode):
+    # 几个进程同时 fork/exit/wait、写同一个管道、sbrk、留下孤儿，再杀掉在别的 hart 上死循环的进程
+    check_counts(c, q.command("run t_smp"), "t_smp")
+    if q.smp < 3:
+        return
+    # 真的在并行：两个死循环的后台进程在不同的 hart 上同时运行，0.5 秒里加起来拿到的 tick
+    # 比一个 hart 能给的（100 Hz × 0.5 秒 = 50 个）多得多。单核时两个加起来最多 50 个
+    spinners = [start_background(q, c, "spin") for _ in range(2)]
+    if None in spinners:
+        return
+    before = ps_table(q, c)
+    time.sleep(SPIN_SECONDS)
+    after = ps_table(q, c)
+    got = sum(after.get(pid, ("", 0, ""))[1] - before.get(pid, ("", 0, ""))[1] for pid in spinners)
+    one_hart = int(SPIN_SECONDS * 100)
+    c.expect(got >= one_hart * 1.3, f"ps: two spinners got {got} ticks in {SPIN_SECONDS}s on {q.smp} harts, "
+             f"expected well over {one_hart}")
+    for pid in spinners:
+        q.command(f"kill {pid}")
+    c.expect(ps_table(q, c) == {}, "ps: processes left after killing all of them")
+
+
 # 每个用例覆盖的文件。改了 CORE 里的文件（或者没列出的内核文件）就跑全部用例。
 CORE = ["build.zig", "linker.ld", "src/main.zig", "src/riscv.zig", "src/trap.zig", "src/vm.zig", "src/page.zig",
-        "src/dtb.zig", "src/uart.zig", "src/proc.zig", "src/syscall.zig", "src/abi.zig", "src/spinlock.zig",
+        "src/dtb.zig", "src/uart.zig", "src/proc.zig", "src/syscall.zig", "src/abi.zig", "src/spinlock.zig", "src/hart.zig",
         "src/file.zig", "user/start.zig", "user/sys.zig", "user/init.zig", "user/sh.zig", "tools/qemu_test.py"]
 NOT_KERNEL = ["src/tests.zig"]  # 只在单元测试里用
 CASES = {
@@ -460,6 +489,7 @@ CASES = {
     "pipe": (case_pipe, ["src/pipe.zig", "user/echo.zig", "user/cat.zig", "user/wc.zig", "user/tests/t_pipe.zig",
                          "user/tests/t_args.zig"]),
     "sbrk": (case_sbrk, ["user/tests/t_sbrk.zig"]),
+    "smp": (case_smp, ["src/timer.zig", "src/plic.zig", "src/pipe.zig", "user/spin.zig", "user/tests/t_smp.zig"]),
 }
 
 
@@ -498,7 +528,7 @@ def build(mode, prefix):
         raise Failure(f"`{' '.join(cmd)}` failed (exit {r.returncode}) or printed output:\n{indent(r.stdout)}")
 
 
-def check_boot(q, c):
+def check_boot(q, c, smp):
     text = q.wait_for(lambda t: "Type 'help' for commands.\n> " in t or "KERNEL PANIC" in t, BOOT_TIMEOUT, "the first prompt")
     for pattern in [
         r"Hello from a Zig kernel on RISC-V!",
@@ -508,18 +538,19 @@ def check_boot(q, c):
         r"\[ok\] page allocator: \d+ free pages",
         r"\[ok\] Sv39 paging enabled",
         r"\[ok\] interrupt sources enabled: timer at 100 Hz",
+        rf"\[ok\] {smp} harts? running, booted on hart \d+\n",
     ]:
         c.contains(text, pattern, "boot log")
 
 
-def run_session(kernel, log_path, names, mode):
+def run_session(kernel, log_path, names, mode, smp):
     """启动一次 QEMU，依次运行 names 里的用例。返回 [(名字, Checks)]，第一项是启动和收尾的检查。"""
     session = Checks()
     results = [("boot", session)]
     current = session  # 出错时，错误记在正在跑的那一项上
-    q = Qemu(kernel)
+    q = Qemu(kernel, smp)
     try:
-        check_boot(q, session)
+        check_boot(q, session, smp)
         before = free_pages(q.command("mem"))
         for name in names:
             current = Checks()
@@ -542,15 +573,19 @@ def run_session(kernel, log_path, names, mode):
     return results
 
 
-def run_mode(mode, names):
+def run_mode(mode, names, smps):
+    """构建一次，每个 hart 数各启动一次 QEMU。返回 [(hart 数, 名字, Checks, 构建错误, 串口日志)]。"""
     prefix = os.path.join(ROOT, "zig-out", "qemu-test", mode)
     try:
         build(mode, prefix)
     except Failure as e:
-        return [("build", Checks(), str(e), None)]
+        return [(None, "build", Checks(), str(e), None)]
     kernel = os.path.join(prefix, "bin", "kernel")
-    log = os.path.join(prefix, "serial.log")
-    return [(n, c, None, log) for n, c in run_session(kernel, log, names, mode)]
+    results = []
+    for smp in smps:
+        log = os.path.join(prefix, f"serial-smp{smp}.log")
+        results += [(smp, n, c, None, log) for n, c in run_session(kernel, log, names, mode, smp)]
+    return results
 
 
 def main():
@@ -559,6 +594,8 @@ def main():
     parser.add_argument("--changed", action="store_true", help="only run the cases covering files changed since HEAD")
     parser.add_argument("--mode", action="append", choices=MODES, help="optimize mode (repeatable; default: safe)")
     parser.add_argument("--all-modes", action="store_true", help="test all four optimize modes")
+    parser.add_argument("--smp", action="append", type=int,
+                        help=f"number of harts given to QEMU (repeatable; default: {' and '.join(map(str, DEFAULT_SMP))})")
     parser.add_argument("--list", action="store_true", help="list the cases and the files they cover")
     args = parser.parse_args()
 
@@ -581,16 +618,18 @@ def main():
         selected = set(args.cases) or set(CASES)
     names = [n for n in CASES if n in selected]
     modes = MODES if args.all_modes else (args.mode or ["safe"])
+    smps = args.smp or DEFAULT_SMP
 
     failed = False
     for mode in modes:
         started = time.monotonic()
-        results = run_mode(mode, names)
-        for name, c, error, log in results:
+        results = run_mode(mode, names, smps)
+        for smp, name, c, error, log in results:
             if error:
                 c.failures.append(error)
             status = "PASS" if not c.failures else "FAIL"
-            print(f"{status}  {mode:<5}  {name:<10}  {c.count} checks")
+            harts = f"smp{smp}" if smp else ""
+            print(f"{status}  {mode:<5}  {harts:<5}  {name:<10}  {c.count} checks")
             for f in c.failures:
                 print(f"    - {f}")
             if c.failures:

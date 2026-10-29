@@ -1,10 +1,11 @@
 //! QEMU virt 机器上的 NS16550A 串口驱动，同时承担“屏幕”和“键盘”：
 //! 输出用轮询，输入用中断——收到字符时串口经 PLIC 发来外部中断，中断处理程序把字符放进环形缓冲区。
 //!
-//! 输出没有加锁：多核时几个 hart 同时输出，字符会交错在一起，但不会出错；
-//! panic 时也要能输出，不能去等一把可能永远拿不到的锁。
+//! 输出由 tx_lock 保护：几个 hart 同时输出时，每次 print / write 整段输出，不会和别的 hart 的输出
+//! 交错在一行里。panic 的 hart 不拿锁（锁可能就在它自己手里），别的 hart 一输出就停下（hart.checkPanic）。
 
 const std = @import("std");
+const hart = @import("hart.zig");
 const Spinlock = @import("spinlock.zig").Spinlock;
 
 pub const base: usize = 0x1000_0000;
@@ -37,14 +38,44 @@ fn putRaw(c: u8) void {
     reg(.rbr_thr).* = c;
 }
 
-pub fn putc(c: u8) void {
+fn putc(c: u8) void {
+    // 别的 hart 在 panic 的话停下，让它的 panic 信息完整地输出
+    hart.checkPanic();
     // 终端需要 \r\n 才会回到行首
     if (c == '\n') putRaw('\r');
     putRaw(c);
 }
 
+/// 保护输出：拿着它输出的一段不会和别的 hart 的输出交错。
+var tx_lock: Spinlock = .init("uart tx");
+
+/// 拿着输出锁的一段输出，由 lockOutput 开始，unlock 结束。
+pub const Output = struct {
+    /// 是否拿了 tx_lock：panic 的 hart 不拿
+    locked: bool,
+
+    pub fn write(o: Output, bytes: []const u8) void {
+        _ = o;
+        for (bytes) |c| putc(c);
+    }
+
+    pub fn unlock(o: Output) void {
+        if (o.locked) tx_lock.release();
+    }
+};
+
+/// 开始一段不被别的 hart 打断的输出（file.zig 的 consoleWrite 用它把一次 write 系统调用整段输出）。
+/// 拿着它时不能再调用 print、write（同一个 hart 重复拿锁会 panic）。
+pub fn lockOutput() Output {
+    if (hart.isPanicking()) return .{ .locked = false };
+    tx_lock.acquire();
+    return .{ .locked = true };
+}
+
 pub fn write(bytes: []const u8) void {
-    for (bytes) |c| putc(c);
+    const out = lockOutput();
+    defer out.unlock();
+    out.write(bytes);
 }
 
 fn getc() ?u8 {
@@ -114,17 +145,22 @@ var writer: std.Io.Writer = .{
 
 fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
     _ = w;
+    const out: Output = .{ .locked = false }; // print 已经拿着锁了
     var n: usize = 0;
     for (data[0 .. data.len - 1]) |bytes| {
-        write(bytes);
+        out.write(bytes);
         n += bytes.len;
     }
     // 最后一段要重复 splat 次（用于填充对齐等）
     const pattern = data[data.len - 1];
-    for (0..splat) |_| write(pattern);
+    for (0..splat) |_| out.write(pattern);
     return n + pattern.len * splat;
 }
 
+/// 格式化输出。整条输出拿着 tx_lock：格式化时 drain 会被调用好几次（每个参数、每段字面量各一次），
+/// 只在 drain 里拿锁的话，别的 hart 的输出会插进一行的中间。
 pub fn print(comptime fmt: []const u8, args: anytype) void {
+    const out = lockOutput();
+    defer out.unlock();
     writer.print(fmt, args) catch {};
 }

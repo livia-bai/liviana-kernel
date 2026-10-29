@@ -40,13 +40,22 @@ fn putRaw(c: u8) void {
     while (reg(.lsr).* & lsr_thr_empty == 0) {}
     reg(.rbr_thr).* = c;
 }
-pub fn putc(c: u8) void { if (c == '\n') putRaw('\r'); putRaw(c); }
-pub fn write(bytes: []const u8) void
-pub fn print(comptime fmt: []const u8, args: anytype) void
+fn putc(c: u8) void { hart.checkPanic(); if (c == '\n') putRaw('\r'); putRaw(c); }
+
+var tx_lock: Spinlock = .init("uart tx");
+pub const Output = struct {        // 拿着 tx_lock 的一段输出
+    locked: bool,                  // panic 的 hart 不拿锁
+    pub fn write(o: Output, bytes: []const u8) void
+    pub fn unlock(o: Output) void
+};
+pub fn lockOutput() Output
+pub fn write(bytes: []const u8) void                          // lockOutput + write + unlock
+pub fn print(comptime fmt: []const u8, args: anytype) void    // 同上，中间是格式化输出
 ```
 
 - 轮询 LSR 的“发送保持寄存器空”位，空了才写下一个字节。
 - `\n` 前补一个 `\r`：终端需要回车才会回到行首。
+- 每个字符之前看一眼是不是有别的 hart 在 panic，是的话停下（[boot.md](boot.md#panic)）。
 - `print` 通过 `std.Io.Writer` 使用标准库的格式化（`{d}`、`{x}`、`{s}` 等）。Writer 的 `buffer` 为空，所以每次写入都直接调用 `drain`：
 
   ```zig
@@ -55,7 +64,14 @@ pub fn print(comptime fmt: []const u8, args: anytype) void
 
   `data` 是若干段字节，最后一段要重复输出 `splat` 次（格式化填充对齐时会用到），返回实际写出的字节数。这里全部写完，返回总长度。
 - `print` 吞掉格式化错误（串口写不会失败）。
-- 输出不加锁（多核时几个 hart 同时输出，字符会交错，但不会出错；panic 时也要能输出，不能去等一把可能永远拿不到的锁），现在只有一个 hart，不会有两个执行流同时打印。时钟和串口的中断处理程序本身不打印（只有“意外的外部中断”和 panic 这种出错路径会打印）；陷阱处理程序里的其他打印（断点、进程退出或被杀、Ctrl-C 的 `^C`）发生在关着中断的内核代码里，同一时刻只有一个执行流在跑，不会和别的内核输出交错在一行里（用户程序的 `write` 每次也是关着中断整段输出，但两个进程的多次 `write` 之间可能交错）。
+
+**输出锁 `tx_lock`**：几个 hart 会同时输出（一个进程退出时内核打印 `[proc] ... exited`，另一个 hart 上的 shell 正好在打印提示符），不加锁的话字符会交错在一起。所以每次 `write`、`print` 整段拿着 `tx_lock`：
+
+- **`print` 要在外面拿锁，不能只在 `drain` 里拿**：格式化一行时 `drain` 会被调用好几次（每段字面量、每个参数各一次），只在 `drain` 里拿锁的话，别的 hart 的输出会插进一行的中间。`print` 先 `lockOutput()`，再 `writer.print`，`drain` 里直接写（它构造一个 `locked = false` 的 `Output`，只用来调用 `write`）。
+- **用户程序的 `write` 系统调用也整段拿锁**：`file.consoleWrite` 在开头 `lockOutput()`，把用户内存分块复制出来、逐块输出，最后才 `unlock()`（[files.md](files.md#串口)）。用户程序的 `print` 先攒进缓冲区，再一次 `write` 写出（[user-programs.md](user-programs.md#syszig)），所以一行不会被别的进程的输出插进来。两个进程的多次 `write` 之间仍然可能交错。
+- 拿着输出锁时不能再调用 `print`、`write`（同一个 hart 重复拿锁会 panic）。`tx_lock` 是“叶子”锁，拿着别的锁的时候可以打印，拿着 `tx_lock` 时不再拿别的锁（[process.md](process.md#锁)）。
+- **panic 时不拿锁**：`lockOutput` 发现当前 hart 正在 panic，就返回一个 `locked = false` 的 `Output`，直接输出。锁可能就在 panic 的 hart 自己手里，也可能在别的 hart 手里，而那个 hart 一输出下一个字符就会停下、永远不放锁。
+- 时钟和串口的中断处理程序本身不打印（只有“意外的外部中断”、Ctrl-C 的 `^C` 和 panic 会打印）。
 
 ### 输入：环形缓冲区
 
@@ -74,7 +90,7 @@ pub fn read() ?u8        // 取出一个字符
 
 - 索引是 `u8`，`+%` 回绕正好对应 256 字节的缓冲区，不需要取模。
 - `head == tail` 表示空；`head + 1 == tail` 表示满（留一个空位区分空和满，实际容量 255）。满了之后新来的字符被丢弃。
-- **单生产者单消费者**：只有中断处理程序（`onInterrupt`）改 `head`，只有 `read` 系统调用（`file.consoleRead` 里的 `uart.hasInput`、`peek`、`read`）改 `tail`。两边都拿着 `rx_lock`（`hasInput` 等断言了这一点）。现在只有一个 hart、内核关着中断运行，本来就不会同时执行；锁是给多核准备的（串口中断可能在另一个 hart 上处理）。中断处理程序也拿这把锁不会死锁：拿着它的代码都关着中断，同一个 hart 上不会被串口中断打断。
+- **单生产者单消费者**：只有中断处理程序（`onInterrupt`）改 `head`，只有 `read` 系统调用（`file.consoleRead` 里的 `uart.hasInput`、`peek`、`read`）改 `tail`。两边都拿着 `rx_lock`（`hasInput` 等断言了这一点）：串口中断在一个 hart 上处理的同时，另一个 hart 上的进程可能正在 `read`。中断处理程序也拿这把锁不会死锁：拿着它的代码都关着中断，同一个 hart 上不会被串口中断打断。
 - 缓冲区为空时 `read` 系统调用拿着 `rx_lock` 调用 `proc.sleep(rx_chan, &rx_lock)`；`trap.handleExternal` 在 `onInterrupt` 之后 `proc.wakeup(rx_chan)` 叫醒它（[files.md](files.md#串口)）。驱动本身不知道进程的存在。
 
 ```zig
@@ -109,7 +125,7 @@ PLIC（Platform-Level Interrupt Controller）把外设的中断线汇总起来�
 
 ### 上下文
 
-PLIC 把“某个 hart 的某个特权级”叫一个上下文（context）。QEMU `virt` 上每个 hart 有两个：`2 * hart` 是 M 模式，`2 * hart + 1` 是 S 模式。内核用 S 模式上下文，hart 0 就是上下文 1。
+PLIC 把“某个 hart 的某个特权级”叫一个上下文（context）。QEMU `virt` 上每个 hart 有两个：`2 * hart` 是 M 模式，`2 * hart + 1` 是 S 模式。内核用 S 模式上下文，hart 0 是上下文 1，hart 2 是上下文 5。`context()` 按当前 hart 的编号（`hart.id()`）现算，所以 `claim`、`complete` 操作的总是当前 hart 自己的上下文。
 
 ### 寄存器
 
@@ -125,39 +141,47 @@ PLIC 把“某个 hart 的某个特权级”叫一个上下文（context）。QE
 ### 初始化
 
 ```zig
-pub fn init(hartid: usize) void {
-    context = 2 * hartid + 1;
+pub fn init() void {               // 启动 hart 调用一次
     priority(uart0_irq).* = 1;
+}
+
+pub fn initHart() void {           // 每个 hart 调用一次
     enable().* = 1 << uart0_irq;
     threshold().* = 0;
     riscv.set(.sie, riscv.sie_seie);
 }
 ```
 
-最后一步打开 `sie.SEIE`：S 模式外部中断使能。之后只要 PLIC 有中断送给这个上下文，`sip.SEIP` 就会置位。
+中断源的优先级是全局的，设一次；使能位图、阈值是每个上下文的，`sie` 是每个 hart 的，每个 hart 自己设。最后一步打开 `sie.SEIE`：S 模式外部中断使能。之后只要 PLIC 有中断送给这个上下文，这个 hart 的 `sip.SEIP` 就会置位。
+
+**串口中断发给每个 hart**（和 xv6 的 `plicinithart` 一样）：每个上下文都使能了 10 号源，PLIC 把它同时送给所有 hart，谁先 `claim` 到谁处理，别的 hart 再 `claim` 时拿到 0，什么也不做。只发给一个 hart 也行，但那个 hart 正在 U 模式里跑一个死循环的进程的话，也照样会被打断，没有什么好处；发给所有 hart，空闲的 hart（在 `wfi`）能最快处理。
 
 ### claim / complete
 
 外部中断处理（`trap.handleExternal`）：
 
-1. `plic.claim()` 读 claim 寄存器，得到当前优先级最高的待处理中断号；PLIC 同时把它标记为“处理中”。读到 0 表示没有（可能被别的上下文抢先领取了），直接返回。
+1. `plic.claim()` 读当前 hart 的上下文的 claim 寄存器，得到当前优先级最高的待处理中断号；PLIC 同时把它标记为“处理中”。读到 0 表示没有（被别的 hart 抢先领取了），直接返回。
 2. 按中断号分发：10 号交给 `uart.onInterrupt()`；其他号打印一条 `[trap] unexpected external interrupt N`。
 3. `plic.complete(irq)` 把中断号写回同一个寄存器，告诉 PLIC 处理完了。在此之前 PLIC 不会再投递同一个中断源。
 
 ## 定时器（`timer.zig`）
 
 ```zig
-pub const tick_hz = 100;          // 每秒 100 次，也就是每 10 ms 一次
-var timebase_hz: u64 = undefined; // time CSR 每秒增加多少，来自设备树
-var deadline: u64 = undefined;    // 下一次中断预约在 time CSR 的哪个值
+pub const tick_hz = 100;                  // 每秒 100 次，也就是每 10 ms 一次
+var timebase_hz: u64 = undefined;         // time CSR 每秒增加多少，来自设备树
+var deadline: [hart.max]u64 = undefined;  // 每个 hart 的下一次中断预约在 time CSR 的哪个值
+var timekeeper: usize = undefined;        // 由哪个 hart 给 ticks 加 1
+pub var lock: Spinlock = .init("ticks");  // 保护 ticks（xv6 的 tickslock）
 pub var ticks: u64 = 0;
 ```
 
-- **时钟频率**：`time` CSR 以 timebase 频率递增，QEMU `virt` 上是 10 MHz。这个值来自设备树 `/cpus` 节点的 `timebase-frequency`（[devicetree.md](devicetree.md)），`kmain` 把它传给 `timer.init`。
-- **预约**：`arm()` 把 `deadline` 加上一个周期 `timebase_hz / tick_hz`（10 MHz 下是 100000 个计数），通过 `sbi.setTimer(deadline)` 让 OpenSBI 在那时产生 S 模式时钟中断。下一次的预约时刻以**上一次的预约时刻**为基准，而不是以“现在”为基准，原因见下面的“为什么”。
-- **初始化**：`init(hz)` 记下频率，把 `deadline` 设成当前的 `time`，预约第一次（一个周期之后），再打开 `sie.STIE`。
-- **中断处理**：`onInterrupt()` 让 `ticks` 加 1，再预约下一次。`setTimer` 同时清除了当前挂起的时钟中断，不预约的话处理程序返回后会立刻再次进来。
-- **计时**：`ticks` 从打开时钟中断开始计数，`uptimeMs()` 返回 `ticks * 1000 / tick_hz` 毫秒，是 `uptime` 系统调用的返回值，shell 的 `uptime` 命令显示它。误差在一个 tick（10 ms）以内，不随时间累积。
+- **时钟频率**：`time` CSR 以 timebase 频率递增，QEMU `virt` 上是 10 MHz，所有 hart 读到的是同一个时钟。这个值来自设备树 `/cpus` 节点的 `timebase-frequency`（[devicetree.md](devicetree.md)），`kmain` 把它传给 `timer.init`。
+- **每个 hart 有自己的定时器**：SBI 的 `set_timer` 只设置调用它的那个 hart 的下一次时钟中断，所以每个 hart 各自预约、各自的 `deadline[hart.id()]`，各自每 10 ms 被打断一次。每个 hart 上的进程都靠自己 hart 的时钟中断被抢占。
+- **预约**：`arm()` 把当前 hart 的 `deadline` 加上一个周期 `timebase_hz / tick_hz`（10 MHz 下是 100000 个计数），通过 `sbi.setTimer(deadline)` 让 OpenSBI 在那时产生 S 模式时钟中断。下一次的预约时刻以**上一次的预约时刻**为基准，而不是以“现在”为基准，原因见下面的“为什么”。
+- **初始化**：`init(hz)` 由启动 hart 调用一次，记下频率，并把自己定为 `timekeeper`；`initHart()` 每个 hart 调用一次，把自己的 `deadline` 设成当前的 `time`，预约第一次（一个周期之后），再打开自己的 `sie.STIE`。
+- **中断处理**：`onInterrupt()` 先预约这个 hart 的下一次（`setTimer` 同时清除了当前挂起的时钟中断，不预约的话处理程序返回后会立刻再次进来）。只有 `timekeeper`（启动 hart）接着拿 `lock`、让 `ticks` 加 1、`proc.wakeup(&ticks)` 叫醒 `sleep` 系统调用里的进程（xv6 的 `clockintr` 也只在 cpu 0 上做）。每个 hart 都加的话，4 个 hart 时 `ticks` 就会快 4 倍。
+- **计时**：`ticks` 从打开时钟中断开始计数，`uptimeMs()` 拿着 `lock` 读它，返回 `ticks * 1000 / tick_hz` 毫秒，是 `uptime` 系统调用的返回值，shell 的 `uptime` 命令显示它。误差在一个 tick（10 ms）以内，不随时间累积。
+- **`lock`**：`sleep` 系统调用拿着它检查睡够了没有、睡在 `&ticks` 上（[process.md](process.md#sleepwakeup)），时钟中断拿着它加 `ticks`、叫醒，所以不会丢 `wakeup`。
 - **为什么以上一次的预约时刻为基准**：中断从到期到被处理总有一段延迟。以前 `arm()` 按“处理中断时读到的 `time` + 一个周期”预约，每个 tick 都把这段延迟丢掉，误差越积越多。实测 `uptime` 比 `time` 慢 2%～3%，shell 空闲 20 秒就慢了 543 ms。现在每个周期的边界是固定的，延迟不累积，同样空闲 20 秒只差 4 ms。
 - **处理晚了超过一个周期时**：新的预约时刻已经过去。按 SBI 规范，这时中断会立刻挂起，连续来几次之后 `ticks` 就追上了。这种情况没有实测过。
 
@@ -167,8 +191,8 @@ pub var ticks: u64 = 0;
 
 | 中断 | `scause` | 来源 | 处理 |
 | --- | --- | --- | --- |
-| S 模式时钟中断 | 中断 5 | OpenSBI 按 `setTimer` 的预约触发 | `timer.onInterrupt()` |
-| S 模式外部中断 | 中断 9 | PLIC，目前只有串口（10 号源） | `plic.claim()` → `uart.onInterrupt()` → `plic.complete()` |
-| S 模式软件中断 | 中断 1 | 核间中断，单核下不会出现 | `sie.SSIE` 没有打开，不会被接收；万一收到就 panic（`unexpected interrupt 1`） |
+| S 模式时钟中断 | 中断 5 | OpenSBI 按 `setTimer` 的预约触发，每个 hart 各自的 | `timer.onInterrupt()` |
+| S 模式外部中断 | 中断 9 | PLIC，目前只有串口（10 号源），送给所有 hart | `plic.claim()` → `uart.onInterrupt()` → `plic.complete()` |
+| S 模式软件中断 | 中断 1 | 核间中断（IPI）。内核不发，所以不会出现 | `sie.SSIE` 没有打开，不会被接收；万一收到就 panic（`unexpected interrupt 1`） |
 
 这三类都在 `mideleg` 里委托给了 S 模式（OpenSBI 设置的 `MIDELEG = 0x1666`）。陷阱分发的细节见 [trap.md](trap.md)。

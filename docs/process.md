@@ -1,12 +1,13 @@
 # 进程：创建、调度和结束
 
-涉及文件：`src/proc.zig`（以及 `src/trap.zig` 的 `trapExit`、`src/vm.zig` 的用户地址空间函数、`src/spinlock.zig`；调用方：`src/main.zig`、`src/trap.zig`、`src/syscall.zig`、`src/file.zig`、`src/pipe.zig`）
+涉及文件：`src/proc.zig`（以及 `src/trap.zig` 的 `trapExit`、`src/vm.zig` 的用户地址空间函数、`src/spinlock.zig`、`src/hart.zig`；调用方：`src/main.zig`、`src/trap.zig`、`src/syscall.zig`、`src/file.zig`、`src/pipe.zig`、`src/timer.zig`）
 
-进程表里最多同时有 8 个进程，按时间片轮转（round-robin）抢占式调度。进程的创建、调度和结束都照搬 [xv6](https://github.com/mit-pdos/xv6-riscv)（`kernel/proc.c`）的结构：
+进程表里最多同时有 16 个进程，在所有 hart 上按时间片轮转（round-robin）抢占式调度。进程的创建、调度、结束和加锁都照搬 [xv6](https://github.com/mit-pdos/xv6-riscv)（`kernel/proc.c`）的结构：
 
 - **第一个进程 init 由内核创建**（`userinit`），pid 1。之后的进程都是 `fork` 出来的：init 用 `fork` + `exec` 启动 shell，shell 再用同样的办法运行程序（[user-programs.md](user-programs.md#init-和-sh)）。
-- **调度器 `proc.scheduler()` 只管调度**。`kmain` 初始化完之后调用它，它在启动栈上永远循环：依次扫描进程表，遇到 `runnable` 的进程就切过去，等它切回来再接着往下扫。
-- **进程自己让出 CPU**：先改自己的状态，再调用 `sched()` 切回调度器。时间片用完（`yield`）、等某件事（`sleep`）、结束（`exit`）都是这样。进程之间从不直接切换。
+- **每个 hart 有自己的调度器 `proc.scheduler()`，只管调度**。每个 hart 初始化完之后调用它，它在这个 hart 的启动栈上永远循环：依次扫描（所有 hart 共用的）进程表，遇到 `runnable` 的进程就切过去，等它切回来再接着往下扫。进程不绑定 hart，这次在哪个 hart 上让出 CPU，下次可能在另一个 hart 上接着运行。
+- **进程自己让出 CPU**：先拿上自己的锁、改自己的状态，再调用 `sched()` 切回调度器。时间片用完（`yield`）、等某件事（`sleep`）、结束（`exit`）都是这样。进程之间从不直接切换。
+- **每个进程有一把锁**，保护它的状态等字段；**`wait_lock`** 保护父子关系。调度器拿着进程锁切到进程，进程拿着它切回来，所以一个进程同一时刻只会在一个 hart 上运行（[锁](#锁)）。
 - **等待用 `sleep(chan, lock)` / `wakeup(chan)`**：`chan` 是任意一个地址，代表“在等什么”；`lock` 是保护等待条件的锁。
 - **每个进程有自己的 fd 表**，指向全局文件表里的串口或管道（[files.md](files.md)）。`fork` 复制，`exec` 保留，结束时全部关掉。
 - **结束的进程变成 zombie，由父进程 `wait` 回收**。父进程先结束的，子进程交给 init。
@@ -37,54 +38,62 @@ pub fn find(name: []const u8) ?*const Program
 ## 进程表
 
 ```zig
-pub const max_procs = abi.max_procs;   // 8，shell 也要知道，所以放在 abi.zig
+pub const max_procs = abi.max_procs;   // 16，shell 也要知道，所以放在 abi.zig
 pub const State = abi.ProcState;       // procinfo 原样交给用户程序
 
 pub const ProcState = enum(u8) { unused, runnable, running, sleeping, zombie };   // abi.zig
 
 pub const Process = struct {
-    state: State = .unused,
-    pid: usize = 0,
-    name: []const u8 = "",             // 程序名，exec 时换掉；fork 出来的子进程沿用父进程的
+    lock: Spinlock = .init("proc"),    // 保护下面标着 lock 的字段，见“锁”
+    state: State = .unused,            // lock
+    pid: usize = 0,                    // lock
+    name: []const u8 = "",             // lock。程序名，exec 时换掉；fork 出来的子进程沿用父进程的
     space: *vm.PageTable = undefined,  // 根页表
-    parent: ?*Process = null,          // 父进程；init 没有
+    parent: ?*Process = null,          // wait_lock。父进程；init 没有
     context: Context = undefined,      // 不在运行时保存的内核上下文
-    chan: ?*const anyopaque = null,    // sleeping 时等的通道
-    killed: ?[]const u8 = null,        // 被 kill 了的话是原因
-    xstatus: u32 = 0,                  // zombie 的结束状态，父进程 wait 时取走
-    ticks: u64 = 0,                    // 在 U 模式运行期间来过的时钟中断数
+    chan: ?*const anyopaque = null,    // lock。sleeping 时等的通道
+    killed: ?[]const u8 = null,        // lock。被 kill 了的话是原因
+    xstatus: u32 = 0,                  // lock。zombie 的结束状态，父进程 wait 时取走
+    ticks: u64 = 0,                    // lock。在 U 模式运行期间来过的时钟中断数
     files: [abi.max_fds]?*file.File = @splat(null),  // 打开的文件，下标就是 fd
     heap_start: usize = 0,             // 堆的起点（最后一个段之后的页边界）
     brk: usize = 0,                    // 堆的末尾，sbrk 调整
 };
 
 pub var table: [max_procs]Process = @splat(.{});
-pub var current: ?*Process = null;     // 正在运行的进程；在调度器里时为 null
-var next_pid: usize = 1;               // 每次创建进程加 1，从不复用
-var init_proc: ?*Process = null;       // 孤儿交给它
-pub var foreground: usize = 0;         // 前台进程的 pid（setfg），按 Ctrl-C 时杀掉它
+var wait_lock: Spinlock = .init("wait");           // 保护所有进程的 parent
+var next_pid: std.atomic.Value(usize) = .init(1);  // 每次创建进程加 1（fetchAdd），从不复用
+var init_proc: ?*Process = null;                   // 孤儿交给它；userinit 设置后不再改
+var foreground: std.atomic.Value(usize) = .init(0);  // 前台进程的 pid（setfg），按 Ctrl-C 时杀掉它
 
 var kernel_stacks: [max_procs][16 * 1024]u8 align(16) = undefined;  // 槽位 i 的进程用第 i 块
-var scheduler_context: Context = undefined;  // 调度器切到进程时保存的上下文
+
+const Cpu = struct {                   // 每个 hart 一份（xv6 的 struct cpu）
+    proc: ?*Process = null,            // 正在这个 hart 上运行的进程；在调度器里时为 null
+    context: Context = undefined,      // 调度器切到进程时保存的上下文
+};
+var cpus: [hart.max]Cpu = @splat(.{});  // 按 hart 编号下标
+pub fn current() ?*Process              // cpus[hart.id()].proc
 ```
 
-状态名和 xv6 一样（xv6 还有一个 `USED`，表示“槽位已占、还在初始化”，这里创建进程是一口气做完的，用不着）。状态的变化：
+状态名和 xv6 一样。xv6 还有一个 `USED`，表示“槽位已占、还在初始化”：它的 `allocproc` 拿到槽位后会先放开进程锁再填其他字段。这里 `fork`、`userinit` 拿着新进程的锁一口气填完所有字段才放开（见[fork](#fork)），别的 hart 看到的要么是 `unused`，要么已经是完整的 `runnable`，用不着这个状态。状态的变化：
 
 | 从 | 到 | 什么时候 | 谁做的 |
 | --- | --- | --- | --- |
-| `unused` | `runnable` | 启动时创建 init；`fork` 系统调用 | `userinit`、`fork` |
+| `unused` | `runnable` | 启动时创建 init；`fork` 系统调用。拿着新进程的锁填好所有字段 | `userinit`、`fork` |
 | `runnable` | `running` | 调度器扫到它 | `scheduler` |
 | `running` | `runnable` | 时钟中断打断了 U 模式（时间片用完），或者 `yield` 系统调用 | `yield` |
 | `running` | `sleeping` | 等某件事：`sleep` 系统调用等时钟，`read` 等键盘或管道里的数据，`write` 等管道腾出空间，`wait` 等子进程结束 | `sleep` |
 | `sleeping` | `runnable` | 等的事发生了（时钟中断、串口中断、管道被读写或关掉、子进程结束），或者被 kill | `wakeup`、`kill` |
 | `running` | `zombie` | `exit` 系统调用，或者 U 模式下出了异常，或者发现自己被 kill 了 | `exit`、`killCurrent`（经 `finish`） |
-| `zombie` | `unused` | 父进程 `wait` 到它 | `reap` |
+| `zombie` | `unused` | 父进程 `wait` 到它 | `wait` → `reap` |
 
-- **每个进程一块 16 KiB 的内核栈**，静态分配在 `.bss` 里（8 块共 128 KiB）。不从页分配器要：它一次只给一页，给不出连续的 16 KiB。实测 Debug 模式下跑完全部 QEMU 测试，最深用了 6463 字节，small 模式下 1127 字节。测法：`.bss` 启动时清零，`shutdown` 时从每块栈的底部找第一个不为 0 的字节，取最大值（临时加的代码，没有留在仓库里）。内核栈两侧没有保护页：内核内存是用大页恒等映射的，要在中间挖出不映射的页得拆大页，现在没做。
-- init 和 shell 一直占着两个槽位，所以同时最多运行 6 个别的程序。
-- `current` 只在 `scheduler` 切到进程前设置、切回来后清回 `null`。系统调用和陷阱处理程序用 `current.?` 取当前进程，Debug/safe 模式下没有进程时会 panic。
-- **进程表还没有加锁**：只有一个 hart，进程在内核里和调度器都关着中断运行，中断只在 U 模式和调度器开头那一下才会进来。中断处理程序对进程表只做 `wakeup`、`kill`（只改状态和标志）和给 `current.ticks` 加 1。别的共享数据（页分配器、文件表、管道、串口的输入缓冲区）已经加了自旋锁，为多核做准备，见[锁](#锁)。
-- **`files` 不用加锁**：只有进程自己会改它（`close`/`dup`/`pipe` 系统调用、`fork` 时复制给子进程、结束时关掉），没有线程，别的进程碰不到。
+所有的状态变化都拿着这个进程的锁。
+
+- **每个进程一块 16 KiB 的内核栈**，静态分配在 `.bss` 里（16 块共 256 KiB）。不从页分配器要：它一次只给一页，给不出连续的 16 KiB。实测 Debug 模式下跑完全部 QEMU 测试（单核和 4 核），最深用了 8216 字节，safe 模式下 3312 字节，small 模式下 2903 字节。测法：`.bss` 启动时清零，`shutdown` 时从每块栈的底部找第一个不为 0 的字节，取最大值（临时加的代码，没有留在仓库里）。内核栈两侧没有保护页：内核内存是用大页恒等映射的，要在中间挖出不映射的页得拆大页，现在没做。
+- init 和 shell 一直占着两个槽位，所以同时最多运行 14 个别的程序。
+- `current()` 返回当前 hart 上正在运行的进程：`cpus[hart.id()].proc`，只在 `scheduler` 切到进程前设置、切回来后清回 `null`。系统调用和陷阱处理程序用 `current().?` 取当前进程，Debug/safe 模式下没有进程时会 panic。它不用加锁：只有这个 hart 自己读写自己那一项，而且内核关着中断运行，读到之后到开中断之前，这个 hart 不会换进程（xv6 的 `myproc` 为此要 `push_off`）。
+- 哪些字段由谁保护见[锁](#锁)。`space`、`context`、`files`、`heap_start`、`brk` 不用加锁：只有进程自己会读写它们（`close`/`dup`/`pipe`/`sbrk` 系统调用、`fork` 时复制给子进程、结束时关掉文件），没有线程，别的进程碰不到；父进程回收 zombie 时它已经不会再运行了。
 
 ## 用户地址空间
 
@@ -176,28 +185,34 @@ pub fn exec(name: []const u8, args: []const []const u8) ExecError!void   // exec
 三个函数都要准备一个“下次被调度时从哪里开始”的状态。用户进程第一次被调度时的路径都一样：
 
 ```
-scheduler → switchContext ─ret→ forkret → checkKilled → trapExit ─sret→ U 模式
+scheduler → switchContext ─ret→ forkret → forkretC（放开进程锁、checkKilled）→ trapExit ─sret→ U 模式
 ```
 
 - **初始的内核上下文**（`firstContext`）：`ra` = `forkret`，`sp` = 这个槽位的 `TrapFrame` 的地址，`s0..s11` = 0。`switchContext` 恢复它之后 `ret` 就跳进 `forkret`。
-- **`TrapFrame` 总在内核栈的最顶端**（`frameOf(p)`）：必须放在栈顶下方正好 `@sizeOf(TrapFrame)` 处，`trapExit` 回到 U 模式时会把“TrapFrame 地址 + 272”当作内核栈顶写进 `sscratch`（[trap.md](trap.md#trapexit)）；之后从 U 模式陷入时，`trapEntry` 也正好把 `TrapFrame` 压在这里。
+- **`TrapFrame` 总在内核栈的最顶端**（`frameOf(p)`）：必须放在栈顶下方正好 `@sizeOf(TrapFrame)` 处，`trapExit` 回到 U 模式时会把“TrapFrame 地址 + 288”当作内核栈顶写进 `sscratch`（[trap.md](trap.md#trapexit)）；之后从 U 模式陷入时，`trapEntry` 也正好把 `TrapFrame` 压在这里。
 - **`forkret`**（名字来自 xv6）是一个裸函数：
 
   ```zig
   fn forkret() callconv(.naked) noreturn {
       asm volatile (
-          \\call %[checkKilled]
+          \\call %[forkretC]
           \\tail %[trapExit]
           ...
       );
   }
+
+  fn forkretC() callconv(.c) void {
+      current().?.lock.release();
+      checkKilled();
+      spinlock.assertNoneHeld();
+  }
   ```
 
-  先调用 `checkKilled`（还没运行就被 kill 了的话，在这里结束，见[结束进程](#结束进程)），再跳进 `trapExit`。`sp` 一直指向 `TrapFrame`（`checkKilled` 是普通函数，只用 `sp` 以下的栈），于是 `trapExit` 按它恢复寄存器、`sret` 进入 U 模式。
+  `forkretC` 先放开进程锁：调度器是拿着它切过来的，平时由 `sched` 的调用方在切回来之后放开，新进程没有这个调用方，就在这里放（xv6 的 `forkret` 第一句也是 `release(&myproc()->lock)`）。再调用 `checkKilled`（还没运行就被 kill 了的话，在这里结束，见[结束进程](#结束进程)），然后跳进 `trapExit`。`sp` 一直指向 `TrapFrame`（`forkretC` 是普通函数，只用 `sp` 以下的栈），于是 `trapExit` 按它恢复寄存器、`sret` 进入 U 模式。
 
 ### userinit
 
-和 xv6 的 `userinit` 一样，只在启动时调用一次：找一个空槽位；`loadImage` 新建地址空间（`vm.createUserSpace()`，复制内核的根页表）、加载嵌在内核里的 `init` 程序（[ELF 加载器](#elf-加载器)）、把命令行参数 `"init"` 放到栈顶（[命令行参数](#命令行参数)）；**打开串口作为 0、1、2 号 fd**（一个 `File`，引用数 3，[files.md](files.md)），之后所有进程都从 init `fork` 继承它们；用 `startFrame(frame, image)` 构造从入口开始运行的 `TrapFrame`；状态设为 `runnable`，pid 是 1，记进 `init_proc`。没有 `init` 程序是构建配置错了，直接 `@panic`；其他错误 `kmain` 会 panic。
+和 xv6 的 `userinit` 一样，只在启动时调用一次（这时别的 hart 已经在各自的调度器里空转了）：`loadImage` 新建地址空间（`vm.createUserSpace()`，复制内核的根页表）、加载嵌在内核里的 `init` 程序（[ELF 加载器](#elf-加载器)）、把命令行参数 `"init"` 放到栈顶（[命令行参数](#命令行参数)）；**打开串口作为 0、1、2 号 fd**（一个 `File`，引用数 3，[files.md](files.md)），之后所有进程都从 init `fork` 继承它们；拿着空槽位的锁（`allocSlot`），用 `startFrame(frame, image)` 构造从入口开始运行的 `TrapFrame`，填好字段，状态设为 `runnable`，pid 是 1，记进 `init_proc`，最后才放开锁。`init_proc` 在放开锁之前设置：别的 hart 要先拿到这把锁才能运行 init，那时一定看得到它。没有 `init` 程序是构建配置错了，直接 `@panic`；其他错误 `kmain` 会 panic。
 
 `startFrame` 构造的 `TrapFrame`：`sepc` = 入口地址，`sp`（`regs[2]`）和 `a1`（`regs[11]`）= 栈上 `Arg` 数组的地址，`a0`（`regs[10]`）= `argc`，其他寄存器为 0，`sstatus = (当前 sstatus & ~(SPP | SIE)) | SPIE`：
 
@@ -209,39 +224,49 @@ scheduler → switchContext ─ret→ forkret → checkKilled → trapExit ─sr
 
 ```zig
 pub fn fork() ForkError!usize {
-    const parent = current.?;
-    const child = try allocSlot();
+    const parent = current().?;
     const space = try vm.cloneUserSpace(parent.space);
+    errdefer vm.destroyUserSpace(space);
+    wait_lock.acquire();
+    defer wait_lock.release();
+    const child = try allocSlot();          // 拿着它的锁返回
+    defer child.lock.release();
     const frame = frameOf(child);
     frame.* = frameOf(parent).*;
     frame.regs[10] = 0;
-    child.* = .{ .state = .runnable, .pid = next_pid, .name = parent.name, .space = space,
-                 .parent = parent, .context = firstContext(child),
-                 .heap_start = parent.heap_start, .brk = parent.brk };
-    for (&child.files, parent.files) |*c, f| c.* = if (f) |x| file.dup(x) else null;
-    next_pid += 1;
-    return child.pid;
+    var files: [abi.max_fds]?*file.File = undefined;
+    for (&files, parent.files) |*c, f| c.* = if (f) |x| file.dup(x) else null;
+    const pid = next_pid.fetchAdd(1, .monotonic);
+    fill(child, .{ .state = .runnable, .pid = pid, .name = parent.name, .space = space,
+                   .parent = parent, .context = firstContext(child), .files = files,
+                   .heap_start = parent.heap_start, .brk = parent.brk });
+    return pid;
 }
 ```
 
+- **先复制地址空间，再拿锁**：复制可能要很久（逐页分配、复制），这时什么锁都不拿。然后拿着 `wait_lock`（要写子进程的 `parent`）和子进程的锁（`allocSlot` 拿着锁返回）一次填好所有字段，最后才放开。所以子进程在别的 hart 看来，要么还是 `unused`，要么已经是完整的 `runnable`，别的 hart 的调度器不会运行一个半填好的进程。进程表满了的话 `errdefer` 释放刚复制的地址空间（在放开 `wait_lock` 之后：`defer` 和 `errdefer` 按相反的顺序执行）。
+- **`fill(p, new)` 换掉除了锁以外的所有字段**：直接 `child.* = .{...}` 会连锁一起覆盖成“没人拿着”，而这时锁在自己手里，别的 hart 可能正在等它。`fill` 在编译期遍历 `Process` 的字段名（`std.meta.fieldNames`），跳过 `lock`，以后加字段也不会漏。回收时用 `fill(c, .{})` 清空。
 - **地址空间逐页复制**（`vm.cloneUserSpace`，[paging.md](paging.md#复制用户地址空间)）：子进程的每一页都是新分配的，内容和权限和父进程一样，之后各改各的。没有写时复制（copy-on-write）。
 - **`TrapFrame` 原样复制**，只把 `a0` 改成 0。`fork` 是在系统调用里调用的，这时 `handleTrap` 已经把父进程 `TrapFrame` 的 `sepc` 加过 4 了，所以子进程第一次被调度时，经 `forkret` → `trapExit` 回到 U 模式，正好从 `ecall` 的下一条指令继续，看到 `fork` 返回了 0。父进程照常从系统调用返回，`a0` 是子进程的 pid。
 - **打开的文件和父进程共用**：fd 表逐项复制，每个 `File` 的引用数加 1（`file.dup`），所以父子进程的 fd 指向同一个串口、同一个管道的同一端。shell 运行管道就靠这个（[shell.md](shell.md#管道)）。`dup` 只加引用数，不会失败。
 - 堆（`heap_start`、`brk`）也照抄，堆里的页随地址空间一起复制了。
 - 进程表满了是 `TooManyProcesses`，`fork` 系统调用返回 `-EAGAIN`；内存不够是 `OutOfMemory`（`-ENOMEM`），`cloneUserSpace` 自己释放已经复制的部分。
+- pid 用原子变量 `next_pid.fetchAdd` 分配：几个 hart 同时 `fork` 也不会拿到同一个 pid。
 
 ### exec
 
 ```zig
 pub fn exec(name: []const u8, args: []const []const u8) ExecError!void {
-    const p = current.?;
+    const p = current().?;
     const program = find(name) orelse return error.NoSuchProgram;
     const image = try loadImage(program, args);   // 新地址空间 + 加载 + 参数放到栈顶
     const old = p.space;
     p.space = image.space;
     vm.activate(image.space);
     vm.destroyUserSpace(old);
-    p.name = program.name;
+    p.lock.acquire();
+    p.name = program.name;                        // procinfo 在别的 hart 上读它
+    p.lock.release();
     p.heap_start = image.brk;
     p.brk = image.brk;
     startFrame(frameOf(p), image);
@@ -295,10 +320,11 @@ pub const SbrkError = error{ OutOfMemory, InvalidArgument };
 ## 调度
 
 ```zig
-pub fn scheduler() noreturn            // kmain 最后调用，不返回
+pub fn scheduler() noreturn            // 每个 hart 初始化完之后调用，不返回
 fn sched() void                        // 当前进程切回调度器
-pub fn yield() void
-pub fn sleep(chan: *const anyopaque, lock: ?*Spinlock) void
+pub fn yield() void                    // yield 系统调用
+pub fn yieldTimeslice() void           // 时钟中断打断了 U 模式
+pub fn sleep(chan: *const anyopaque, lock: *Spinlock) void
 pub fn wakeup(chan: *const anyopaque) void
 ```
 
@@ -306,18 +332,22 @@ pub fn wakeup(chan: *const anyopaque) void
 
 ```zig
 pub fn scheduler() noreturn {
+    const c = &cpus[hart.id()];
     while (true) {
         riscv.enableInterrupts();
         riscv.disableInterrupts();
+        hart.checkPanic();
         var found = false;
         for (&table) |*p| {
+            p.lock.acquire();
+            defer p.lock.release();
             if (p.state != .runnable) continue;
             p.state = .running;
-            current = p;
+            c.proc = p;
             vm.activate(p.space);
-            switchContext(&scheduler_context, &p.context);
+            switchContext(&c.context, &p.context);
             vm.activate(vm.kernel_root);
-            current = null;
+            c.proc = null;
             found = true;
         }
         if (!found) riscv.wfi();
@@ -325,55 +355,73 @@ pub fn scheduler() noreturn {
 }
 ```
 
-和 xv6 的 `scheduler()` 一句一句对得上：
+和 xv6 的 `scheduler()` 一句一句对得上。每个 hart 跑一份，各自用自己的启动栈和 `cpus[hart.id()]`，扫的是同一张进程表：
 
-1. **开一下中断再关上**。进程和调度器都是关着中断运行的，中断只在这里（以及 U 模式）才会被处理。挂起的中断（时钟、键盘）在这一刻进来，中断处理程序可能 `wakeup` 某个进程。
-2. **扫一遍进程表**，每个 `runnable` 的进程：状态设为 `running`，`current` 指向它，切到它的地址空间，`switchContext(&scheduler_context, &p.context)` 切过去。进程要么第一次运行（`forkret`），要么从它上次调用 `sched()` 的地方继续。
-3. 进程调用 `sched()` 之后，执行回到这里：切回内核页表，`current = null`，接着扫下一个槽位。切回内核页表是因为这个进程可能已经结束了，父进程回收它时要释放它的页表，那时不能还有人在用。
+1. **开一下中断再关上**。进程和调度器都是关着中断运行的，中断只在这里（以及 U 模式）才会被处理。挂起的中断（时钟、键盘）在这一刻进来，中断处理程序可能 `wakeup` 某个进程。然后看一眼是不是有别的 hart 在 panic（[boot.md](boot.md#panic)），有的话停下。
+2. **扫一遍进程表**，每个槽位先拿它的锁再看状态。`runnable` 的进程：状态设为 `running`，`c.proc` 指向它，切到它的地址空间，`switchContext(&c.context, &p.context)` 切过去。进程要么第一次运行（`forkret`），要么从它上次调用 `sched()` 的地方继续。
+3. 进程调用 `sched()` 之后，执行回到这里，这时**又拿着这个进程的锁**（进程是拿着它切回来的）：切回内核页表，`c.proc = null`，放开锁，接着扫下一个槽位。
 4. **一整圈都没有可运行的进程就 `wfi`**，等下一个中断。
 
-**轮转**：每扫一圈，每个 `runnable` 的进程运行一次，所以就绪的进程轮流运行，不需要记“上次运行的是谁”。
+**为什么拿着进程锁切换**：从“检查到 `runnable`、改成 `running`”到“`switchContext` 真正换到它的栈上”之间，别的 hart 的调度器不能插进来也去运行它；反过来，进程“改掉自己的状态、切回调度器”这一步也要在别的 hart 看来是一下子完成的，否则另一个 hart 看到它是 `runnable`，就会在它还在原来的栈上运行时恢复它的 `context`，两个 hart 用同一块内核栈。所以锁在两次切换之间交接：调度器拿着锁切到进程，进程那边（`sched` 的调用方，或者新进程的 `forkretC`）放开；进程要让出 CPU 时先拿上锁再改状态、调用 `sched`，调度器那边放开。xv6 的注释管这叫“锁由一个线程拿、另一个线程放”。
+
+**先切回内核页表再放开锁**：这个进程可能已经结束了。父进程（可能在另一个 hart 上）要拿到它的锁才能看到它是 `zombie`、回收它、释放它的页表（[wait](#wait回收子进程)），所以放开锁的时候，这个 hart 必须已经不用它的页表了。同样，`finish` 拿着锁切走，也保证了父进程回收它（重用这个槽位的内核栈）时，它已经不在这块栈上了。
+
+**轮转**：每扫一圈，每个 `runnable` 的进程运行一次，所以就绪的进程轮流运行，不需要记“上次运行的是谁”。几个 hart 同时扫的时候，谁先拿到锁谁运行，另一个 hart 再看到时它已经是 `running` 了，跳过。
 
 **先关中断再扫描、再 `wfi`，顺序不能改**，原因是一个经典的竞争：如果开着中断扫描，可能出现“扫描时没有可运行的进程 → 正要执行 `wfi` 时键盘中断来了，叫醒了 shell → `wfi` 睡下去”，shell 要等到下一个中断（最长 10 ms 后的时钟中断）才能运行。关着中断扫描就没有这个问题：中断只是挂起（`sip` 里的位置 1）而不会被处理；`wfi` 只看 `sie` 和 `sip`、不看 `sstatus.SIE`，有挂起的中断就立即返回；下一轮开头开中断，挂起的中断马上被处理。xv6 的注释里讲的也是这件事。
+
+**别的 hart 叫醒的进程**：hart A 上的 `wakeup` 把一个进程改成 `runnable` 时，正在 `wfi` 的 hart B 不会马上知道（没有发核间中断），要等它自己的下一个时钟中断，最多 10 ms。xv6 也是这样。通常不明显：hart A 自己的调度器下一圈也会看到这个进程。
 
 ### sched、yield
 
 ```zig
 fn sched() void {
-    const p = current.?;
+    const p = current().?;
+    if (!p.lock.holding()) @panic("sched: not holding the process lock");
+    if (spinlock.heldCount() != 1) std.debug.panic("sched: {d} spinlocks held", .{spinlock.heldCount()});
     std.debug.assert(p.state != .running);
     std.debug.assert(riscv.read(.sstatus) & riscv.sstatus_sie == 0);
-    spinlock.assertNoneHeld();
-    switchContext(&p.context, &scheduler_context);
+    switchContext(&p.context, &cpus[hart.id()].context);
 }
 
 pub fn yield() void {
-    current.?.state = .runnable;
+    const p = current().?;
+    p.lock.acquire();
+    p.state = .runnable;
     sched();
+    p.lock.release();
 }
 ```
 
-`sched` 是进程切回调度器的唯一入口，切换前检查三件事：状态已经改掉了（不再是 `running`，否则调度器会以为它还在跑），中断是关着的，没有拿着任何自旋锁（拿着锁切走的话，下一个要这把锁的进程会永远自旋下去）。xv6 的 `sched` 检查的是“只拿着自己的进程锁”，这里还没有进程锁。等调度器下次挑中这个进程时，`switchContext` 才返回，执行从 `sched` 之后继续。
+`sched` 是进程切回调度器的唯一入口，切换前检查四件事（和 xv6 一样）：拿着自己的进程锁，而且只拿着这一把（拿着别的锁切走的话，下一个要这把锁的会永远自旋下去），状态已经改掉了（不再是 `running`，否则调度器会以为它还在跑），中断是关着的。等调度器下次挑中这个进程时（可能在另一个 hart 上），`switchContext` 才返回，执行从 `sched` 之后继续，这时又拿着进程锁，由调用方放开。
 
-`yield` 由陷阱处理程序调用：时钟中断打断 U 模式时（时间片用完，[trap.md](trap.md#分发)），以及 `yield` 系统调用。只有时钟中断让出 CPU，串口中断不让（和 xv6 一样）：串口中断只是叫醒在 `read` 里等输入的进程（通常是 shell），它最多等当前进程用完这个时间片（10 ms）。
+注意 `sched` 每次现查 `cpus[hart.id()]`，不能在函数开头取一次存着：切回来的时候可能已经在另一个 hart 上了。
 
-**时间片**：时钟中断是全局的每 10 ms 一次，不是按进程计时的，所以一个进程刚被调度就碰上时钟中断时，它的时间片会不足 10 ms。`ticks` 只在时钟中断打断这个进程时加 1，是它用掉的 CPU 时间的近似值（单位 10 ms），`ps` 显示它。两个死循环的进程一起跑时，`ticks` 的增速几乎相同。
+`yield` 由 `yield` 系统调用调用；时钟中断打断 U 模式时（时间片用完，[trap.md](trap.md#分发)）陷阱处理程序调用 `yieldTimeslice`，它多做一件事：拿着锁给 `ticks` 加 1。只有时钟中断让出 CPU，串口中断不让（和 xv6 一样）：串口中断只是叫醒在 `read` 里等输入的进程（通常是 shell），它最多等当前进程用完这个时间片（10 ms），多核时空闲的 hart 也会在自己的下一个时钟中断运行它。
+
+**时间片**：每个 hart 的时钟中断是每 10 ms 一次（[devices.md](devices.md#定时器timerzig)），不是按进程计时的，所以一个进程刚被调度就碰上时钟中断时，它的时间片会不足 10 ms。`ticks` 只在时钟中断打断这个进程时加 1，是它用掉的 CPU 时间的近似值（单位 10 ms），`ps` 显示它。两个死循环的进程一起跑时，`ticks` 的增速几乎相同；多核时它们在不同的 hart 上同时跑，各自每秒接近 100。
 
 ### sleep、wakeup
 
 ```zig
-pub fn sleep(chan: *const anyopaque, lock: ?*Spinlock) void {
-    const p = current.?;
+pub fn sleep(chan: *const anyopaque, lock: *Spinlock) void {
+    const p = current().?;
+    p.lock.acquire();
+    lock.release();
     p.chan = chan;
     p.state = .sleeping;
-    if (lock) |l| l.release();
     sched();
     p.chan = null;
-    if (lock) |l| l.acquire();
+    p.lock.release();
+    lock.acquire();
 }
 
 pub fn wakeup(chan: *const anyopaque) void {
+    const me = current();
     for (&table) |*p| {
+        if (p == me) continue;
+        p.lock.acquire();
+        defer p.lock.release();
         if (p.state == .sleeping and p.chan == chan) p.state = .runnable;
     }
 }
@@ -381,17 +429,17 @@ pub fn wakeup(chan: *const anyopaque) void {
 
 `chan` 只是一个地址，用来配对 `sleep` 和 `wakeup`，内核不会去读它指向的内容。现在用到的通道：
 
-| 谁在等 | 等什么 | 通道 | 谁叫醒 |
-| --- | --- | --- | --- |
-| `sleep` 系统调用 | 时钟走够 | `&timer.ticks` | 每个时钟中断（`trap.handleTrap`） |
-| `read` 系统调用（串口） | 键盘输入 | `uart.rx_chan`（`&rx_buf`） | 串口中断（`trap.handleExternal`） |
-| `read` 系统调用（管道） | 管道里有数据，或者写端都关了 | `&pipe.nread` | 往管道里写了东西（`pipe.write`），写端关了（`pipe.close`） |
-| `write` 系统调用（管道） | 管道腾出空间，或者读端都关了 | `&pipe.nwrite` | 从管道里读走了东西（`pipe.read`），读端关了（`pipe.close`） |
-| `wait` 系统调用 | 子进程结束 | 自己的 `*Process` | 子进程结束时（`finish` 叫醒父进程）；孤儿交给 init 时（`reparent` 叫醒 init） |
+| 谁在等 | 等什么 | 通道 | 拿着的锁 | 谁叫醒 |
+| --- | --- | --- | --- | --- |
+| `sleep` 系统调用 | 时钟走够 | `&timer.ticks` | `timer.lock` | 启动 hart 的每个时钟中断（`timer.onInterrupt`） |
+| `read` 系统调用（串口） | 键盘输入 | `uart.rx_chan`（`&rx_buf`） | `uart.rx_lock` | 串口中断（`trap.handleExternal`） |
+| `read` 系统调用（管道） | 管道里有数据，或者写端都关了 | `&pipe.nread` | `Pipe.lock` | 往管道里写了东西（`pipe.write`），写端关了（`pipe.close`） |
+| `write` 系统调用（管道） | 管道腾出空间，或者读端都关了 | `&pipe.nwrite` | `Pipe.lock` | 从管道里读走了东西（`pipe.read`），读端关了（`pipe.close`） |
+| `wait` 系统调用 | 子进程结束 | 自己的 `*Process` | `wait_lock` | 子进程结束时（`finish` 叫醒父进程）；孤儿交给 init 时（`reparent` 叫醒 init） |
 
 规矩是**醒来之后自己检查条件，不满足就再睡**：`while (!条件) sleep(chan, lock);`。醒来不代表条件满足：时钟通道每个 tick 都叫醒所有在等的进程，各自数够了没有；两个进程同时 `read`，一个字符只能给其中一个；被 `kill` 也会醒。`wakeup` 只改状态、不切换，所以中断处理程序里也能调用。
 
-**`lock` 是保护等待条件的锁**，照 xv6 的 `sleep(chan, lk)`：调用方拿着它检查条件、拿着它调用 `sleep`；`sleep` 在状态改成 `sleeping` 之后才放开它，醒来后重新拿上再返回，所以调用方的循环里一直拿着锁。改条件的一方（往管道里写、串口中断往缓冲区里放字符）也要先拿这把锁，于是“检查完条件、还没睡下”的时候它插不进来，不会出现 lost wakeup（`wakeup` 发生在睡下之前，等的人永远睡下去）。例子是管道的读：
+**`lock` 是保护等待条件的锁**，照 xv6 的 `sleep(chan, lk)`：调用方拿着它检查条件、拿着它调用 `sleep`；醒来后重新拿上再返回，所以调用方的循环里一直拿着锁。改条件的一方（往管道里写、串口中断往缓冲区里放字符、时钟中断加 `ticks`）也要先拿这把锁。例子是管道的读：
 
 ```zig
 p.lock.acquire();
@@ -402,17 +450,23 @@ while (p.nread == p.nwrite and p.write_open) {
 }
 ```
 
-现在只有一个 hart、全程关中断，就算不传锁也不会丢 `wakeup`；但多核时另一个 hart 上的写者随时可能插进来，锁才是真正起作用的东西。条件没有锁保护的（`sleep` 系统调用看 `timer.ticks`、`wait` 看进程表）传 `null`，多核时要补上 tickslock 和 xv6 的 `wait_lock`。多核时 `sleep` 里还要在放开 `lock` 之前拿上进程自己的锁，一直拿到切回调度器为止，否则 `wakeup` 可能在它还没切走时就把它改成 `runnable`，被另一个 hart 的调度器同时运行。
+**为什么不会丢 `wakeup`**（lost wakeup：`wakeup` 发生在睡下之前，等的人永远睡下去）：`sleep` 先拿上自己的进程锁，再放开 `lock`，然后才改状态、切走；调度器切回来之后才放开进程锁。所以从“调用方检查完条件”到“真正切走”，这个进程一直拿着 `lock` 或者自己的进程锁（交接时两把都拿着）。改条件的一方要先拿 `lock` 才能改，改完调用 `wakeup` 又要拿进程锁才能看状态，于是它看到的要么是还没检查条件之前（那调用方会看到新的条件，不睡），要么是已经完全睡下、切走之后（`sleeping`，叫醒它）。进程锁还保证了另一件事：`wakeup` 不会在这个进程还没切走时就把它改成 `runnable`，让另一个 hart 的调度器在它还在原来的栈上运行时恢复它。
+
+**`wakeup` 跳过当前进程**：它正在运行，不会是 `sleeping`；而调用方可能正拿着它的锁，再拿就是同一个 hart 重复加锁（xv6 也跳过 `myproc()`）。
+
+`lock` 不能为空。单核时内核全程关中断，不传锁也不会丢 `wakeup`；多核时另一个 hart 上的写者随时可能插进来，等待的条件必须有锁保护。
 
 `sleep` 系统调用（`syscall.zig`）就是 xv6 的 `sys_sleep`：
 
 ```zig
 const n = (ms *| timer.tick_hz +| 999) / 1000;
+timer.lock.acquire();
+defer timer.lock.release();
 const start = timer.ticks;
-while (timer.ticks - start < n and !proc.isKilled()) proc.sleep(&timer.ticks, null);
+while (timer.ticks - start < n and !proc.isKilled()) proc.sleep(&timer.ticks, &timer.lock);
 ```
 
-要睡的 tick 数 `⌈ms × 100 / 1000⌉`，乘法和加法都是饱和运算，`ms` 再大也不会溢出（最多睡到永远，只能被 `kill`）。用户程序看到的 `uptime()` 也是按 tick 算的，所以醒来后 `uptime()` 至少增加了 `ms`；按真实时间算，可能比 `ms` 少不到一个 tick（睡下去时当前 tick 已经过了一部分）。`ms = 0` 时不睡，直接返回。被 kill 了就提前返回，回到陷阱处理程序后结束。
+要睡的 tick 数 `⌈ms × 100 / 1000⌉`，乘法和加法都是饱和运算，`ms` 再大也不会溢出（最多睡到永远，只能被 `kill`）。`ticks` 由 `timer.lock` 保护（xv6 的 `tickslock`），只有启动 hart 的时钟中断给它加 1，加完在锁里 `wakeup(&ticks)`（[devices.md](devices.md#定时器timerzig)）。用户程序看到的 `uptime()` 也是按 tick 算的，所以醒来后 `uptime()` 至少增加了 `ms`；按真实时间算，可能比 `ms` 少不到一个 tick（睡下去时当前 tick 已经过了一部分）。`ms = 0` 时不睡，直接返回。被 kill 了就提前返回，回到陷阱处理程序后结束。
 
 ## 切换上下文
 
@@ -456,22 +510,25 @@ fn switchNaked() callconv(.naked) noreturn {
 - 真正的切换在裸函数 `switchNaked` 里（它要直接改 `sp`，不能有序言和尾声）。Zig 不允许直接调用裸函数，所以在一段内联汇编里 `call` 它。
 - 对编译器来说，这段内联汇编就是“会破坏 `ra`、`t0..t6`、`a0..a7` 和内存的一段代码”，正好对应一次 C 函数调用的效果；编译器不会对裸函数本身做任何假设。`from` 和 `to` 用 `"r"` 约束传进任意寄存器，再在汇编里 `mv` 到 `a0`、`a1`，而不是直接用 `"{a0}"`、`"{a1}"` 约束：`a0`、`a1` 已经声明为被破坏，被破坏的寄存器不应该同时用作输入（GCC 的内联汇编规则明确禁止），这样写就不依赖编译器怎么处理这种重叠。被声明为被破坏的寄存器也不会被分配给 `"r"` 输入，所以两条 `mv` 不会互相覆盖。
 - `switchNaked` 声明成 `noreturn`：它用 `ret` 跳走，不会走到函数体结尾。这没关系，因为它只从内联汇编里调用，编译器看不到这个调用。**曾经踩过的坑**：单进程版本最初把裸函数 `@ptrCast` 成 C 调用约定的函数指针来调用，而裸函数被声明成了 `noreturn`。release 模式下编译器据此认为调用之后的代码永远不会执行，把切回内核页表、释放内存这些代码都删掉了，进程一退出内核就崩溃。现在的写法不依赖裸函数的签名。
-- 切换全程关着中断：调度器关着中断扫描进程表，进程这边是在陷阱处理程序里。
+- 切换全程关着中断、拿着这个进程的锁：调度器关着中断扫描进程表，进程这边是在陷阱处理程序里（[调度器](#调度器)讲了为什么要拿着锁）。
+- `Context` 里没有 `tp`：`tp` 存的是 hart 编号（[trap.md](trap.md#tp-约定)），属于 hart 而不属于进程。进程在 hart A 上切走、在 hart B 上被恢复时，`tp` 保持 B 的值，正好是对的。
 
 ### 栈的变化
 
 ```
-启动栈（调度器在用）               进程 A 的内核栈（16 KiB）          进程 B 的内核栈
+hart 0 的启动栈（调度器在用）      进程 A 的内核栈（16 KiB）          进程 B 的内核栈
 ┌─────────────────────┐          ┌─────────────────────┐ ← 栈顶     ┌─────────────────────┐
-│ kmain → scheduler → │          │ TrapFrame（272 字节）│            │ 初始 TrapFrame       │ ← B.context.sp
+│ kmain → scheduler → │          │ TrapFrame（288 字节）│            │ 初始 TrapFrame       │ ← B.context.sp
 │ switchContext       │ ←        ├─────────────────────┤            └─────────────────────┘
-│                     │ scheduler│ handleTrap →        │              （还没运行过，
-└─────────────────────┘ _context │ yield → sched →     │                ra = forkret）
-                          .sp    │ switchContext       │ ← A.context.sp
+│                     │ cpus[0]  │ handleTrap →        │              （还没运行过，
+└─────────────────────┘ .context │ yieldTimeslice →    │                ra = forkret）
+                          .sp    │ sched →             │
+                                 │ switchContext       │ ← A.context.sp
                                  └─────────────────────┘
 ```
 
-- 调度器切到进程时，它的调用链（`kmain → scheduler → switchContext`）留在启动栈上，`scheduler_context.sp` 记住它的位置。`kmain` 永远不会返回，启动栈从此归调度器用。
+- 调度器切到进程时，它的调用链（`kmain → scheduler → switchContext`，别的 hart 是 `kmainSecondary → scheduler → switchContext`）留在这个 hart 的启动栈上，`cpus[hart].context.sp` 记住它的位置。`kmain` 永远不会返回，启动栈从此归这个 hart 的调度器用（[boot.md](boot.md#每个-hart-的启动栈)）。
+- 上图里 A 停在 hart 0 的调度器切过来的位置，但它的 `context` 不记得是哪个 hart：下次可能是 hart 2 的调度器 `switchContext(&cpus[2].context, &A.context)` 把它恢复出来，`sched` 返回后它就在 hart 2 上接着运行，切回去时也是切回 hart 2 的调度器。
 - 每次从 U 模式陷入，`trapEntry` 都从 `sscratch`（这个进程的内核栈顶）开始压 `TrapFrame`。陷阱处理程序让出 CPU 时，它的调用链就停在这个进程的内核栈上，等下次轮到它再继续。同一时刻每块进程内核栈上最多只有一层陷阱。
 - 进程结束时它的内核栈上的内容直接丢弃，下一个用这个槽位的进程从头再用。`fork` 出来的子进程的内核栈上只有复制来的 `TrapFrame`，没有父进程的调用链：它从 `forkret` 开始，不经过 `handleTrap` 的后半段。
 ## 结束进程
@@ -479,14 +536,16 @@ fn switchNaked() callconv(.naked) noreturn {
 ```zig
 pub fn exit(code: u8) noreturn                                          // exit 系统调用
 pub fn killCurrent(comptime reason: []const u8, args: anytype) noreturn // U 模式下的异常
-pub fn checkKilled() callconv(.c) void                                  // 回到 U 模式之前
+pub fn checkKilled() void                                               // 回到 U 模式之前
 fn finish(p: *Process, status: u32) noreturn
 
-pub fn waitChild(pid: usize, nohang: bool) WaitError!?*Process          // wait 系统调用
-pub fn reap(c: *Process) void
+pub fn wait(pid: usize, nohang: bool, status_ptr: usize) WaitError!?usize  // wait 系统调用
+pub const WaitError = error{ NoChildren, BadAddress };
+fn reap(c: *Process) void
 
-pub fn kill(pid: usize, reason: []const u8) KillError!void              // kill 系统调用、Ctrl-C
+pub fn kill(pid: usize, reason: []const u8) KillError!void              // kill 系统调用
 pub const KillError = error{ NoSuchProcess, PermissionDenied };
+pub fn interruptForeground() void                                       // Ctrl-C
 ```
 
 ### exit：变成 zombie
@@ -501,10 +560,13 @@ fn finish(p: *Process, status: u32) noreturn {
         if (f.*) |x| file.close(x);
         f.* = null;
     }
+    wait_lock.acquire();
     reparent(p, init);
+    wakeup(p.parent.?);
+    p.lock.acquire();
     p.xstatus = status;
     p.state = .zombie;
-    wakeup(p.parent.?);
+    wait_lock.release();
     sched();
     unreachable;
 }
@@ -512,37 +574,48 @@ fn finish(p: *Process, status: u32) noreturn {
 
 1. **init 不能结束**：所有孤儿都靠它回收，它没了内核就 panic（xv6 也是 `panic("init exiting")`）。正常情况下 init 从不退出，`kill` 也不允许杀它。
 2. **关掉所有打开的文件**。必须在这里关，不能等父进程回收：管道的写端关了，读的进程才会读到结尾。要是等到 `wait` 回收时才关，读的进程能不能结束就取决于父进程先回收谁：`run echo hi | wc` 的组长要是先 `wait` wc，echo 的写端就一直开着，wc 永远读不到结尾，两边一起卡住。`reap` 断言 zombie 的 fd 表是空的。
-3. **`reparent`：子进程交给 init**。被交过去的子进程可能已经是 zombie 了，所以顺便叫醒 init，让它的 `wait` 重新看一遍。
-4. 记下结束状态：`exit(code)` 是退出码（0..255），被杀的是 `abi.killed_status`（`0x100`），两者不会混淆。
-5. 状态改成 `zombie`，叫醒父进程（它可能在 `wait` 里睡着），切回调度器，再也不回来。
+3. 拿上 `wait_lock`（下面要读写 `parent`）。**`reparent`：子进程交给 init**。被交过去的子进程可能已经是 zombie 了，所以顺便叫醒 init，让它的 `wait` 重新看一遍。
+4. 叫醒父进程（它可能在 `wait` 里睡着）。先叫醒、后改状态也不会漏：父进程要拿到 `wait_lock` 才能检查子进程，而 `wait_lock` 要等这个进程变成 `zombie` 之后才放开。
+5. 拿上自己的锁，记下结束状态（`exit(code)` 是退出码 0..255，被杀的是 `abi.killed_status` 即 `0x100`，两者不会混淆），状态改成 `zombie`，放开 `wait_lock`，拿着自己的锁切回调度器，再也不回来。顺序和 xv6 的 `exit` 一样。
 
-**不在这里释放内存**：进程这时还在用自己的内核栈和地址空间（`satp` 指着它的页表）。地址空间由父进程在 `wait` 里回收，那时运行的是父进程，用的是父进程的页表。zombie 只占一个槽位和它的用户内存，直到被回收。
+**不在这里释放内存**：进程这时还在用自己的内核栈和地址空间（`satp` 指着它的页表）。地址空间由父进程在 `wait` 里回收，那时运行的是父进程，用的是父进程的页表。父进程可能在另一个 hart 上，正好在这个进程切走的同时去回收它：它要拿到这个进程的锁才能看到 `zombie`，而锁要等调度器换回内核页表之后才放开（[调度器](#调度器)），所以回收时这个进程的页表和内核栈已经没人在用了。zombie 只占一个槽位和它的用户内存，直到被回收。
 
 ### wait：回收子进程
 
 ```zig
-pub fn waitChild(pid: usize, nohang: bool) WaitError!?*Process {
-    const p = current.?;
+pub fn wait(pid: usize, nohang: bool, status_ptr: usize) WaitError!?usize {
+    const p = current().?;
+    wait_lock.acquire();
+    defer wait_lock.release();
     while (true) {
-        if (try findZombieChild(p, pid)) |c| return c;
-        if (nohang or p.killed != null) return null;
-        sleep(p, null);
+        if (try findZombieChild(p, pid)) |c| {      // 拿着 c 的锁返回
+            defer c.lock.release();
+            if (status_ptr != 0) {
+                vm.copyToUser(p.space, status_ptr, std.mem.asBytes(&c.xstatus)) catch return error.BadAddress;
+            }
+            const child_pid = c.pid;
+            reap(c);
+            return child_pid;
+        }
+        if (nohang or isKilled()) return null;
+        sleep(p, &wait_lock);
     }
 }
 ```
 
-- `findZombieChild` 扫一遍进程表，看 `parent == p` 的进程（`pid` 不是 `abi.wait_any` 时只看这一个 pid）：有 zombie 就返回它；有符合条件的子进程但都没结束返回 `null`；一个都没有是 `NoChildren`（`-ECHILD`）。它只看进程表，单元测试直接测它。
-- 都没结束就**睡在自己身上**（`sleep(p, null)`），子进程的 `finish` 用 `wakeup(p.parent)` 叫醒它。醒来再扫一遍。`nohang` 时不睡，返回 `null`（系统调用返回 0）；被 kill 了也不睡，回到陷阱处理程序后结束。
-- 找到的 zombie 先交给系统调用处理程序：它把 `xstatus` 写进用户给的地址（写不进去就返回 `-EFAULT`，**不回收**，子进程还在，可以再 `wait`），然后调用 `reap`：释放地址空间，槽位清回 `unused`。xv6 也是先 `copyout` 再 `freeproc`。
+- **整个过程拿着 `wait_lock`**：`parent` 字段只在拿着它时改（`fork`、`reparent`、`reap`），所以扫描期间父子关系不会变。
+- `findZombieChild` 扫一遍进程表，看 `parent == p` 的进程（`pid` 不是 `abi.wait_any` 时只看这一个 pid），每个都拿它的锁看状态：有 zombie 就**拿着它的锁**返回；有符合条件的子进程但都没结束返回 `null`；一个都没有是 `NoChildren`（`-ECHILD`）。它只看进程表，单元测试直接测它。
+- 都没结束就**睡在自己身上**（`sleep(p, &wait_lock)`），子进程的 `finish` 用 `wakeup(p.parent)` 叫醒它。醒来再扫一遍。`nohang` 时不睡，返回 `null`（系统调用返回 0）；被 kill 了也不睡，回到陷阱处理程序后结束。
+- 找到 zombie 后，先把 `xstatus` 写进用户给的地址（`status_ptr` 为 0 时不写；写不进去就返回 `BadAddress`，系统调用返回 `-EFAULT`，**不回收**，子进程还在，可以再 `wait`），然后 `reap`：释放地址空间，`fill(c, .{})` 把槽位清回 `unused`（锁留着）。xv6 也是先 `copyout` 再 `freeproc`，也是拿着 `wait_lock` 和子进程的锁做这些。`copyToUser` 只查页表、复制，不会等待，拿着锁调用没问题。
 
 ### kill：只做标记
 
 **杀别的进程**（`kill`），照 xv6 的做法：**只记下原因（`killed`），在睡的改成 `runnable`，不当场结束它**。被杀的进程可能停在内核栈上的任何地方（`sleep` 里、`yield` 里），只有它自己知道怎么安全地收尾，所以让它自己来：
 
-- 陷阱处理程序回到 U 模式之前调用 `checkKilled()`（[trap.md](trap.md#分发)），新进程第一次进入 U 模式之前 `forkret` 也调用它。`killed` 不为空就 `killCurrent("{s}", .{reason})`。所以**被杀的进程不会再执行一条用户指令**。
-- 睡着的进程被改成 `runnable`，醒来后在 `sleep`、`read`、`write`（管道）、`wait` 的循环里看到 `killed`（`proc.isKilled()`），提前返回，接着在 `checkKilled` 里结束。
-- 正在 U 模式运行的进程（Ctrl-C 时前台进程多半是这样）：串口中断打断它，中断处理程序调用 `kill`，回到 U 模式之前 `checkKilled` 就结束它。
-- `kill` 只改标志和状态，所以中断处理程序里也能调用。同一个进程被杀两次，保留第一次的原因。zombie 也能“杀”，什么都不变。
+- 陷阱处理程序回到 U 模式之前调用 `checkKilled()`（[trap.md](trap.md#分发)），新进程第一次进入 U 模式之前 `forkretC` 也调用它。拿着进程锁读出 `killed`，不为空就 `killCurrent("{s}", .{reason})`。所以**被杀的进程不会再执行一条用户指令**。
+- 睡着的进程被改成 `runnable`，醒来后在 `sleep`、`read`、`write`（管道）、`wait` 的循环里看到 `killed`（`proc.isKilled()`，也拿进程锁读），提前返回，接着在 `checkKilled` 里结束。
+- 正在 U 模式运行的进程：中断（或者另一个 hart 上的 `kill` 系统调用）只给它做标记。单核时串口中断打断的就是它，这次中断返回之前 `checkKilled` 就结束它；多核时它可能正在另一个 hart 上运行，要等那个 hart 的下一个时钟中断（最多 10 ms）进入内核，回到 U 模式之前结束。没有核间中断去催它，xv6 也是这样。
+- `kill` 先找到这个 pid 的进程并拿着它的锁（`lockPid`：逐个槽位拿锁比较 pid），再标记。只改标志和状态，所以中断处理程序里也能调用。同一个进程被杀两次，保留第一次的原因。zombie 也能“杀”，什么都不变。
 - 杀 init 是 `PermissionDenied`（`-EPERM`），没有这个进程是 `NoSuchProcess`（`-ESRCH`）。
 
 输出：
@@ -564,19 +637,19 @@ pub fn waitChild(pid: usize, nohang: bool) WaitError!?*Process {
 
 ## Ctrl-C
 
-Ctrl-C 结束的是**前台进程和它的所有子孙**：shell 用 `fork` 启动前台程序后，调用 `setfg(pid)` 告诉内核，等它结束后再 `setfg(0)`（[shell.md](shell.md#前台和后台)）。运行管道时，前台进程是管道的“组长”，各个程序都是它的子进程（[shell.md](shell.md#管道)）。内核只记一个 pid（`proc.foreground`），后台进程不受影响。
+Ctrl-C 结束的是**前台进程和它的所有子孙**：shell 用 `fork` 启动前台程序后，调用 `setfg(pid)` 告诉内核，等它结束后再 `setfg(0)`（[shell.md](shell.md#前台和后台)）。运行管道时，前台进程是管道的“组长”，各个程序都是它的子进程（[shell.md](shell.md#管道)）。内核只记一个 pid（`proc.foreground`，原子变量：`setfg` 在一个 hart 上写，串口中断可能在另一个 hart 上读），后台进程不受影响。
 
 1. 串口中断处理程序看到 `0x03`，不放进输入缓冲区，`uart.onInterrupt()` 返回 `true`（[devices.md](devices.md#ctrl-c)）。
-2. 同一个中断里，`trap.handleExternal` 接着调用 `proc.interruptForeground()`：前台进程存在、没结束、不是 init 的话，打印 `^C`，然后扫一遍进程表，对前台进程和它的子孙（顺着 `parent` 往上找得到前台进程的）都 `proc.kill(pid, "interrupted by Ctrl-C")`；否则什么也不做，所以在 shell 里随手按的 Ctrl-C 不会留到下一个程序。`kill` 只做标记，标记的时候谁都还没结束、没有被交给 init，父子关系是完整的，一遍就能找全。这和 xv6 的 `consoleintr` 在中断里直接处理控制字符是一个思路。
-3. 被杀的进程在 U 模式运行的话，这次中断返回之前 `checkKilled` 就结束它；在 `sleep`、`read`、`write`、`wait` 里睡着的话，它被叫醒后结束；`runnable` 的话，下次被调度时结束。用户程序就算死循环、从不做系统调用，也不会再回到 U 模式。
+2. 同一个中断里，`trap.handleExternal` 接着调用 `proc.interruptForeground()`：拿上 `wait_lock`，前台进程存在、没结束、不是 init 的话，打印 `^C`，然后扫一遍进程表，对前台进程和它的子孙（顺着 `parent` 往上找得到前台进程的）都拿锁做 `kill` 的标记（原因是 `interrupted by Ctrl-C`）；否则什么也不做，所以在 shell 里随手按的 Ctrl-C 不会留到下一个程序。整个扫描拿着 `wait_lock`，父子关系不会变、前台进程也不会被回收；`kill` 只做标记，标记的时候谁都还没结束、没有被交给 init，父子关系是完整的，一遍就能找全。这和 xv6 的 `consoleintr` 在中断里直接处理控制字符是一个思路。
+3. 被杀的进程在这个 hart 的 U 模式运行的话，这次中断返回之前 `checkKilled` 就结束它；在别的 hart 的 U 模式运行的话，那个 hart 的下一个时钟中断结束它；在 `sleep`、`read`、`write`、`wait` 里睡着的话，它被叫醒后结束；`runnable` 的话，下次被调度时结束。用户程序就算死循环、从不做系统调用，也不会再回到 U 模式。
 4. 前台进程结束时叫醒在 `wait` 里等它的 shell。
 
 ## 限制和以后可以做的
 
-- 只有一个 hart，进程表和调度器还没有加锁。多核还差的见[锁](#锁)。
 - 内核代码不可抢占：进程在内核里关着中断运行，直到自己调用 `sched`。xv6 在内核里也开着中断，内核代码被时钟中断打断时也会 `yield`。这里内核里没有长时间的计算，不需要。
-- 进程之间没有优先级。
-- 进程表固定 8 项，内核栈是静态的，两侧没有保护页。
+- 没有核间中断（IPI）：叫醒了进程、杀了别的 hart 上正在运行的进程，都要等那个 hart 自己的下一个时钟中断（最多 10 ms）才生效。
+- 进程之间没有优先级，也不考虑在哪个 hart 上运行过（没有亲和性）。
+- 进程表固定 16 项，内核栈和启动栈是静态的，两侧没有保护页：溢出时会悄悄踩坏相邻的数据，所以栈的大小按实测用量留了余量。
 - `fork` 逐页复制整个地址空间，没有写时复制；紧接着 `exec` 的话，复制的内容马上就扔掉了。
 - 没有文件系统，`exec` 只能运行嵌在内核里的程序，打开的文件只有串口和管道。
 - 只有一个前台进程，没有进程组和信号：Ctrl-C 杀前台进程和它的子孙；前台进程的子孙被交给 init 之后（父进程先结束了）就不算了。
@@ -584,26 +657,39 @@ Ctrl-C 结束的是**前台进程和它的所有子孙**：shell 用 `fork` 启�
 
 ## 锁
 
-为多核做准备，共享的数据结构已经加了自旋锁（`src/spinlock.zig`，照 xv6 的 `spinlock.c`）：
+几个 hart 同时访问的数据都由自旋锁（`src/spinlock.zig`，照 xv6 的 `spinlock.c`）保护：
 
 | 锁 | 保护什么 | 在哪 |
 | --- | --- | --- |
+| `Process.lock`（每个进程一把） | 这个进程的 `state`、`pid`、`name`、`chan`、`killed`、`xstatus`、`ticks`；调度器拿着它切到进程，进程拿着它切回调度器 | 本文 |
+| `proc.wait_lock` | 所有进程的 `parent`；`wait` 拿着它睡在自己身上 | 本文 |
+| `timer.lock` | `timer.ticks`；`sleep` 系统调用拿着它睡在 `&ticks` 上 | [devices.md](devices.md#定时器timerzig) |
 | `page.lock` | 空闲页链表、`free_pages` | [page-allocator.md](page-allocator.md) |
 | `file.lock` | 文件表（每个 `File` 的引用数） | [files.md](files.md#文件表) |
 | `Pipe.lock` | 一个管道的缓冲区和两端的状态；读写的进程拿着它睡在管道上 | [files.md](files.md#管道) |
 | `uart.rx_lock` | 串口的输入缓冲区；`read` 拿着它睡在 `uart.rx_chan` 上，串口中断也要拿它 | [devices.md](devices.md#输入环形缓冲区) |
+| `uart.tx_lock` | 串口输出：一次 `print`、一次 `write` 系统调用整段输出，不和别的 hart 的输出交错 | [devices.md](devices.md#串口uartzig) |
+
+不用锁的：`proc.next_pid`、`proc.foreground` 是原子变量；`init_proc` 只在启动时写一次；`cpus[i]`、`spinlock` 的 `held[i]`、`timer.deadline[i]` 只有 hart i 自己读写；进程的 `space`、`context`、`files`、`heap_start`、`brk` 只有进程自己读写（见[进程表](#进程表)）；内核页表启动后不再改。
 
 规矩（`spinlock.zig` 的开头也写了）：
 
 - **拿着锁时中断必须关着**，`acquire` 检查这一点。不然中断处理程序在同一个 hart 上去拿同一把锁（比如串口中断拿 `rx_lock`），就会永远自旋。内核本来就全程关着中断，所以 `acquire` 只检查、不负责关中断（xv6 用 `push_off`/`pop_off` 计数）。
-- **不能拿着锁切换进程、回到 U 模式**：`sched` 和 `handleTrap` 回到 U 模式之前都检查 `spinlock.held == 0`。要拿着锁等待的，用 `sleep(chan, lock)`。
-- **锁不嵌套**：现在没有任何地方同时拿两把锁（比如 `file.close` 先放开文件表的锁，再去关管道），所以不用规定加锁顺序。以后要嵌套时先定顺序。
-- 同一个 hart 重复拿同一把锁直接 panic（`holding()` 看 `cpu` 字段）。现在 `cpuId()` 总是 0。
+- **切换进程时只能拿着这个进程自己的锁**（`sched` 检查 `heldCount() == 1` 且拿着的就是它），**回到 U 模式时什么锁都不能拿着**（`handleTrap` 末尾和 `forkretC` 检查 `heldCount() == 0`）。要拿着锁等待的，用 `sleep(chan, lock)`。
+- **加锁顺序**（只按这个方向嵌套，就不会死锁）：
 
-**多核时还要做的**（这一轮只做了上面这些）：
+  ```
+  wait_lock → Process.lock → page.lock、file.lock、uart.tx_lock
+  timer.lock、Pipe.lock、uart.rx_lock → Process.lock
+  ```
 
-- 每个 hart 一份 `current`、`scheduler_context`、`spinlock.held`（xv6 的 `struct cpu`），`cpuId()` 从 `tp` 读 hart 编号；`kmain` 用 SBI 的 HSM 扩展启动其他 hart，每个 hart 跑自己的调度器。
-- 进程锁：`state`、`chan`、`killed`、`xstatus` 由每个进程自己的锁保护，调度器拿着它切到进程、进程拿着它切回来（xv6 的 `p->lock`），`sleep` 在放开 `lock` 之前拿上它；`wakeup`、`kill`、`findZombieChild` 都要先拿进程锁。
-- `wait_lock`：保护 `parent`，`reparent`、`waitChild`、`interruptForeground` 用；`sleep` 系统调用的 tickslock；`next_pid`、`foreground` 也要加锁或改成原子变量。
-- 串口输出现在没加锁，几个 hart 同时输出时字符会交错；panic 时要能输出，所以输出锁不能是 panic 也要等的那种。
-- 页表：每个进程只在一个 hart 上运行（没有线程），用户页表不用跨 hart 刷 TLB；内核页表启动后不再改。
+  - `wait_lock` 在进程锁前面：`fork`、`finish`、`wait`、`interruptForeground`、`info` 都是先拿 `wait_lock` 再拿进程锁。
+  - 等待条件的锁在进程锁前面：`sleep` 拿着 `lock` 去拿进程锁；改条件的一方拿着 `lock` 调用 `wakeup`、`isKilled`，它们拿进程锁。`wait_lock` 也是这种用法。
+  - 页分配器、文件表、串口输出的锁是“叶子”：拿着它们时不再拿别的锁。`fork` 拿着 `wait_lock` 和子进程的锁时调用 `file.dup`（拿 `file.lock`），`reap` 拿着锁释放页（拿 `page.lock`），各处拿着锁打印（拿 `uart.tx_lock`）。
+  - 同一层的锁不嵌套：`file.close` 先放开 `file.lock` 再去关管道（拿 `Pipe.lock`）；一次只拿一个进程的锁（`sleep` 里交接时拿着自己的进程锁和 `lock`，两者不同层）。
+- 同一个 hart 重复拿同一把锁直接 panic（`holding()` 比较锁里记的 hart 编号和 `hart.id()`）。
+- 等锁时每转一圈看一眼是不是有别的 hart 在 panic（`hart.checkPanic`）：锁可能在已经停下的 hart 手里，永远等不到。
+
+每个 hart 记着自己拿着几把锁（`held[hart.id()]`）。进程锁在调度器和进程之间交接（调度器拿、进程放，或者反过来），但交接的两边总在同一个 hart 上：调度器切到的进程就在这个 hart 上接着运行，进程切回的也是这个 hart 的调度器。所以每个 hart 的计数都对得上。
+
+**页表和 TLB**：每个进程同一时刻只在一个 hart 上运行（没有线程），用户页表只在这个 hart 的 TLB 里。进程换到另一个 hart 时，调度器 `vm.activate` 会 `sfence.vma`；离开时调度器切回内核页表也 `sfence.vma`。`sbrk` 缩小、`exec` 换地址空间时只刷当前 hart 的 TLB 就够了，不用跨 hart 刷（TLB shootdown）。内核页表启动后不再改，所有 hart 共用。

@@ -67,12 +67,12 @@ fn run(input: []const u8) void {
 - 先用 `listprog` 确认每个程序都有，没有就打印 `no such program: NAME` 和程序列表，不 `fork`。
 - `fork` 出子进程，子进程 `exec` 成要运行的程序，命令行参数就是拆出来的那些词（第一个是程序名，[命令解析](#命令解析)）。`exec` 失败（比如 ELF 不合法）时，子进程打印原因并以 127 结束；这时它还是 shell 的副本，内核打印的名字是 `sh`。
 - **前台**（`run NAME`）：`setfg(pid)` 告诉内核按 Ctrl-C 时杀掉它（和它的子孙），然后 `wait(pid)` 睡着等它结束、回收它，再 `setfg(null)`。子进程在 `exec` 之前也先 `setfg(自己的 pid)`：`fork` 之后先运行父进程还是子进程不一定，只靠父进程登记的话，子进程可能已经开始运行、等着输入了，父进程还没来得及 `setfg`，这时按的 Ctrl-C 没人管。QEMU 测试在 Debug 模式下碰到过一次：`t_read` 打印了 `reading`，测试马上按 Ctrl-C，结果没有任何反应。所以输出顺序是：程序的输出、`[proc] ... exited ...`，然后才是 `> `。
-- **后台**（`run NAME &`）：打印 `[proc] pid N (NAME) started in the background`（管道是 `(pipeline)`）后马上回到提示符。它的输出和 shell 的输出会交错在一起，没有作业控制，只能用 `kill` 结束它。后台进程和 shell 谁先运行取决于调度，所以程序的第一行输出可能出现在 `started in the background` 前面。
+- **后台**（`run NAME &`）：打印 `[proc] pid N (NAME) started in the background`（管道是 `(pipeline)`）后马上回到提示符。它的输出和 shell 的输出会交错在一起，没有作业控制，只能用 `kill` 结束它。后台进程和 shell 谁先运行取决于调度（多核时它们同时运行），所以程序的第一行输出可能出现在 `started in the background` 前面；紧接着 `ps` 的话，还可能看到它还没 `exec`，名字仍然是 `sh`。每次 `print` 是一次 `write`，内核整段输出，所以两边的输出只会按行交错，不会插进一行的中间。
 - **回收后台进程**：每次打印提示符之前，`reapBackground` 用 `wait(null, nohang)` 把已经结束的子进程都回收掉。它们的结束信息内核已经打印过了；不回收的话会一直是 zombie，占着进程表的槽位。
 
 ## 管道
 
-`run A | B | C`：A 的标准输出接到 B 的标准输入，B 的接到 C 的，最多 4 个程序（`max_stages`：进程表 8 个槽位，init、shell、组长占三个，再留一个余量）。和 xv6 的 `sh` 一样，shell 自己不建管道，而是 fork 一个子进程当**组长**（`runPipeline`），由它来建：
+`run A | B | C`：A 的标准输出接到 B 的标准输入，B 的接到 C 的，最多 4 个程序（`max_stages`：init、shell、组长占三个槽位，进程表原来只有 8 个槽位时定下的，现在有 16 个，没有改）。和 xv6 的 `sh` 一样，shell 自己不建管道，而是 fork 一个子进程当**组长**（`runPipeline`），由它来建：
 
 ```zig
 for (stages, 0..) |*st, i| {
@@ -152,8 +152,8 @@ const cmd = std.meta.stringToEnum(Command, name) orelse { ... "unknown command" 
 说明：
 
 - `uptime` 显示 `ms / 1000` 秒和 `ms % 1000 / 10` 百分之一秒（补零到两位），所以 `up 3.05s` 不会显示成 `3.5s`。内核按 tick 计时，百分之一秒正好是 tick 数。
-- 进程表满了打印 `run: too many processes (at most 8)`（`fork` 返回 `TooManyProcesses`；8 是 `abi.max_procs`，其中 init 和 shell 占两个），ELF 加载失败打印 `run: cannot load NAME: BadElf`（或 `OutOfMemory`）。
-- `ps` 的输出（一个后台的 `spin` 在死循环）：
+- 进程表满了打印 `run: too many processes (at most 16)`（`fork` 返回 `TooManyProcesses`；16 是 `abi.max_procs`，其中 init 和 shell 占两个），ELF 加载失败打印 `run: cannot load NAME: BadElf`（或 `OutOfMemory`）。
+- `ps` 的输出（单核，一个后台的 `spin` 在死循环）：
 
   ```
     PID  PPID STATE     TICKS NAME
@@ -162,7 +162,7 @@ const cmd = std.meta.stringToEnum(Command, name) orelse { ... "unknown command" 
      17     2 runnable      2 spin
   ```
 
-  `ps` 是 shell 执行的，所以 `running` 的总是 shell 自己；init 总在 `wait` 里睡着。`TICKS` 是进程在 U 模式运行期间来过的时钟中断数，大致等于它用掉的 CPU 时间（单位 10 ms）。按槽位顺序列出，不一定按 pid 排序。结束了还没被回收的进程显示为 `zombie`。
+  `ps` 是 shell 执行的，所以 shell 自己总是 `running`；init 总在 `wait` 里睡着。单核时 shell 占着唯一的 hart，`spin` 只能是 `runnable`；多核时它在别的 hart 上跑，显示 `running`。`TICKS` 是进程在 U 模式运行期间来过的时钟中断数，大致等于它用掉的 CPU 时间（单位 10 ms）。按槽位顺序列出，不一定按 pid 排序。结束了还没被回收的进程显示为 `zombie`。
 - `kill PID`：`PID` 不是数字时打印 `usage: kill PID`，没有这个进程时打印 `kill: no such process: PID`，杀 init 打印 `kill: cannot kill pid 1: permission denied`。`kill` 系统调用只做标记（[process.md](process.md#kill只做标记)），所以 shell 接着 `wait(pid)`：是自己的子进程的话，等它真的结束、回收它，`killed: kill()` 那一行就在下一个提示符之前；不是自己的子进程时 `wait` 立刻返回 `NoChildren`。
 - `kill` shell 自己（它的 pid）也可以：shell 结束，init 打印 `init: sh exited, restarting it` 并启动一个新的 shell。
 

@@ -9,23 +9,25 @@
 - 解析设备树，得到内存范围和时钟频率
 - 物理页分配器，Sv39 分页，内核按段设置权限（代码只读可执行，数据不可执行）
 - U 模式用户程序：独立编译的 ELF 嵌进内核，由内核加载；用户程序出错或按 Ctrl-C 只结束进程，内核照常运行
-- 多进程，照 xv6 的结构：时间片轮转调度（调度器循环、`sleep`/`wakeup`、`kill` 只做标记）；`fork`/`exec`/`wait`、父子进程、zombie 和孤儿回收；最多 8 个进程
+- 多核：启动 hart 用 SBI 的 HSM 扩展启动设备树里的其他 hart（QEMU 默认 4 个，最多用 8 个），每个 hart 跑自己的调度器
+- 多进程，照 xv6 的结构：时间片轮转调度（每个 hart 一个调度器循环、`sleep`/`wakeup`、`kill` 只做标记）；`fork`/`exec`/`wait`、父子进程、zombie 和孤儿回收；最多 16 个进程
 - 21 个系统调用：文件描述符（`read`/`write`/`close`/`dup`）和管道（`pipe`），命令行参数（`exec` 带 `argv`），堆（`sbrk`）
 - 用户态的 init 和 shell：init 启动 shell，shell 用 `fork` + `exec` 运行程序，可以带参数、在后台运行、用 `|` 接成管道
-- 页分配器、文件表、管道、串口输入缓冲区加了自旋锁，为多核做准备
+- 照 xv6 加锁：每个进程一把锁、`wait_lock`、tickslock，页分配器、文件表、管道、串口的输入和输出都有自旋锁
 
 ```
 Hello from a Zig kernel on RISC-V!
 SBI: OpenSBI, spec v1.0 | hart 0 | device tree at 0x87e00000
 [ok] trap vector installed
-[trap] breakpoint at 0x80215d56, skipping it
+[trap] breakpoint at 0x8021687c, skipping it
 [ok] device tree: 128 MiB RAM at 0x80000000, timebase 10000000 Hz
-[ok] page allocator: 31868 free pages (127472 KiB)
+[ok] page allocator: 31783 free pages (127132 KiB)
 [ok] Sv39 paging enabled: kernel mapped 1:1, text r-x, rodata r--, data rw-
 [ok] interrupt sources enabled: timer at 100 Hz, keyboard via UART + PLIC
+[ok] 4 harts running, booted on hart 0
 Type 'help' for commands.
 > run hello
-Hello from U-mode! I am pid 3, the kernel has been up for 10 ms.
+Hello from U-mode! I am pid 3, the kernel has been up for 2170 ms.
 write() refused a kernel pointer: BadAddress
 [proc] pid 3 (hello) exited with code 0
 > run echo hello, world
@@ -39,19 +41,26 @@ hello, world
 > run spin &
 [proc] pid 8 (spin) started in the background
 > pid 8 spinning in U-mode without making syscalls
+run spin &
+[proc] pid 9 (spin) started in the background
+> pid 9 spinning in U-mode without making syscalls
 run ticker &
-[proc] pid 9 (ticker) started in the background
-> [ticker pid 9] tick 1 at 1370 ms
+[proc] pid 10 (ticker) started in the background
+> [ticker pid 10] tick 1 at 8170 ms
+[ticker pid 10] tick 2 at 9170 ms
 ps
   PID  PPID STATE     TICKS NAME
     1     0 sleeping      0 init
-    2     1 running       1 sh
-    8     2 runnable    152 spin
-    9     2 sleeping      0 ticker
-> run spin
-pid 10 spinning in U-mode without making syscalls
+    2     1 running       2 sh
+    8     2 running     400 spin
+    9     2 running     301 spin
+   10     2 sleeping      0 ticker
+> [ticker pid 10] tick 3 at 10170 ms
+run spin
+pid 11 spinning in U-mode without making syscalls
+[ticker pid 10] tick 4 at 11170 ms
 ^C
-[proc] pid 10 (spin) killed: interrupted by Ctrl-C
+[proc] pid 11 (spin) killed: interrupted by Ctrl-C
 ```
 
 ## 运行
@@ -59,8 +68,9 @@ pid 10 spinning in U-mode without making syscalls
 需要 Zig **0.17.0** 和 `qemu-system-riscv64`（Debian/Ubuntu 包名 `qemu-system-misc`，自带 OpenSBI 固件）。
 
 ```sh
-zig build run                     # 编译并在 QEMU 中启动（Debug 模式）
-zig build run -Doptimize=small    # 体积优化，内核代码段约 14.6 KB
+zig build run                     # 编译并在 QEMU 中启动（Debug 模式，4 个 hart）
+zig build run -Doptimize=small    # 体积优化，内核代码段约 22 KB
+zig build run -- -smp 1           # 只用一个 hart
 ```
 
 退出 QEMU：先按 `Ctrl-A`，再按 `X`；或者在 shell 里输入 `shutdown`。
@@ -121,4 +131,4 @@ tools/          QEMU 测试脚本
 
 - 更多系统调用：阻塞读键盘的 `read`、`fork`/`exec`/`wait`，以及用户程序自己申请内存
 - 从设备树读串口、PLIC 的地址和中断号
-- 多核：用 SBI HSM 扩展启动其他 hart
+- 多核：核间中断（叫醒的进程、被杀的进程现在要等那个 hart 的下一个时钟中断）

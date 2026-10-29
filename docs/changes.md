@@ -2,6 +2,15 @@
 
 每次改了内核（`src/`、`user/`、`build.zig`、链接脚本），在最上面加几行：新增了什么功能，修了什么 bug。最新的在前面。
 
+## 2026-10-29 多核；照 xv6 给进程加锁
+
+- 新增：多核。OpenSBI 只把一个 hart 交给内核，`kmain` 做完全局的初始化后，从设备树 `/cpus` 里找出其他 hart（新增 `dtb.Info.harts`），用 SBI HSM 扩展的 `hart_start`（新增 `sbi.hartStart`）逐个启动，等每个报到了再启动下一个；它们从 `secondaryEntry` → `kmainSecondary` 做自己那份初始化（`trap.init`、`vm.initHart`、`plic.initHart`、`timer.initHart`），然后各自运行调度器。启动日志多了一行 `[ok] N harts running, booted on hart M`。最多用 8 个 hart（`hart.max`）。`zig build run` 默认 `-smp 4`。
+- 新增：`src/hart.zig`。内核用 `tp` 存当前 hart 的编号（`hart.id()`）；`TrapFrame` 多了 `kernel_tp`（和补齐用的一项，共 288 字节），从 U 模式陷入时换回内核的 `tp`，回到 U 模式时再换成用户的。每个 hart 有自己的启动栈（`boot_stacks`，32 KiB，去掉了链接脚本里的 `__stack_top`）、`proc.cpus[i]`（当前进程、调度器上下文）、`spinlock` 的计数、定时器的预约时刻、PLIC 上下文。串口中断发给所有 hart。
+- 新增：照 xv6 的进程锁。每个进程一把锁，保护状态等字段，调度器拿着它切到进程、进程拿着它切回；`wait_lock` 保护父子关系；`timer.lock`（tickslock）保护 `ticks`，只有启动 hart 给它加 1。`proc.sleep` 的锁参数不能再为空。`fork`、`userinit` 拿着新进程的锁一次填好所有字段（`fill`，不覆盖锁）；`wait` 整个移进 `proc.wait`；`next_pid`、`foreground` 改成原子变量；新增 `proc.current()`、`yieldTimeslice`、`setForeground`、`parentPid`、`info`。定下了加锁顺序。
+- 新增：串口输出锁。每次 `print`、`write` 和一次 `write` 系统调用整段输出，不会和别的 hart 的输出交错。panic 的 hart 不拿锁，别的 hart 在输出、等锁、调度时看到有 hart 在 panic 就停下。panic 信息多了 hart 编号。
+- 改动：进程表从 8 项增加到 16 项（`abi.max_procs`）。
+- 新增：回归测试 `t_smp`（几个进程同时 fork/exit/wait、写同一个管道、sbrk、留下孤儿，杀掉在别的 hart 上死循环的进程），QEMU 测试用例 `smp`（还检查两个死循环的进程真的在并行）。`qemu_test.py` 默认单核和 4 核各跑一遍，新增 `--smp`。单元测试：设备树的 cpu 节点、Ctrl-C 找前台进程的子孙、`setfg`、`fill`、锁都放开了。
+
 ## 2026-10-29 命令行参数、文件描述符和管道、sbrk；为多核加锁
 
 - 新增：命令行参数。`exec` 多了 `argv`、`argc` 两个参数（最多 16 个、共 1024 字节，超出返回 `-E2BIG`），内核把它们复制到新程序的栈顶，`_start` 从 `a0`、`a1` 拿到，用户程序用 `sys.argv`、`sys.arg(i)` 读。shell 的 `run NAME ARGS...` 按空格拆参数。

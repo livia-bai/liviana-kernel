@@ -120,14 +120,17 @@ pub fn write(f: *File, space: *vm.PageTable, ptr: usize, len: usize) Error!usize
 
 /// 用户内存先分块复制到内核缓冲区再输出，每块都经过 vm.copyFromUser 检查。
 /// 每块都不跨页：一块失败就说明这一页整个不能读，前面的字节都已经写出去了。
+/// 整个 write 拿着串口的输出锁，所以一次 write 的内容不会和别的 hart 的输出交错。
 fn consoleWrite(space: *vm.PageTable, ptr: usize, len: usize) Error!usize {
+    const out = uart.lockOutput();
+    defer out.unlock();
     var buf: [128]u8 = undefined;
     var done: usize = 0;
     while (done < len) {
         const va = ptr + done;
         const chunk = buf[0..@min(buf.len, len - done, page.size - va % page.size)];
         vm.copyFromUser(space, chunk, va) catch return if (done == 0) error.BadAddress else done;
-        uart.write(chunk);
+        out.write(chunk);
         done += chunk.len;
     }
     return done;

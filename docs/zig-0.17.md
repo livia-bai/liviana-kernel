@@ -72,6 +72,14 @@ error: unused argument in '...'
 
 用 `comptimePrint` 生成汇编代码时，参数结构体里有格式串没用到的字段就会报错（比如 `trapEntry`、`trapExit` 想共用一个偏移量结构体，而其中一个字段只有 `trapExit` 用）。解决办法：把多段汇编模板先用 `++` 拼起来再统一 `comptimePrint`；只有一边用到的常量改用内联汇编的操作数传入，比如立即数用 `"i"` 约束：`andi t0, t0, %[spp]` + `[spp] "i" (riscv.sstatus_spp)`。
 
+### 内联汇编里取变量的地址不能用 `"X"` 约束
+
+```
+error: ld.lld: undefined symbol: a0
+```
+
+`tail %[kmain]` + `[kmain] "X" (&kmain)` 能用：函数的地址是个符号，编译器把符号名原样代进汇编。但对一个**变量**（`var boot_stacks: [8][32768]u8`）这样写，`la sp, %[stacks]` + `[stacks] "X" (&boot_stacks)`，编译器先生成一段把地址算进寄存器的代码（这里挑了 `a0`），再把寄存器名代进去，汇编就成了 `la sp, a0`，`a0` 被当成一个叫 `a0` 的符号，链接时找不到。在裸函数里这更要命：`a0` 里本来放着要保留的参数（hart 编号），已经被覆盖了。办法是把变量 `export` 出来，汇编里直接写它的名字（`main.zig` 的 `boot_stacks`）。
+
 ### 指针转换
 
 - `@ptrCast` 不能提高对齐要求：`*[512]Pte`（8 字节对齐）转成 `*align(4096) [4096]u8` 会报 `@ptrCast increases pointer alignment`，要写成 `@ptrCast(@alignCast(p))`，`@alignCast` 在 Debug/safe 模式下会检查实际地址。

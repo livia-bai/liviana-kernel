@@ -17,7 +17,15 @@ pub const TrapFrame = extern struct {
     regs: [32]usize,
     sepc: usize,
     sstatus: usize,
+    /// 回到 U 模式时内核的 tp（当前 hart 的编号，见 hart.zig），下次从 U 模式陷入时换回来
+    kernel_tp: usize = 0,
+    /// 补齐到 16 字节：TrapFrame 放在内核栈顶，它的下沿就是 handleTrap 开始用的 sp，要 16 字节对齐
+    _pad: usize = 0,
 };
+
+comptime {
+    std.debug.assert(@sizeOf(TrapFrame) % 16 == 0);
+}
 
 /// scause 最高位为 1 时，低位是中断编号。
 const Interrupt = enum(usize) {
@@ -71,6 +79,7 @@ const asm_offsets = .{
     .sp = 2 * @sizeOf(usize),
     .sepc = @offsetOf(TrapFrame, "sepc"),
     .sstatus = @offsetOf(TrapFrame, "sstatus"),
+    .kernel_tp = @offsetOf(TrapFrame, "kernel_tp"),
 };
 
 /// 陷阱入口。在 TrapFrame 里保存被打断的上下文，然后调用 handleTrap。
@@ -80,7 +89,10 @@ const asm_offsets = .{
 /// 入口先交换 sp 和 sscratch：交换后 sp 不为 0 说明来自 U 模式，sp 已经是内核栈；
 /// 为 0 说明来自内核，原来的 sp 就在 sscratch 里，取回来接着用。
 /// 两种情况下 sscratch 最后都存着被打断时的 sp，保存进 TrapFrame 之后清零。
-/// 内核不使用 gp 和 tp（没有线程局部变量，也不做 gp 相对寻址），所以用户程序留在里面的值不用换掉。
+///
+/// 内核用 tp 存当前 hart 的编号（hart.zig）。来自 U 模式时 tp 是用户程序的，存进 TrapFrame 之后
+/// 换成 trapExit 回到 U 模式时留下的 kernel_tp；来自内核时 tp 本来就是对的，不动。
+/// 内核不使用 gp（不做 gp 相对寻址），用户程序留在里面的值不用换掉。
 fn trapEntry() align(4) callconv(.naked) noreturn {
     asm volatile (std.fmt.comptimePrint(
             \\csrrw sp, sscratch, sp
@@ -96,6 +108,10 @@ fn trapEntry() align(4) callconv(.naked) noreturn {
             \\sd t0, {[sepc]d}(sp)
             \\csrr t0, sstatus
             \\sd t0, {[sstatus]d}(sp)
+            \\andi t0, t0, %[spp]
+            \\bnez t0, 2f
+            \\ld tp, {[kernel_tp]d}(sp)
+            \\2:
             \\mv a0, sp
             \\call %[handleTrap]
             \\tail %[trapExit]
@@ -103,6 +119,7 @@ fn trapEntry() align(4) callconv(.naked) noreturn {
         :
         : [handleTrap] "X" (&handleTrap),
           [trapExit] "X" (&trapExit),
+          [spp] "i" (riscv.sstatus_spp),
     );
 }
 
@@ -111,7 +128,8 @@ fn trapEntry() align(4) callconv(.naked) noreturn {
 ///
 /// 先写回 sstatus：其中 SIE 为 0，之后不会再被中断打断；SPP 决定 sret 回到哪个特权级。
 /// 如果要回到 U 模式，把这个 TrapFrame 的上沿（也就是内核栈顶）存进 sscratch，
-/// 下次从 U 模式陷入时 trapEntry 就从这里开始用内核栈。
+/// 下次从 U 模式陷入时 trapEntry 就从这里开始用内核栈；再把内核的 tp 存进 kernel_tp，
+/// 下次陷入时换回来。进程可能在别的 hart 上被调度过，所以每次回到 U 模式都要重新存。
 pub fn trapExit() callconv(.naked) noreturn {
     asm volatile (std.fmt.comptimePrint(
             \\ld t0, {[sstatus]d}(sp)
@@ -120,6 +138,7 @@ pub fn trapExit() callconv(.naked) noreturn {
             \\bnez t0, 1f
             \\addi t0, sp, {[size]d}
             \\csrw sscratch, t0
+            \\sd tp, {[kernel_tp]d}(sp)
             \\1:
             \\ld t0, {[sepc]d}(sp)
             \\csrw sepc, t0
@@ -144,14 +163,12 @@ fn handleTrap(frame: *TrapFrame) callconv(.c) void {
         switch (interrupt) {
             .supervisor_timer => {
                 timer.onInterrupt();
-                proc.wakeup(&timer.ticks); // 叫醒 sleep 系统调用里的进程，它们自己数时间到了没有
                 if (from_user) {
-                    proc.current.?.ticks += 1;
                     // 时间片用完了，让出 CPU（xv6 的 usertrap 也是这样）。用户程序就算在 U 模式里死循环，
-                    // 时钟中断也会把 CPU 交回内核。下次轮到它时 yield 返回，经 trapExit 回到 U 模式。
-                    // 放在中断处理全部完成之后：yield 可能很久以后才返回。
+                    // 时钟中断也会把 CPU 交回内核。下次轮到它时（可能在别的 hart 上）返回，经 trapExit 回到 U 模式。
+                    // 放在中断处理全部完成之后：可能很久以后才返回。
                     // （内核代码都是关着中断执行的，所以中断打断的要么是 U 模式，要么是调度器。）
-                    proc.yield();
+                    proc.yieldTimeslice();
                 }
             },
             .supervisor_external => handleExternal(),

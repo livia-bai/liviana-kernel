@@ -224,7 +224,7 @@ test_step.dependOn(&b.addRunArtifact(unit_tests).step);
 
 ```zig
 const qemu = b.addSystemCommand(&.{
-    "qemu-system-riscv64", "-machine", "virt", "-smp", "1", "-m", "128M",
+    "qemu-system-riscv64", "-machine", "virt", "-smp", "4", "-m", "128M",
     "-nographic", "-bios", "default", "-kernel",
 });
 qemu.addArtifactArg2(kernel, .{});
@@ -234,7 +234,7 @@ qemu.addPassthruArgs();
 | 参数 | 含义 |
 | --- | --- |
 | `-machine virt` | QEMU 的通用 RISC-V 虚拟板，外设地址见 [architecture.md](architecture.md#物理内存布局) |
-| `-smp 1` | 单核。内核目前只支持一个 hart |
+| `-smp 4` | 4 个 hart。内核从设备树里知道有几个、逐个启动（[boot.md](boot.md#启动其他-hart)），最多用 8 个。要换个数就在后面再给一个，后给的覆盖前面的：`zig build run -- -smp 1` |
 | `-m 128M` | 内存大小。改了之后内核会从设备树里读到新的大小，不需要改代码 |
 | `-nographic` | 不开窗口，串口接到当前终端；Ctrl-A 是 QEMU 的转义键，Ctrl-A X 退出 |
 | `-bios default` | 使用 QEMU 自带的 OpenSBI（fw_dynamic），它以 S 模式跳到 `0x8020_0000` |

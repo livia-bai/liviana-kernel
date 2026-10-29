@@ -34,11 +34,7 @@ SECTIONS
         *(COMMON)
         . = ALIGN(8);
         __bss_end = .;
-
-        /* 内核栈：64 KiB，紧跟在 .bss 后面；栈向下增长，所以 sp 从 __stack_top 开始 */
-        . = ALIGN(16);
-        . += 64K;
-        __stack_top = .;
+        /* 每个 hart 的启动栈也在 .bss 里（src/main.zig 的 boot_stacks） */
 
         /* 内核镜像到此为止，之后的内存交给页分配器 */
         . = ALIGN(4K);

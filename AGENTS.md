@@ -1,6 +1,6 @@
 # AGENTS.md
 
-用 Zig 写的最小 RISC-V 64 位内核，跑在 QEMU `virt` 机器上，由 OpenSBI 引导，内核运行在 S 模式，用户程序运行在 U 模式。
+用 Zig 写的最小 RISC-V 64 位内核，跑在 QEMU `virt` 机器上，由 OpenSBI 引导，内核运行在 S 模式，用户程序运行在 U 模式。支持多核（QEMU 默认 4 个 hart），加锁照 xv6。
 
 详细文档在 [docs/](docs/README.md)，里面有“源码文件 → 文档”的对照表。改某个文件之前，先读它对应的文档。
 
@@ -33,7 +33,7 @@ python3 tools/qemu_test.py --list      # 列出 QEMU 测试的用例和它们覆
 
 1. `zig fmt --check build.zig src/ user/`
 2. `zig build test`：单元测试，几毫秒。改了设备树解析、页分配器、页表、ELF 加载器这类纯逻辑，优先在这里加测试。
-3. `python3 tools/qemu_test.py --changed`：只跑和改动的文件有关的 QEMU 用例，默认 safe 模式。改了内联汇编、MMIO、中断、页表、进出 U 模式的代码时加 `--all-modes`（release 模式最容易暴露漏写 `volatile`、clobber，或者 `noreturn` 写错的问题）。新增源文件或测试程序时，在 `tools/qemu_test.py` 的 `CASES` 里登记它属于哪个用例。
+3. `python3 tools/qemu_test.py --changed`：只跑和改动的文件有关的 QEMU 用例，默认 safe 模式，单核和 4 核各跑一遍。改了加锁、调度、进程生命周期的代码时多跑几遍、多试几种 hart 数（`--smp 2 --smp 8`），竞争不一定每次都出现。改了内联汇编、MMIO、中断、页表、进出 U 模式的代码时加 `--all-modes`（release 模式最容易暴露漏写 `volatile`、clobber，或者 `noreturn` 写错的问题）。新增源文件或测试程序时，在 `tools/qemu_test.py` 的 `CASES` 里登记它属于哪个用例。
 
 改什么测什么，不要为了测试而测试：只改文档或 `tools/` 不需要编译、不跑 QEMU；同一份代码通过了就不要重复跑。新功能和 bug 修复要测到边界情况：能在主机上测的写单元测试，只能在 QEMU 里看到的加进 `user/tests/` 和 `qemu_test.py`。详见 [docs/testing.md](docs/testing.md)。
 
@@ -42,31 +42,36 @@ python3 tools/qemu_test.py --list      # 列出 QEMU 测试的用例和它们覆
 通用：
 
 - 代码注释和文档用中文，内核和用户程序打印的信息用英文。
+- 内核打印用 `uart.print`/`uart.write`，每次整段拿着输出锁；拿着 `uart.lockOutput()` 时不能再调用它们。
 - 目标 CPU 是 rv64imac，不启用 F/D 扩展：不要用浮点，陷阱处理也不保存浮点寄存器。
 - CSR 读写统一走 `src/riscv.zig`，新用到的 CSR 加到 `Csr` 枚举里。
 - 内存范围和时钟频率来自设备树（`src/dtb.zig`）；外设地址和 PLIC 中断号仍按 QEMU `virt` 写死，改的话要连注释一起改。
 
 绑在一起、改一边就要同步改另一边的：
 
-- `trap.TrapFrame` 的布局 ↔ `trap.trapEntry`、`trap.trapExit` 的汇编 ↔ `proc.startFrame` 构造初始 `TrapFrame`（`a0`/`a1`/`sp` 传命令行参数） ↔ `syscall.dispatch` 读参数的下标（[docs/trap.md](docs/trap.md#trapframe)）。
+- `trap.TrapFrame` 的布局（大小是 16 的倍数，含 `kernel_tp`） ↔ `trap.trapEntry`、`trap.trapExit` 的汇编 ↔ `proc.startFrame` 构造初始 `TrapFrame`（`a0`/`a1`/`sp` 传命令行参数） ↔ `syscall.dispatch` 读参数的下标（[docs/trap.md](docs/trap.md#trapframe)）。
 - `proc.Context` ↔ `proc.contextAsm`（[docs/process.md](docs/process.md#保存的上下文)）。
 - `linker.ld` 里各段的 4 KiB 对齐和 `__text_start`、`__rodata_start`、`__data_start`、`__kernel_end` ↔ `vm.init` 设置的页权限（[docs/boot.md](docs/boot.md#链接脚本)）。
+- `hart.max` ↔ `main.zig` 的启动栈（`boot_stacks`、`_start` 里的编号检查） ↔ 各处按 hart 编号下标的数组（`proc.cpus`、`spinlock.held`、`timer.deadline`）。启动栈的大小是实测的，改了 `kmain` 的初始化要重新量（[docs/boot.md](docs/boot.md#每个-hart-的启动栈)）。
+- 全局的初始化（启动 hart 的 `kmain`） ↔ 每个 hart 一份的初始化（`kmainSecondary`：`trap.init`、`vm.initHart`、`plic.initHart`、`timer.initHart`，以及清 `sstatus.FS`）：新加的每个 hart 的 CSR 设置两边都要做（[docs/boot.md](docs/boot.md#启动其他-hart)）。
 - `user/linker.ld` 的页对齐、可读的段 ↔ `proc.loadSegment` 的检查。
 - `src/abi.zig` 同时被内核和用户程序使用：新增系统调用时 `abi.zig`、`syscall.zig`、`user/sys.zig`、[docs/syscalls.md](docs/syscalls.md) 一起改。
 
 不能破坏的不变量：
 
 - `sscratch`：在 U 模式运行时存进程内核栈顶，在内核里为 0（[docs/trap.md](docs/trap.md#sscratch-约定)）。
-- `sstatus.FS` 保持 Off：`kmain` 一开始就清掉 OpenSBI 留下的 Dirty，进入 U 模式的 `sstatus` 从内核当前的值派生，所以用户程序也不能用浮点（[docs/riscv-sbi.md](docs/riscv-sbi.md#位定义)）。
+- `tp`：在内核里是当前 hart 的编号（`hart.id()`）；从 U 模式陷入时 `trapEntry` 换回内核的值，回到 U 模式时 `trapExit` 换成用户的。内核不能把 `tp` 挪作他用（[docs/trap.md](docs/trap.md#tp-约定)）。
+- `sstatus.FS` 保持 Off：`kmain`、`kmainSecondary` 一开始就清掉 OpenSBI 留下的 Dirty，进入 U 模式的 `sstatus` 从内核当前的值派生，所以用户程序也不能用浮点（[docs/riscv-sbi.md](docs/riscv-sbi.md#位定义)）。
 - 内核代码（陷阱处理、系统调用、调度器扫描进程表）全程关中断执行；只有调度器每一轮开头开一下中断（[docs/trap.md](docs/trap.md#中断开关不变量)）。
 - 调度器先关中断再扫描进程表、再 `wfi`，下一轮开头才开中断（[docs/process.md](docs/process.md#调度器)）。
-- 进程切换只在关中断时进行，并且总是调度器 ↔ 进程：`proc.scheduler` 切到进程，进程改掉自己的状态后只通过 `proc.sched`（`yield`/`sleep`/`finish`）切回（[docs/process.md](docs/process.md#切换上下文)）。`startFrame` 构造的 `TrapFrame`（init、`exec`）的 `sstatus` 必须清掉 `SIE`。
+- 进程切换只在关中断、拿着这个进程的锁时进行，并且总是调度器 ↔ 进程：`proc.scheduler` 拿着进程锁切到进程，进程拿上自己的锁、改掉自己的状态后只通过 `proc.sched`（`yield`/`yieldTimeslice`/`sleep`/`finish`）切回，切回来之后由调用方放开锁；新进程在 `forkretC` 里放开（[docs/process.md](docs/process.md#调度器)）。调度器先换回内核页表再放开进程锁。`startFrame` 构造的 `TrapFrame`（init、`exec`）的 `sstatus` 必须清掉 `SIE`。
+- 进程的 `state`、`pid`、`name`、`chan`、`killed`、`xstatus`、`ticks` 只在拿着它的锁时读写，`parent` 只在拿着 `wait_lock` 时读写；新进程拿着锁一次填好再放开（`fill` 不覆盖锁）（[docs/process.md](docs/process.md#锁)）。
 - 进程的 `TrapFrame` 总在它内核栈的最顶端（`proc.frameOf`）：`trapEntry`、`trapExit` 设 `sscratch`、`fork` 复制父进程的 `TrapFrame` 都依赖这一点。
 - 结束的进程只由父进程 `wait` 回收（`proc.reap`），父进程先结束的交给 init；init（pid 1）不能结束，结束内核就 panic（[docs/process.md](docs/process.md#结束进程)）。
-- 等待用 `proc.sleep(chan, lock)` / `proc.wakeup(chan)`，`lock` 是保护等待条件的锁（没有就传 `null`），醒来后在循环里重新检查条件；`proc.kill` 只做标记，被杀的进程在回到 U 模式之前（`handleTrap` 末尾、`forkret`）由 `checkKilled` 结束（[docs/process.md](docs/process.md#结束进程)）。
-- 自旋锁（`src/spinlock.zig`）只在关中断时拿；不能拿着锁调用 `proc.sched`、回到 U 模式（`sched` 和 `handleTrap` 会检查）；现在没有嵌套加锁，要嵌套先定顺序（[docs/process.md](docs/process.md#锁)）。
+- 等待用 `proc.sleep(chan, lock)` / `proc.wakeup(chan)`，`lock` 是保护等待条件的锁（不能为空：改条件的一方也要拿它），醒来后在循环里重新检查条件；`proc.kill` 只做标记，被杀的进程在回到 U 模式之前（`handleTrap` 末尾、`forkret`）由 `checkKilled` 结束（[docs/process.md](docs/process.md#结束进程)）。
+- 自旋锁（`src/spinlock.zig`）只在关中断时拿；调用 `proc.sched` 时只能拿着这个进程自己的锁，回到 U 模式时不能拿着任何锁（`sched`、`handleTrap`、`forkretC` 会检查）。嵌套加锁按固定顺序：`wait_lock` → 进程锁 → 页分配器、文件表、串口输出这些叶子锁；`timer.lock`、管道锁、`uart.rx_lock` → 进程锁。新加的嵌套要先对照这个顺序（[docs/process.md](docs/process.md#锁)）。
 - 进程结束时（`proc.finish`）关掉它所有的 fd，不能留给 `wait`：管道的写端不关，读的进程读不到结尾（[docs/process.md](docs/process.md#结束进程)）。
-- 用户地址空间只能用 Sv39 根页表的第 1 项（`vm.user_base..vm.user_end`），内核映射不能放进这个范围（[docs/paging.md](docs/paging.md#用户地址空间)）。
+- 用户地址空间只能用 Sv39 根页表的第 1 项（`vm.user_base..vm.user_end`），内核映射不能放进这个范围（[docs/paging.md](docs/paging.md#用户地址空间)）。内核页表启动后不再改，所有 hart 共用；一个用户地址空间同一时刻只在一个 hart 上用，改了它只刷当前 hart 的 TLB。
 - 内核碰用户内存只能通过 `vm.copyFromUser` 这类先查页表的函数，不要打开 `sstatus.SUM` 直接解引用用户指针（[docs/syscalls.md](docs/syscalls.md#访问用户内存)）。
 - 页表叶子必须可读或可执行，可写必须可读；ELF 加载器拒绝不可读的段（[docs/process.md](docs/process.md#elf-加载器)）。
 

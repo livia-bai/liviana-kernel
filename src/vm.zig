@@ -91,6 +91,11 @@ pub fn init(memory: dtb.Region) MapError!void {
     activate(kernel_root);
 }
 
+/// 其他 hart 启动时调用：内核页表已经由启动 hart 建好，启动后不再改，各个 hart 共用，打开分页就行。
+pub fn initHart() void {
+    activate(kernel_root);
+}
+
 fn mapMmio(base: usize, size: usize) MapError!void {
     try map(kernel_root, base, base, std.mem.alignForward(usize, size, page.size), .{ .r = true, .w = true });
 }

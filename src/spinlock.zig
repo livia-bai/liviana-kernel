@@ -1,36 +1,30 @@
-//! 自旋锁，照 xv6 的 spinlock.c 写，为多核做准备。
-//!
-//! 现在只有一个 hart，而且内核代码全程关着中断运行（见 docs/trap.md），所以锁实际上不会被争抢：
-//! acquire 时锁一定是空的。这里先把锁加在共享的数据结构上（页分配器、文件表、管道、串口的输入缓冲区），
-//! 写法和多核时一样，到时候只需要补上每个 hart 的状态（cpuId、held），不用再到处找漏掉的地方。
+//! 自旋锁，照 xv6 的 spinlock.c 写。几个 hart 同时访问的共享数据（进程表、页分配器、文件表、管道、
+//! 串口）都由自旋锁保护。
 //!
 //! 约定：
 //! - 拿着锁时中断必须是关着的。否则中断处理程序在同一个 hart 上去拿同一把锁，就会永远自旋下去。
-//!   内核代码本来就关着中断运行，所以 acquire 只检查，不负责关中断（xv6 的 push_off）。
-//! - 不能拿着锁切换进程（sched）、回到 U 模式。要拿着锁等待的，用 proc.sleep(chan, lock)：
-//!   它在睡下之后放开锁，醒来再重新拿上。
+//!   内核代码本来就关着中断运行（见 docs/trap.md），所以 acquire 只检查，不负责关中断（xv6 的 push_off）。
+//! - 不能拿着锁回到 U 模式。切换进程（sched）时只能拿着这个进程自己的锁（proc.zig），别的锁都要先放开；
+//!   要拿着锁等待的，用 proc.sleep(chan, lock)：它在睡下之后放开锁，醒来再重新拿上。
 //! - 同一个 hart 重复拿同一把锁是死锁，直接 panic。
+//! - 要同时拿几把锁时按固定的顺序拿，见 docs/process.md 的“锁”一节。
 
 const std = @import("std");
 const builtin = @import("builtin");
 const riscv = @import("riscv.zig");
+const hart = @import("hart.zig");
 
-const no_cpu = std.math.maxInt(usize);
+const no_hart = std.math.maxInt(usize);
 
-/// 当前 hart 的编号。现在只有一个 hart，总是 0；多核时改成从 tp 读。
-pub fn cpuId() usize {
-    return 0;
-}
-
-/// 当前 hart 拿着几把锁。多核时每个 hart 一个。
-pub var held: usize = 0;
+/// 每个 hart 拿着几把锁。只有这个 hart 自己读写自己那一项。
+var held: [hart.max]usize = @splat(0);
 
 pub const Spinlock = struct {
     /// 调试用的名字，panic 信息里会打印
     name: []const u8,
     locked: std.atomic.Value(bool) = .init(false),
-    /// 拿着锁的 hart，用来发现重复加锁
-    cpu: usize = no_cpu,
+    /// 拿着锁的 hart，用来发现重复加锁。只在拿着锁时写，所以不用原子操作
+    hart: usize = no_hart,
 
     pub fn init(name: []const u8) Spinlock {
         return .{ .name = name };
@@ -40,29 +34,39 @@ pub const Spinlock = struct {
         assertInterruptsOff();
         if (l.holding()) std.debug.panic("acquire: lock {s} is already held by this hart", .{l.name});
         // amoswap.w.aq：换进 true，换出来的是 false 才算拿到。acquire 语义保证临界区里的访存
-        // 不会被提前到拿到锁之前
-        while (l.locked.swap(true, .acquire)) std.atomic.spinLoopHint();
-        l.cpu = cpuId();
-        held += 1;
+        // 不会被提前到拿到锁之前。等锁时顺便看看是不是有别的 hart 在 panic：
+        // 锁可能在已经停下的 hart 手里，永远等不到
+        while (l.locked.swap(true, .acquire)) {
+            hart.checkPanic();
+            std.atomic.spinLoopHint();
+        }
+        l.hart = hart.id();
+        held[hart.id()] += 1;
     }
 
     pub fn release(l: *Spinlock) void {
         if (!l.holding()) std.debug.panic("release: lock {s} is not held by this hart", .{l.name});
-        l.cpu = no_cpu;
-        held -= 1;
+        l.hart = no_hart;
+        held[hart.id()] -= 1;
         // release 语义保证临界区里的访存都在放开锁之前完成
         l.locked.store(false, .release);
     }
 
-    /// 当前 hart 是否拿着这把锁。
+    /// 当前 hart 是否拿着这把锁。别的 hart 拿着时，hart 字段不会等于当前 hart 的编号，
+    /// 所以不拿锁读它也不会误判。
     pub fn holding(l: *const Spinlock) bool {
-        return l.locked.load(.monotonic) and l.cpu == cpuId();
+        return l.locked.load(.monotonic) and l.hart == hart.id();
     }
 };
 
-/// 切换进程、回到 U 模式之前调用：这时不能拿着任何锁。
+/// 当前 hart 拿着几把锁。
+pub fn heldCount() usize {
+    return held[hart.id()];
+}
+
+/// 回到 U 模式之前调用：这时不能拿着任何锁。
 pub fn assertNoneHeld() void {
-    if (held != 0) std.debug.panic("{d} spinlock(s) still held", .{held});
+    if (heldCount() != 0) std.debug.panic("{d} spinlock(s) still held", .{heldCount()});
 }
 
 fn assertInterruptsOff() void {
@@ -75,13 +79,13 @@ fn assertInterruptsOff() void {
 test "拿锁、放锁，记录拿着几把锁" {
     var a = Spinlock.init("a");
     var b = Spinlock.init("b");
-    const before = held;
+    const before = heldCount();
     a.acquire();
     b.acquire();
     try std.testing.expect(a.holding() and b.holding());
-    try std.testing.expectEqual(before + 2, held);
+    try std.testing.expectEqual(before + 2, heldCount());
     b.release();
     a.release();
     try std.testing.expect(!a.holding());
-    try std.testing.expectEqual(before, held);
+    try std.testing.expectEqual(before, heldCount());
 }

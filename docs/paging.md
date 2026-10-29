@@ -116,10 +116,10 @@ pub fn init(memory: dtb.Region) MapError!void
 
 | 范围 | 来自 | 权限 | Debug 模式实测 | 页大小 |
 | --- | --- | --- | --- | --- |
-| `[__text_start, __rodata_start)` | 代码 | R-X | `0x80200000..0x8024c000` | 4 KiB |
-| `[__rodata_start, __data_start)` | 只读数据（含 `.eh_frame`、嵌入的用户程序 ELF） | R-- | `0x8024c000..0x802af000` | 4 KiB |
-| `[__data_start, __kernel_end)` | `.data`、`.bss`、启动栈、进程内核栈 | RW- | `0x802af000..0x802c5000` | 4 KiB |
-| `[__kernel_end, 内存末尾)` | 页分配器管理的内存、设备树 | RW- | `0x802c5000..0x88000000` | 到 `0x80400000` 为止用 4 KiB，之后 62 个 2 MiB |
+| `[__text_start, __rodata_start)` | 代码 | R-X | `0x80200000..0x80255000` | 4 KiB |
+| `[__rodata_start, __data_start)` | 只读数据（含 `.eh_frame`、嵌入的用户程序 ELF） | R-- | `0x80255000..0x80354000` | 4 KiB |
+| `[__data_start, __kernel_end)` | `.data`、`.bss`、每个 hart 的启动栈、进程内核栈 | RW- | `0x80354000..0x803d7000` | 4 KiB |
+| `[__kernel_end, 内存末尾)` | 页分配器管理的内存、设备树 | RW- | `0x803d7000..0x88000000` | 到 `0x80400000` 为止用 4 KiB，之后 62 个 2 MiB |
 | 串口 | `uart.base`、`uart.mmio_size` 向上取整到页 | RW- | `0x10000000..0x10001000` | 4 KiB |
 | PLIC | `plic.base`、`plic.mmio_size` | RW- | `0x0c000000..0x0c600000` | 3 个 2 MiB |
 
@@ -143,6 +143,7 @@ pub fn init(memory: dtb.Region) MapError!void
 - **按段设权限**带来的保护：往代码或只读数据里写会触发写缺页（`store_page_fault`），跳到数据或空闲内存里执行会触发取指缺页。这要求各段按页对齐，见 [boot.md](boot.md#链接脚本)。开发时用一段临时代码验证过：往 `kmain` 所在的代码页写一个字，得到 `store_page_fault`。
 - **不映射的地方**：内核之前的 `0x8000_0000..0x8020_0000`（其中 `0x8000_0000..0x8006_0000` 是 OpenSBI，PMP 本来就不让 S 模式访问；后面是空着的，内核用不到）；地址 0 附近（空指针解引用变成 `load_page_fault`）；设备树里的其他外设（virtio、RTC 等，内核不用）。
 - 开始映射前检查内核镜像是否完全在设备树报告的内存范围里，不在就 panic（`kernel image is outside of RAM`）。
+- **所有 hart 共用这一份内核页表**：启动 hart 在 `vm.init` 里建好、打开分页，其他 hart 启动时调用 `vm.initHart()`，只做 `activate(kernel_root)`（[boot.md](boot.md#启动其他-hart)）。内核页表启动后不再改，所以不用担心别的 hart 的 TLB 里留着旧的内核映射。
 
 ## 切换地址空间
 
@@ -157,7 +158,8 @@ pub fn activate(root: *PageTable) void {
 - `satp` = MODE（最高 4 位，8 = Sv39）| ASID（第 44..59 位，这里一直是 0）| 根页表的物理页号。
 - 规范规定写 `satp` 本身不保证之前对页表的修改已经生效，也不会作废 TLB。所以写之前和之后各执行一次 `sfence.vma`：之前的那次保证页表的写入对页表遍历可见，之后的那次作废旧地址空间留在 TLB 里的翻译。
 - 没有使用 ASID，所有地址空间都是 ASID 0，所以每次切换都要作废整个 TLB。内核映射带 G 位，规范允许实现保留它们，但不带参数的 `sfence.vma` 会连全局项一起作废，这里也没有依赖这个优化。
-- `vm.init` 最后调用 `activate(kernel_root)` 打开分页；`proc.scheduler` 每次切到用户进程前切到它的地址空间，进程让出 CPU 后切回 `kernel_root`（父进程回收它的页表之前必须先切走）；`proc.exec` 换地址空间时先切到新的，再释放旧的。
+- `satp` 和 TLB 都是每个 hart 自己的，`activate` 和 `sfence.vma` 只影响当前 hart。
+- `vm.init` 最后调用 `activate(kernel_root)` 打开分页；`proc.scheduler` 每次切到用户进程前切到它的地址空间，进程让出 CPU 后切回 `kernel_root`（父进程可能在别的 hart 上回收它的页表，之前这个 hart 必须先切走，见 [process.md](process.md#调度器)）；`proc.exec` 换地址空间时先切到新的，再释放旧的。一个用户地址空间同一时刻只在一个 hart 上使用，所以改用户页表（`sbrk` 缩小）后只刷当前 hart 的 TLB 就够了（[process.md](process.md#锁)）。
 
 ## 用户地址空间
 

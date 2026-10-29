@@ -47,7 +47,7 @@ pub const Errno = enum(usize) {
     _,
 };
 
-pub const max_procs = 8;
+pub const max_procs = 16;
 pub const max_fds = 16;                  // 每个进程的 fd 表大小
 pub const stdin = 0, stdout = 1, stderr = 2;
 pub const max_args = 16;                 // exec 最多传几个参数
@@ -88,7 +88,7 @@ pub fn errnoOf(ret: usize) ?Errno      // 返回值在 [-4095, -1] 内时取出�
 | 10 | `kill` | `a0` = pid | 0；`-ESRCH`、`-EPERM`（init） | 只做标记，目标进程回到 U 模式之前结束（[process.md](process.md#kill只做标记)） |
 | 11 | `getppid` | 无 | 父进程的 pid；init 是 0 | |
 | 12 | `setfg` | `a0` = pid，0 表示没有 | 0；`-ESRCH` | 设置前台进程：按 Ctrl-C 时内核杀掉它（[process.md](process.md#ctrl-c)） |
-| 13 | `procinfo` | `a0` = `ProcInfo` 数组的地址，`a1` = 数组长度 n | 进程总数（可能大于 n）；`-EFAULT` | 按槽位顺序写最多 n 个进程的信息。n = 0 时只返回总数。名字超过 16 字节时截断 |
+| 13 | `procinfo` | `a0` = `ProcInfo` 数组的地址，`a1` = 数组长度 n | 进程总数（可能大于 n）；`-EFAULT` | 按槽位顺序写最多 n 个进程的信息。n = 0 时只返回总数。名字超过 16 字节时截断。每个槽位单独拿锁读一次（`proc.info`），不是同一瞬间的快照：别的 hart 上的进程可能正在 `fork`、结束 |
 | 14 | `meminfo` | `a0` = `MemInfo` 的地址 | 0；`-EFAULT` | 空闲页数、总页数、页大小 |
 | 15 | `listprog` | `a0` = 下标，`a1` = 缓冲区地址，`a2` = 长度 | 名字的完整长度；`-ENOENT`（下标超出范围）、`-EFAULT` | 把第 `a0` 个嵌在内核里的程序名写进缓冲区，最多写 `a2` 字节 |
 | 16 | `shutdown` | 无 | 不返回 | 通过 SBI 关机 |
@@ -107,9 +107,9 @@ pub fn dispatch(frame: *TrapFrame) usize {
     return switch (number) {
         .exit => proc.exit(@truncate(args[0])),
         .write => write(args[0], args[1], args[2]),
-        .getpid => proc.current.?.pid,
+        .getpid => proc.current().?.pid,
         ...
-        .getppid => if (proc.current.?.parent) |p| p.pid else 0,
+        .getppid => proc.parentPid(),       // 拿着 wait_lock 读 parent
         ...
         .shutdown => shutdown(),
         _ => abi.fail(.nosys),
@@ -119,7 +119,7 @@ pub fn dispatch(frame: *TrapFrame) usize {
 
 `proc.exit` 和 `shutdown` 是 `noreturn`，可以直接放在 `switch` 表达式里。其余的大多是一个小函数：把参数交给 `proc` 或 `vm` 里的函数，把 Zig 的错误换成 `abi.fail(错误码)`。
 
-会等待的调用（`yield`、`sleep`、`read`、管道的 `write`、`wait`）在里面切回调度器，等这个进程再被调度时才返回，然后 `handleTrap` 照常把返回值写进 `a0`、检查 `killed`、回到 U 模式。`sleep` 和 xv6 的 `sys_sleep` 一样，在循环里 `proc.sleep(&timer.ticks, null)`，每个时钟中断醒来一次，数够了 tick（或者被 kill 了）才返回（[process.md](process.md#sleepwakeup)）。
+会等待的调用（`yield`、`sleep`、`read`、管道的 `write`、`wait`）在里面切回调度器，等这个进程再被调度时才返回，然后 `handleTrap` 照常把返回值写进 `a0`、检查 `killed`、回到 U 模式。`sleep` 和 xv6 的 `sys_sleep` 一样，拿着 `timer.lock` 在循环里 `proc.sleep(&timer.ticks, &timer.lock)`，每个 tick 醒来一次，数够了 tick（或者被 kill 了）才返回（[process.md](process.md#sleepwakeup)）。
 
 ## write
 
@@ -189,18 +189,15 @@ fn pipe(fds_ptr: usize) usize
 ```zig
 fn wait(pid: usize, status_ptr: usize, options: usize) usize {
     if (options & ~abi.wait_nohang != 0) return abi.fail(.inval);
-    const found = proc.waitChild(pid, options & abi.wait_nohang != 0) catch return abi.fail(.child);
-    const child = found orelse return 0;
-    if (status_ptr != 0) {
-        vm.copyToUser(space(), status_ptr, std.mem.asBytes(&child.xstatus)) catch return abi.fail(.fault);
-    }
-    const child_pid = child.pid;
-    proc.reap(child);
-    return child_pid;
+    const found = proc.wait(pid, options & abi.wait_nohang != 0, status_ptr) catch |err| return abi.fail(switch (err) {
+        error.NoChildren => .child,
+        error.BadAddress => .fault,
+    });
+    return found orelse 0;
 }
 ```
 
-- 怎么找、怎么等子进程见 [process.md](process.md#wait回收子进程)。
+- 怎么找、怎么等子进程、怎么写状态和回收见 [process.md](process.md#wait回收子进程)：这些都要拿着 `wait_lock` 和子进程的锁做，所以整个放在 `proc.wait` 里，系统调用这一层只转换错误码。
 - 结束状态是一个 `u32`：正常退出时是退出码（0..255），被杀（异常、`kill`、Ctrl-C）时是 `abi.killed_status`（`0x100`）。
 - **写状态失败时不回收**，返回 `-EFAULT`：子进程还是 zombie，可以换个地址再 `wait`。
 - 不认识的 options 位返回 `-EINVAL`。
@@ -290,6 +287,6 @@ pub fn fprint(fd: Fd, comptime fmt: []const u8, args: anytype) void
 1. `src/abi.zig`：在 `Syscall` 里加一个编号（需要新错误码就在 `Errno` 里加，沿用 Linux 的编号）。
 2. `src/syscall.zig`：在 `dispatch` 的 `switch` 里加分支。参数是 `args[0..6]`，返回 `usize`；失败时返回 `abi.fail(...)`。
 3. 涉及用户指针的，一律通过 `vm.copyFromUser` / `vm.copyToUser` 访问，不要打开 `SUM`。会消耗内核状态（比如取走输入）的，先用 `vm.checkUser` 检查整个范围。
-4. 要阻塞等待的（比如等键盘输入），照 `sleep` 的办法：挑一个代表“在等什么”的地址作通道，拿着保护条件的锁 `while (!条件 and !proc.isKilled()) proc.sleep(chan, &lock);`，在条件可能变化的地方（中断处理程序、别的进程）拿着同一把锁改条件、`proc.wakeup(chan)`（[process.md](process.md#sleepwakeup)）。读串口用的是 `uart.rx_chan` 和 `uart.rx_lock`，管道用的是 `&pipe.nread`/`&pipe.nwrite` 和管道的锁，`wait` 用的是进程自己（还没有锁，传 `null`）。不要在系统调用里开中断 `wfi`（[trap.md](trap.md#中断开关不变量)）。
+4. 要阻塞等待的（比如等键盘输入），照 `sleep` 的办法：挑一个代表“在等什么”的地址作通道，拿着保护条件的锁 `while (!条件 and !proc.isKilled()) proc.sleep(chan, &lock);`，在条件可能变化的地方（中断处理程序、别的进程）拿着同一把锁改条件、`proc.wakeup(chan)`（[process.md](process.md#sleepwakeup)）。读串口用的是 `uart.rx_chan` 和 `uart.rx_lock`，管道用的是 `&pipe.nread`/`&pipe.nwrite` 和管道的锁，`wait` 用的是进程自己和 `proc.wait_lock`，`sleep` 用的是 `&timer.ticks` 和 `timer.lock`。`lock` 不能为空。不要在系统调用里开中断 `wfi`（[trap.md](trap.md#中断开关不变量)）。
 5. `user/sys.zig`：加一个封装函数。
 6. 更新本文的调用列表，在 [changes.md](changes.md) 里加一行。

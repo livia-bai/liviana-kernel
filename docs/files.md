@@ -64,7 +64,7 @@ fn consoleWrite(space: *vm.PageTable, ptr: usize, len: usize) Error!usize
 fn consoleRead(space: *vm.PageTable, ptr: usize, len: usize) Error!usize
 ```
 
-- **写**：用户内存按块（128 字节、不跨页）复制到栈上，再 `uart.write`。部分写的语义见 [syscalls.md](syscalls.md#write)。
+- **写**：先 `uart.lockOutput()` 拿上串口的输出锁，用户内存按块（128 字节、不跨页）复制到栈上、逐块输出，全部写完才放开锁，所以一次 `write` 的内容不会和别的 hart 的输出交错（[devices.md](devices.md#输出)）。部分写的语义见 [syscalls.md](syscalls.md#write)。
 - **读**：拿着 `uart.rx_lock` 检查输入缓冲区（[devices.md](devices.md#输入环形缓冲区)），空着就 `proc.sleep(uart.rx_chan, &uart.rx_lock)`，串口中断叫醒它；被 kill 了就返回。有字符就有多少读多少（最多 `len`），每次最多 64 个放进栈上的缓冲区，再 `copyToUser`。调用方（`read` 系统调用）已经检查过目标范围可写，`copyToUser` 不会失败。
 - **Ctrl-D（`0x04`）表示输入结束**，和 Unix 终端一样：读到它就停下。它前面有字符的话先返回这些字符，Ctrl-D 留在缓冲区里；下一次 `read` 读掉它、返回 0。所以单独按一次 Ctrl-D，`read` 返回 0。`cat`、`wc` 直接从键盘读时靠它结束；shell 读到 0 就忽略。
 - 不回显、不做行编辑（shell 自己做），Ctrl-C 在串口中断里就被截下了（[process.md](process.md#ctrl-c)），读不到。
@@ -91,7 +91,7 @@ pub fn read(p: *Pipe, space: *vm.PageTable, ptr: usize, len: usize) Error!usize
 
 - **一个管道占一页**（`page.alloc`），编译期断言 `@sizeOf(Pipe) <= 4096`。两端都关了才 `page.free`。
 - **环形缓冲区**：`nread`、`nwrite` 只增不减，`nwrite - nread` 是缓冲区里的字节数，下标是它们对 `size` 取模。64 位的计数器不会回绕（每秒写 1 GB 也要几百年），所以不用像 xv6 那样担心回绕时取模出错。
-- **所有字段由 `lock` 保护**，读写两端的进程拿着它等待。这是“为多核准备”的锁里真正有用的一把：多核时读写两端的进程会在不同的 hart 上同时运行。
+- **所有字段由 `lock` 保护**，读写两端的进程拿着它等待：读写两端的进程可能在不同的 hart 上同时运行。回归测试 `t_smp` 让 6 个进程同时往一个管道里写，按字节数对账（[testing.md](testing.md#回归测试程序)）。
 
 ### 写
 

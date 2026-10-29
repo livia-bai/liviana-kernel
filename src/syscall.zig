@@ -23,7 +23,7 @@ pub fn dispatch(frame: *TrapFrame) usize {
     return switch (number) {
         .exit => proc.exit(@truncate(args[0])),
         .write => write(args[0], args[1], args[2]),
-        .getpid => proc.current.?.pid,
+        .getpid => proc.current().?.pid,
         .uptime => timer.uptimeMs(),
         .yield => yield(),
         .sleep => sleep(args[0]),
@@ -32,7 +32,7 @@ pub fn dispatch(frame: *TrapFrame) usize {
         .exec => exec(args[0], args[1], args[2], args[3]),
         .wait => wait(args[0], args[1], args[2]),
         .kill => kill(args[0]),
-        .getppid => if (proc.current.?.parent) |p| p.pid else 0,
+        .getppid => proc.parentPid(),
         .setfg => setfg(args[0]),
         .procinfo => procinfo(args[0], args[1]),
         .meminfo => meminfo(args[0]),
@@ -47,7 +47,7 @@ pub fn dispatch(frame: *TrapFrame) usize {
 }
 
 fn space() *vm.PageTable {
-    return proc.current.?.space;
+    return proc.current().?.space;
 }
 
 fn yield() usize {
@@ -56,24 +56,26 @@ fn yield() usize {
 }
 
 /// 睡至少 ms 毫秒，按 tick 向上取整（乘法和加法都是饱和的，ms 再大也不溢出）。
-/// 和 xv6 的 sys_sleep 一样：睡在 &timer.ticks 上，每个时钟中断叫醒一次，醒来自己数够了没有。
+/// 和 xv6 的 sys_sleep 一样：拿着 timer.lock 睡在 &timer.ticks 上，每个 tick 叫醒一次，醒来自己数够了没有。
 /// 被 kill 了就提前返回，回到陷阱处理程序后结束。
 fn sleep(ms: usize) usize {
     const n = (ms *| timer.tick_hz +| 999) / 1000;
+    timer.lock.acquire();
+    defer timer.lock.release();
     const start = timer.ticks;
-    while (timer.ticks - start < n and !proc.isKilled()) proc.sleep(&timer.ticks, null);
+    while (timer.ticks - start < n and !proc.isKilled()) proc.sleep(&timer.ticks, &timer.lock);
     return 0;
 }
 
 /// fd 对应的打开的文件，fd 超出范围或者没有打开时返回 null。
 fn fileOf(fd: usize) ?*file.File {
     if (fd >= abi.max_fds) return null;
-    return proc.current.?.files[fd];
+    return proc.current().?.files[fd];
 }
 
 /// 当前进程最小的空闲 fd，指向 f（f 的引用已经算好了）。fd 表满了返回 null。
 fn installFd(f: *file.File) ?usize {
-    const files = &proc.current.?.files;
+    const files = &proc.current().?.files;
     for (files, 0..) |*slot, fd| {
         if (slot.* == null) {
             slot.* = f;
@@ -107,7 +109,7 @@ fn read(fd: usize, ptr: usize, len: usize) usize {
 
 fn close(fd: usize) usize {
     const f = fileOf(fd) orelse return abi.fail(.badf);
-    proc.current.?.files[fd] = null;
+    proc.current().?.files[fd] = null;
     file.close(f);
     return 0;
 }
@@ -129,7 +131,7 @@ fn pipe(fds_ptr: usize) usize {
         error.TooManyFiles => .nfile,
         error.OutOfMemory => .nomem,
     });
-    const files = &proc.current.?.files;
+    const files = &proc.current().?.files;
     const rfd = installFd(r) orelse {
         file.close(r);
         file.close(w);
@@ -194,18 +196,15 @@ fn exec(name_ptr: usize, name_len: usize, argv_ptr: usize, argc: usize) usize {
     return argc;
 }
 
-/// 等子进程结束（见 proc.waitChild），把结束状态写进 status_ptr（不为 0 时），回收它，返回它的 pid。
+/// 等子进程结束，把结束状态写进 status_ptr（不为 0 时），回收它，返回它的 pid（见 proc.wait）。
 /// 写状态失败时不回收，返回 -EFAULT：子进程还在，可以再 wait 一次。
 fn wait(pid: usize, status_ptr: usize, options: usize) usize {
     if (options & ~abi.wait_nohang != 0) return abi.fail(.inval);
-    const found = proc.waitChild(pid, options & abi.wait_nohang != 0) catch return abi.fail(.child);
-    const child = found orelse return 0;
-    if (status_ptr != 0) {
-        vm.copyToUser(space(), status_ptr, std.mem.asBytes(&child.xstatus)) catch return abi.fail(.fault);
-    }
-    const child_pid = child.pid;
-    proc.reap(child);
-    return child_pid;
+    const found = proc.wait(pid, options & abi.wait_nohang != 0, status_ptr) catch |err| return abi.fail(switch (err) {
+        error.NoChildren => .child,
+        error.BadAddress => .fault,
+    });
+    return found orelse 0;
 }
 
 fn kill(pid: usize) usize {
@@ -217,26 +216,17 @@ fn kill(pid: usize) usize {
 }
 
 fn setfg(pid: usize) usize {
-    if (pid != 0 and proc.findPid(pid) == null) return abi.fail(.srch);
-    proc.foreground = pid;
+    proc.setForeground(pid) catch return abi.fail(.srch);
     return 0;
 }
 
 /// 把进程表里每个在用的槽位写成一个 ProcInfo，最多写 n 个，返回进程总数（可能比 n 大）。
+/// 每个槽位单独拿锁取一份（proc.info），不是同一瞬间的快照：别的 hart 上的进程可能正在 fork、结束。
 fn procinfo(ptr: usize, n: usize) usize {
     var count: usize = 0;
-    for (&proc.table) |*p| {
-        if (p.state == .unused) continue;
+    for (0..proc.max_procs) |i| {
+        const info = proc.info(i) orelse continue;
         if (count < n) {
-            var info: abi.ProcInfo = .{
-                .pid = p.pid,
-                .ppid = if (p.parent) |q| q.pid else 0,
-                .ticks = p.ticks,
-                .state = p.state,
-                .name_len = @intCast(@min(p.name.len, 16)),
-                .name = @splat(0),
-            };
-            @memcpy(info.name[0..info.name_len], p.name[0..info.name_len]);
             const va = std.math.add(usize, ptr, count * @sizeOf(abi.ProcInfo)) catch return abi.fail(.fault);
             vm.copyToUser(space(), va, std.mem.asBytes(&info)) catch return abi.fail(.fault);
         }
