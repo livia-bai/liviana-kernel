@@ -69,11 +69,16 @@ pub fn build(b: *std.Build) void {
 
     // zig build test：在主机上运行单元测试（src/tests.zig），测设备树解析、页分配器、页表、ELF 加载器这些纯逻辑。
     // 用户程序的 ELF 也交给单元测试，用来测 ELF 加载器。
-    const unit_tests = b.addTest(.{ .root_module = b.createModule(.{
-        .root_source_file = b.path("src/tests.zig"),
-        .target = b.graph.host,
-        .optimize = optimize,
-    }) });
+    // -Dtest-filter=名字的一部分：只跑名字里含这一段的测试
+    const test_filter = b.option([]const u8, "test-filter", "Only run the unit tests whose names contain this text");
+    const unit_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tests.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+        .filters = if (test_filter) |f| &.{f} else &.{},
+    });
     const test_step = b.step("test", "Run the unit tests on the host");
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
 

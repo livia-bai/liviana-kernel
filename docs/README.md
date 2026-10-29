@@ -21,6 +21,7 @@ liviana-kernel 的详细文档，按功能组织，讲这个用 Zig 写的 RISC-
 | [process.md](process.md) | 进程：进程表、ELF 加载器、`userinit`/`fork`/`exec`、命令行参数、`sbrk`、xv6 式调度（每个 hart 的 `scheduler`、`sched`/`sleep`/`wakeup`）、核间中断、切换上下文、`exit`/`wait`/`kill`、Ctrl-C、锁和加锁顺序 |
 | [disk.md](disk.md) | 磁盘：virtio 块设备驱动、睡眠锁、缓冲区缓存、读写块的系统调用 |
 | [btree.md](btree.md) | 写时复制 B 树（以后文件系统的基础，类似 btrfs）：节点格式、写时复制、事务和提交、空闲空间、掉电测试 |
+| [fs.md](fs.md) | 文件系统：inode、目录、文件内容（内联、数据块、洞、校验和），每个操作一个事务，掉电测试 |
 | [files.md](files.md) | 文件：fd 表、文件表、串口和管道的读写 |
 | [syscalls.md](syscalls.md) | 系统调用：调用约定、调用列表、访问用户内存、怎么加新调用 |
 | [shell.md](shell.md) | shell（用户程序）：输入处理、前台和后台进程、命令 |
@@ -46,6 +47,7 @@ liviana-kernel 的详细文档，按功能组织，讲这个用 Zig 写的 RISC-
 | `src/bio.zig` | [disk.md](disk.md#缓冲区缓存biozig) | [syscalls.md](syscalls.md#调用列表) |
 | `src/btree.zig` | [btree.md](btree.md#节点格式btreezig) | |
 | `src/ctree.zig` | [btree.md](btree.md) | [disk.md](disk.md#缓冲区缓存biozig) |
+| `src/fs.zig` | [fs.md](fs.md) | [btree.md](btree.md) |
 | `src/ipi.zig` | [process.md](process.md#核间中断) | [riscv-sbi.md](riscv-sbi.md#用到的扩展)、[trap.md](trap.md#分发) |
 | `src/dtb.zig` | [devicetree.md](devicetree.md) | |
 | `src/page.zig` | [page-allocator.md](page-allocator.md) | |

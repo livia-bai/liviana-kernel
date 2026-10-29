@@ -12,6 +12,7 @@
 ```sh
 zig build test                 # 没有输出就是全部通过
 zig build test --summary all   # 显示通过了几个
+zig build test -Dtest-filter=掉电 --summary all   # 只跑名字里含“掉电”的测试
 ```
 
 入口是 `src/tests.zig`，它引用了下面这些文件，各文件末尾的 `test` 块就是测试：
@@ -29,6 +30,7 @@ zig build test --summary all   # 显示通过了几个
 | `src/sleeplock.zig` | 拿、放、`holding`（主机上没有进程，只测不需要等待的路径） |
 | `src/btree.zig` | 键的顺序和 `successor`；叶子的插入、删除和数据的挪动；叶子分裂后两边都空出至少四分之一；`childFor` 把 `ptrs[0].key` 当负无穷；内部节点的插入、删除、分裂；校验和 |
 | `src/ctree.zig` | 写时复制 B 树（[btree.md](btree.md#单元测试)）：插入、查找、遍历、更新、删除，树长高又变矮；没提交的改动挂载后没了，`pending` 的块不被提前分配；磁盘满；坏块、写丢了、超级块坏了；随机操作每步都检查；在每一次写之后掉电（包括只写进一部分）共 681 次，重新挂载后都是某个已提交的状态 |
+| `src/fs.zig` | 文件系统（[fs.md](fs.md#单元测试)）：目录和路径、各种错误；`readdir`、散列相同的名字；内联、换成数据块、跨页、洞、写到一半出错整个作废、截断、删除后块都还回来；数据块的校验和；在每一次写盘之后掉电（共 121 次），重新挂载后都是某一个操作做完的样子，再接着写也不坏 |
 | `src/ipi.zig` | `wakeIdle` 每次用 `cmpxchg` 认领一个别的空闲 hart，不叫自己，没有空闲的就停下 |
 | `src/file.zig` | `dup` 加引用、最后一个 `close` 才关掉管道；文件表满了 `openPipe` 失败且不漏 |
 

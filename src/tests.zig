@@ -16,4 +16,5 @@ test {
     _ = @import("bio.zig");
     _ = @import("btree.zig");
     _ = @import("ctree.zig");
+    _ = @import("fs.zig");
 }

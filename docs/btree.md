@@ -161,6 +161,20 @@ commit:  写超级块（事务号 transid，写到第 transid % 2 块） → pen
 
 **位图不能在栈上复制**：一个位图 8 KiB，`Volume` 有三个（`used`、`pending` 和走树用的 `seen`），比内核栈的一半还大。只在原地改（`clear`、逐个 `masks` 的循环），不写 `.initEmpty()`、`complement()`、`v.* = .{...}` 这类可能先在栈上造一个临时值的写法。
 
+## 给文件系统用的接口
+
+```zig
+pub const DataRef = struct { blockno: u64, generation: u64 };
+data_refs: ?*const fn (key: Key, data: []const u8) ?DataRef   // Volume 的字段
+pub fn allocData(v: *Volume) Error!u64
+pub fn freeData(v: *Volume, blockno: u64, generation: u64) void
+pub fn lastKey(v: *Volume) Error!?Key
+```
+
+- **数据块**是树外的块（文件的内容），由叶子里的条目指向。`allocData` 分配一个（属于当前事务），`freeData` 释放：和节点一样，属于已提交的树的要等提交之后才能再用（[fs.md](fs.md#文件内容)）。
+- **`data_refs`**：挂载、检查走树时，对叶子里的每个条目调用它；它认出指向数据块的条目，返回那个块，`walk` 把它也记成用着的，同一块被引用两次是 `Corrupt`。文件系统在挂载之前设好（`fs.mount`），B 树自己的测试里是 null。
+- **`lastKey`**：树里最大的键（一路走最右边的指针），文件系统挂载时用它算下一个 inode 号。
+
 ## 检查（`check`）
 
 走一遍当前的树，检查：每个节点的校验和、块号、事务号（不大于当前事务）、层数；键在节点里严格递增，并且都在父节点给的 `[下界, 上界)` 里（跳过 `ptrs[0].key`）；所有叶子在同一层；叶子的数据正好从块末尾往前挨着放、不和条目重叠；同一个块不被引用两次；当前的树不用 `pending` 里的块；`used` 正好等于树的块 + 超级块 + `pending`，`free_count` 和它一致。挂载时走的是同一个 `walk`（不数条目），所以坏块、写丢了在挂载时就能发现。
@@ -182,7 +196,7 @@ commit:  写超级块（事务号 transid，写到第 transid % 2 块） → pen
 
 ## 限制和以后可以做的
 
-- 还没有接进内核：文件系统（inode、目录、文件数据、`mkfs`、系统调用）是下一步。
+- 还没有接进内核：文件系统本身在 [fs.md](fs.md)，`mkfs`、系统调用是下一步。
 - QEMU 上写盘是同步的（`bio.write` 等设备做完），但驱动没有协商、也没发 `VIRTIO_BLK_T_FLUSH`：数据交给了 QEMU，QEMU 自己（宿主机）掉电的话，超级块可能比前面的节点先落到宿主机的磁盘上。真机上要在写超级块之前发一次 flush。
 - 不合并半空的节点；没有快照。
 - 每个修改都复制整条路径，写放大比日志式文件系统大；一个事务里反复改同一批节点就不再复制。

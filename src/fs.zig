@@ -1,0 +1,884 @@
+//! 文件系统：inode、目录、文件内容，都是写时复制 B 树（ctree.zig）里的条目，照 btrfs 的条目设计简化。
+//! 这里只有文件系统本身的逻辑（不加锁、不知道进程），内核（syscall.zig）、mkfs、单元测试都用它。
+//!
+//! 条目（键是 (objectid, type, offset)，objectid 都是 inode 号，所以一个文件的所有条目在树里挨在一起）：
+//!
+//!   (ino, inode,  0)                  Inode：种类、长度、父目录
+//!   (目录 ino, dir, 名字的散列 << 32 | 序号)   目录项：子 inode 号、种类、名字。散列相同的名字序号不同
+//!   (ino, extent, 页号 * 4096)        文件第几页的内容：内联（数据直接放在条目里）或者指向一个数据块
+//!
+//! - 根目录的 inode 号是 1，新 inode 号是树里最大的 objectid + 1（挂载时算出来，之后递增）。
+//! - 目录不存 "." 和 ".."：路径里遇到它们时直接用自己、Inode.parent。没有硬链接，一个 inode 只有一个名字。
+//! - 文件按 4 KiB 一页存。不超过 inline_max 字节的文件整个内联在第 0 页的条目里（btrfs 的 inline extent），
+//!   省一个数据块；长大之后换成数据块。没有条目的页是“洞”，读出来是 0。长度之外的字节总是 0。
+//! - 数据块也写时复制：改一页就分配一个新块、写好，再改条目指向它，旧块交给 Volume.freeData
+//!   （属于已提交的树的要等提交之后才能再用）。条目里记着数据块的 crc32c，读盘时校验（btrfs 的数据校验和）。
+//! - 一次操作就是 ctree 的一个事务的一部分：调用方成功之后 commit，出错 abort（见 Fs.run），
+//!   所以每个操作要么全做了、要么什么都没做，掉电也一样。
+
+const std = @import("std");
+const btree = @import("btree.zig");
+const ctree = @import("ctree.zig");
+const bio = @import("bio.zig");
+const Key = btree.Key;
+const Volume = ctree.Volume;
+
+pub const block_size = btree.block_size;
+pub const root_ino: u64 = 1;
+/// 名字最长多少字节
+pub const max_name = 255;
+/// 不超过这么多字节的文件内联在条目里
+pub const inline_max = 512;
+/// 文件最大多少（页号乘 4096 不能溢出，留够余量）
+pub const max_file_size: u64 = 1 << 40;
+
+const type_inode: u8 = 1;
+const type_dir: u8 = 2;
+const type_extent: u8 = 3;
+
+pub const Kind = enum(u8) { file = 1, dir = 2, _ };
+
+pub const Inode = extern struct {
+    kind: Kind,
+    _pad: [7]u8 = @splat(0),
+    size: u64,
+    /// 所在的目录（根目录是它自己）。路径里的 ".." 用它
+    parent: u64,
+};
+
+/// 目录项的数据：这个头加上名字（不以 0 结尾）。
+const DirHeader = extern struct {
+    ino: u64,
+    kind: Kind,
+    name_len: u8,
+    _pad: [6]u8 = @splat(0),
+};
+
+const ExtentKind = enum(u8) { inline_data = 1, block = 2, _ };
+
+/// 文件内容的条目的数据：这个头，内联时后面跟着内容，指向数据块时后面是 BlockRef。
+const ExtentHeader = extern struct {
+    kind: ExtentKind,
+    _pad: [3]u8 = @splat(0),
+    /// 数据块的 crc32c（内联的不用：节点自己有校验和）
+    csum: u32 = 0,
+};
+
+const BlockExtent = extern struct {
+    head: ExtentHeader,
+    blockno: u64,
+    /// 写这个数据块的事务号，释放时用（Volume.freeData）
+    generation: u64,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(Inode) == 24 and @sizeOf(DirHeader) == 16 and @sizeOf(BlockExtent) == 24);
+    std.debug.assert(@sizeOf(DirHeader) + max_name <= btree.max_data and @sizeOf(ExtentHeader) + inline_max <= btree.max_data);
+}
+
+pub const Error = ctree.Error || error{
+    /// 路径中间的某一段不是目录，或者对文件做目录的操作
+    NotDir,
+    /// 对目录做文件的操作（读写）
+    IsDir,
+    /// 删除的目录不是空的
+    NotEmpty,
+    NameTooLong,
+    /// 空名字、"."、".."、含 '/'
+    InvalidName,
+    /// 读写的用户内存不对（out.put、in.get 返回的）
+    BadAddress,
+    FileTooBig,
+};
+
+pub const Stat = struct {
+    ino: u64,
+    kind: Kind,
+    size: u64,
+};
+
+pub const Dirent = struct {
+    ino: u64,
+    kind: Kind,
+    name_len: usize,
+    /// 下一次 readdir 从这里接着找
+    next: u64,
+};
+
+const zeros: [block_size]u8 = @splat(0);
+
+fn csum(data: *const [block_size]u8) u32 {
+    return std.hash.crc.@"CRC-32/ISCSI".hash(data);
+}
+
+fn nameHash(name: []const u8) u64 {
+    return std.hash.crc.@"CRC-32/ISCSI".hash(name);
+}
+
+/// 挂载时 ctree 走树用：指向数据块的条目返回那个块。
+fn dataRefs(key: Key, data: []const u8) ?ctree.DataRef {
+    if (key.type != type_extent or data.len != @sizeOf(BlockExtent)) return null;
+    const e = std.mem.bytesToValue(BlockExtent, data);
+    if (e.head.kind != .block) return null;
+    return .{ .blockno = e.blockno, .generation = e.generation };
+}
+
+pub const Fs = struct {
+    vol: *Volume,
+    /// 下一个新 inode 的号
+    next_ino: u64,
+
+    /// 在磁盘上建一个只有空的根目录的文件系统。
+    pub fn format(vol: *Volume, blocks: u64) Error!void {
+        try Volume.format(blocks);
+        vol.data_refs = dataRefs;
+        try vol.mount();
+        try vol.insert(Key.init(root_ino, type_inode, 0), std.mem.asBytes(&Inode{ .kind = .dir, .size = 0, .parent = root_ino }));
+        try vol.commit();
+    }
+
+    pub fn mount(vol: *Volume) Error!Fs {
+        vol.data_refs = dataRefs;
+        try vol.mount();
+        var fs: Fs = .{ .vol = vol, .next_ino = 0 };
+        const root = try fs.getInode(root_ino);
+        if (root.kind != .dir) return error.Corrupt;
+        const last = try vol.lastKey() orelse return error.Corrupt;
+        fs.next_ino = last.objectid + 1;
+        return fs;
+    }
+
+    /// 做一个操作：成功就提交，出错就作废这个事务（之前做了一半的都不算）。
+    pub fn run(fs: *Fs, comptime op: anytype, args: anytype) Error!@typeInfo(@typeInfo(@TypeOf(op)).@"fn".return_type.?).error_union.payload {
+        const result = @call(.auto, op, .{fs} ++ args) catch |err| {
+            try fs.vol.abort();
+            return err;
+        };
+        try fs.vol.commit();
+        return result;
+    }
+
+    // ---- inode ----
+
+    fn getInode(fs: *Fs, ino: u64) Error!Inode {
+        var ind: Inode = undefined;
+        const size = try fs.vol.lookup(Key.init(ino, type_inode, 0), std.mem.asBytes(&ind)) orelse return error.NotFound;
+        if (size != @sizeOf(Inode)) return error.Corrupt;
+        return ind;
+    }
+
+    fn putInode(fs: *Fs, ino: u64, ind: Inode) Error!void {
+        try fs.vol.update(Key.init(ino, type_inode, 0), std.mem.asBytes(&ind));
+    }
+
+    pub fn stat(fs: *Fs, ino: u64) Error!Stat {
+        const ind = try fs.getInode(ino);
+        return .{ .ino = ino, .kind = ind.kind, .size = ind.size };
+    }
+
+    // ---- 目录 ----
+
+    const Found = struct { ino: u64, kind: Kind, offset: u64 };
+
+    /// 在目录 dir 里找 name。返回找到的目录项（没有就是 null），以及插入这个名字时该用的序号。
+    fn scan(fs: *Fs, dir: u64, name: []const u8) Error!struct { ?Found, u64 } {
+        const h = nameHash(name);
+        var buf: [@sizeOf(DirHeader) + max_name]u8 = undefined;
+        var k = Key.init(dir, type_dir, h << 32);
+        var next_seq: u64 = 0;
+        while (try fs.vol.next(k, &buf)) |f| {
+            if (f.key.objectid != dir or f.key.type != type_dir or f.key.offset >> 32 != h) break;
+            if (f.size < @sizeOf(DirHeader)) return error.Corrupt;
+            const head = std.mem.bytesToValue(DirHeader, buf[0..@sizeOf(DirHeader)]);
+            if (@sizeOf(DirHeader) + head.name_len != f.size) return error.Corrupt;
+            if (std.mem.eql(u8, buf[@sizeOf(DirHeader)..f.size], name)) return .{ .{ .ino = head.ino, .kind = head.kind, .offset = f.key.offset }, 0 };
+            next_seq = (f.key.offset & 0xffff_ffff) + 1;
+            k = f.key.successor() orelse break;
+        }
+        return .{ null, next_seq };
+    }
+
+    fn checkName(name: []const u8) Error!void {
+        if (name.len > max_name) return error.NameTooLong;
+        if (name.len == 0 or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..") or
+            std.mem.indexOfScalar(u8, name, '/') != null) return error.InvalidName;
+    }
+
+    /// 路径对应的 inode 号。以 '/' 开头的从根目录找，否则从 cwd 找；多个 '/' 当一个，"." 和 ".." 照常。
+    pub fn resolve(fs: *Fs, cwd: u64, path: []const u8) Error!u64 {
+        if (path.len == 0) return error.NotFound;
+        var ino = if (path[0] == '/') root_ino else cwd;
+        var it = std.mem.tokenizeScalar(u8, path, '/');
+        while (it.next()) |part| {
+            const ind = try fs.getInode(ino);
+            if (ind.kind != .dir) return error.NotDir;
+            if (std.mem.eql(u8, part, ".")) continue;
+            if (std.mem.eql(u8, part, "..")) {
+                ino = ind.parent;
+                continue;
+            }
+            if (part.len > max_name) return error.NameTooLong;
+            const found, _ = try fs.scan(ino, part);
+            ino = (found orelse return error.NotFound).ino;
+        }
+        return ino;
+    }
+
+    /// 路径的父目录和最后一段名字（创建、删除用）。最后一段不能是 "."、".."，父目录必须是目录。
+    fn resolveParent(fs: *Fs, cwd: u64, path: []const u8) Error!struct { u64, []const u8 } {
+        const trimmed = std.mem.trimEnd(u8, path, "/");
+        if (trimmed.len == 0) return error.InvalidName; // "" 或者 "/"
+        const slash = std.mem.lastIndexOfScalar(u8, trimmed, '/');
+        const name = if (slash) |i| trimmed[i + 1 ..] else trimmed;
+        try checkName(name);
+        const dir = if (slash) |i| try fs.resolve(cwd, if (i == 0) "/" else trimmed[0..i]) else cwd;
+        if ((try fs.getInode(dir)).kind != .dir) return error.NotDir;
+        return .{ dir, name };
+    }
+
+    /// 新建一个空文件或空目录，返回它的 inode 号。已经有这个名字时返回 Exists。
+    pub fn create(fs: *Fs, cwd: u64, path: []const u8, kind: Kind) Error!u64 {
+        const dir, const name = try fs.resolveParent(cwd, path);
+        const found, const seq = try fs.scan(dir, name);
+        if (found != null) return error.Exists;
+        const ino = fs.next_ino;
+        fs.next_ino += 1;
+        try fs.vol.insert(Key.init(ino, type_inode, 0), std.mem.asBytes(&Inode{ .kind = kind, .size = 0, .parent = dir }));
+        var buf: [@sizeOf(DirHeader) + max_name]u8 = undefined;
+        const head: DirHeader = .{ .ino = ino, .kind = kind, .name_len = @intCast(name.len) };
+        @memcpy(buf[0..@sizeOf(DirHeader)], std.mem.asBytes(&head));
+        @memcpy(buf[@sizeOf(DirHeader)..][0..name.len], name);
+        try fs.vol.insert(Key.init(dir, type_dir, nameHash(name) << 32 | seq), buf[0 .. @sizeOf(DirHeader) + name.len]);
+        return ino;
+    }
+
+    /// 删掉一个名字和它的 inode（文件的内容一起释放）。目录必须是空的。
+    /// 还打开着它的文件、以它为当前目录的进程之后再用它会得到 NotFound（没有 Unix 那样“关掉才真正删除”）。
+    pub fn unlink(fs: *Fs, cwd: u64, path: []const u8) Error!void {
+        const dir, const name = try fs.resolveParent(cwd, path);
+        const found, _ = try fs.scan(dir, name);
+        const e = found orelse return error.NotFound;
+        if (e.kind == .dir) {
+            if (try fs.vol.next(Key.init(e.ino, type_dir, 0), null)) |f| {
+                if (f.key.objectid == e.ino and f.key.type == type_dir) return error.NotEmpty;
+            }
+        }
+        // inode 号为 e.ino 的所有条目：inode 和文件内容
+        while (try fs.vol.next(Key.init(e.ino, 0, 0), null)) |f| {
+            if (f.key.objectid != e.ino) break;
+            try fs.dropItem(f.key);
+        }
+        try fs.vol.delete(Key.init(dir, type_dir, e.offset));
+    }
+
+    /// 删掉一个条目；是指向数据块的内容条目的话，数据块也释放。
+    fn dropItem(fs: *Fs, key: Key) Error!void {
+        var buf: [@sizeOf(BlockExtent)]u8 = undefined;
+        const size = try fs.vol.lookup(key, &buf) orelse return error.NotFound;
+        if (dataRefs(key, buf[0..@min(size, buf.len)])) |d| {
+            if (size == @sizeOf(BlockExtent)) fs.vol.freeData(d.blockno, d.generation);
+        }
+        try fs.vol.delete(key);
+    }
+
+    /// 目录 dir 里键 >= cookie 的第一个目录项，名字写进 name。没有了返回 null。从 0 开始，每次用返回的 next。
+    pub fn readdir(fs: *Fs, dir: u64, cookie: u64, name: *[max_name]u8) Error!?Dirent {
+        if ((try fs.getInode(dir)).kind != .dir) return error.NotDir;
+        var buf: [@sizeOf(DirHeader) + max_name]u8 = undefined;
+        const f = try fs.vol.next(Key.init(dir, type_dir, cookie), &buf) orelse return null;
+        if (f.key.objectid != dir or f.key.type != type_dir) return null;
+        if (f.size < @sizeOf(DirHeader)) return error.Corrupt;
+        const head = std.mem.bytesToValue(DirHeader, buf[0..@sizeOf(DirHeader)]);
+        if (@sizeOf(DirHeader) + head.name_len != f.size) return error.Corrupt;
+        @memcpy(name[0..head.name_len], buf[@sizeOf(DirHeader)..f.size]);
+        return .{ .ino = head.ino, .kind = head.kind, .name_len = head.name_len, .next = f.key.offset + 1 };
+    }
+
+    // ---- 文件内容 ----
+
+    fn extentKey(ino: u64, page: u64) Key {
+        return Key.init(ino, type_extent, page * block_size);
+    }
+
+    /// 从文件 ino 的 off 处读最多 len 字节，交给 out.put(在这次读里的位置, 字节)。返回读了多少（到文件末尾为止）。
+    pub fn read(fs: *Fs, ino: u64, off: u64, len: usize, out: anytype) Error!usize {
+        const ind = try fs.getInode(ino);
+        if (ind.kind != .file) return error.IsDir;
+        if (off >= ind.size) return 0;
+        const n: usize = @intCast(@min(len, ind.size - off));
+        var done: usize = 0;
+        while (done < n) {
+            const pos = off + done;
+            const a: usize = @intCast(pos % block_size);
+            const m = @min(block_size - a, n - done);
+            try fs.readPage(ino, pos / block_size, a, m, out, done);
+            done += m;
+        }
+        return n;
+    }
+
+    fn readPage(fs: *Fs, ino: u64, page: u64, a: usize, m: usize, out: anytype, at: usize) Error!void {
+        var ebuf: [@sizeOf(ExtentHeader) + inline_max]u8 = undefined;
+        const size = try fs.vol.lookup(extentKey(ino, page), &ebuf) orelse return out.put(at, zeros[0..m]); // 洞
+        if (size < @sizeOf(ExtentHeader) or size > ebuf.len) return error.Corrupt;
+        const head = std.mem.bytesToValue(ExtentHeader, ebuf[0..@sizeOf(ExtentHeader)]);
+        switch (head.kind) {
+            .inline_data => {
+                const data = ebuf[@sizeOf(ExtentHeader)..size];
+                const have = data[@min(a, data.len)..@min(a + m, data.len)];
+                try out.put(at, have);
+                if (have.len < m) try out.put(at + have.len, zeros[0 .. m - have.len]);
+            },
+            .block => {
+                if (size != @sizeOf(BlockExtent)) return error.Corrupt;
+                const e = std.mem.bytesToValue(BlockExtent, ebuf[0..size]);
+                const b = try fs.readData(e);
+                defer bio.release(b);
+                try out.put(at, b.data[a..][0..m]);
+            },
+            _ => return error.Corrupt,
+        }
+    }
+
+    /// 读一个数据块，拿着它的缓冲区返回。从磁盘读进来的核对校验和。
+    fn readData(fs: *Fs, e: BlockExtent) Error!*bio.Buf {
+        if (e.blockno < 2 or e.blockno >= fs.vol.blocks) return error.Corrupt;
+        const b = try bio.get(e.blockno);
+        if (bio.load(b) and csum(b.data) != e.head.csum) {
+            b.valid = false;
+            bio.release(b);
+            return error.Corrupt;
+        }
+        return b;
+    }
+
+    /// 从 in.get(在这次写里的位置, 目标) 取 len 字节，写到文件 ino 的 off 处，文件不够长就变长（中间留洞）。
+    pub fn write(fs: *Fs, ino: u64, off: u64, len: usize, in: anytype) Error!usize {
+        var ind = try fs.getInode(ino);
+        if (ind.kind != .file) return error.IsDir;
+        if (len == 0) return 0;
+        const end = std.math.add(u64, off, len) catch return error.FileTooBig;
+        if (end > max_file_size) return error.FileTooBig;
+        if (end <= inline_max and (ind.size == 0 or try fs.page0Inline(ino))) {
+            try fs.writeInline(ino, ind.size, off, end, in);
+        } else {
+            if (ind.size > 0 and try fs.page0Inline(ino)) try fs.unInline(ino);
+            var done: usize = 0;
+            while (done < len) {
+                const pos = off + done;
+                const a: usize = @intCast(pos % block_size);
+                const m = @min(block_size - a, len - done);
+                try fs.writePage(ino, pos / block_size, a, m, in, done);
+                done += m;
+            }
+        }
+        ind.size = @max(ind.size, end);
+        try fs.putInode(ino, ind);
+        return len;
+    }
+
+    fn page0Inline(fs: *Fs, ino: u64) Error!bool {
+        var head: ExtentHeader = undefined;
+        _ = try fs.vol.lookup(extentKey(ino, 0), std.mem.asBytes(&head)) orelse return false;
+        return head.kind == .inline_data;
+    }
+
+    /// 内联的文件写完之后还不超过 inline_max：整个内容在条目里改。内联条目的数据长度就是文件长度。
+    fn writeInline(fs: *Fs, ino: u64, size: u64, off: u64, end: u64, in: anytype) Error!void {
+        const h = @sizeOf(ExtentHeader);
+        var buf: [h + inline_max]u8 = undefined;
+        const old: usize = @intCast(size);
+        if (old > 0) {
+            const got = try fs.vol.lookup(extentKey(ino, 0), &buf) orelse return error.Corrupt;
+            if (got != h + old) return error.Corrupt;
+        } else {
+            @memcpy(buf[0..h], std.mem.asBytes(&ExtentHeader{ .kind = .inline_data }));
+        }
+        const new: usize = @intCast(@max(size, end));
+        @memset(buf[h + old .. h + new], 0);
+        try in.get(0, buf[h + @as(usize, @intCast(off)) .. h + @as(usize, @intCast(end))]);
+        if (old > 0) try fs.vol.update(extentKey(ino, 0), buf[0 .. h + new]) else try fs.vol.insert(extentKey(ino, 0), buf[0 .. h + new]);
+    }
+
+    /// 内联的内容搬进一个数据块（文件要长到 inline_max 以上了）。
+    fn unInline(fs: *Fs, ino: u64) Error!void {
+        const h = @sizeOf(ExtentHeader);
+        var buf: [h + inline_max]u8 = undefined;
+        const size = try fs.vol.lookup(extentKey(ino, 0), &buf) orelse return error.Corrupt;
+        const blk = try fs.vol.allocData();
+        const b = try bio.get(blk);
+        defer bio.release(b);
+        @memset(b.data, 0);
+        @memcpy(b.data[0 .. size - h], buf[h..size]);
+        try fs.vol.update(extentKey(ino, 0), std.mem.asBytes(&fs.writeData(b, blk)));
+    }
+
+    /// 算校验和、写下数据块，返回指向它的条目。
+    fn writeData(fs: *Fs, b: *bio.Buf, blk: u64) BlockExtent {
+        b.valid = true;
+        bio.write(b);
+        return .{ .head = .{ .kind = .block, .csum = csum(b.data) }, .blockno = blk, .generation = fs.vol.transid };
+    }
+
+    /// 改第 page 页的 [a, a + m)：分配一个新块，不是整页覆盖的话先复制旧内容（没有旧的就是 0），
+    /// 再从 in 取新内容，写下去，条目改成指向新块，旧块释放。
+    fn writePage(fs: *Fs, ino: u64, page: u64, a: usize, m: usize, in: anytype, at: usize) Error!void {
+        const key = extentKey(ino, page);
+        var old: ?BlockExtent = null;
+        var ebuf: [@sizeOf(BlockExtent)]u8 = undefined;
+        if (try fs.vol.lookup(key, &ebuf)) |size| {
+            const head = std.mem.bytesToValue(ExtentHeader, ebuf[0..@sizeOf(ExtentHeader)]);
+            if (size != @sizeOf(BlockExtent) or head.kind != .block) return error.Corrupt;
+            old = std.mem.bytesToValue(BlockExtent, &ebuf);
+        }
+        const blk = try fs.vol.allocData();
+        const b = try bio.get(blk);
+        defer bio.release(b);
+        if (a != 0 or m != block_size) {
+            if (old) |e| {
+                const ob = try fs.readData(e);
+                defer bio.release(ob);
+                b.data.* = ob.data.*;
+            } else {
+                @memset(b.data, 0);
+            }
+        }
+        try in.get(at, b.data[a..][0..m]);
+        const e = fs.writeData(b, blk);
+        if (old) |o| {
+            fs.vol.freeData(o.blockno, o.generation);
+            try fs.vol.update(key, std.mem.asBytes(&e));
+        } else {
+            try fs.vol.insert(key, std.mem.asBytes(&e));
+        }
+    }
+
+    /// 把文件截成 0 字节，释放它的所有内容。
+    pub fn truncate(fs: *Fs, ino: u64) Error!void {
+        var ind = try fs.getInode(ino);
+        if (ind.kind != .file) return error.IsDir;
+        while (try fs.vol.next(extentKey(ino, 0), null)) |f| {
+            if (f.key.objectid != ino or f.key.type != type_extent) break;
+            try fs.dropItem(f.key);
+        }
+        ind.size = 0;
+        try fs.putInode(ino, ind);
+    }
+
+    /// 检查：B 树（含数据块的引用）和每个 inode 的条目对得上。单元测试、以后的 scrub 用。
+    pub fn check(fs: *Fs) Error!ctree.Volume.Stats {
+        return fs.vol.check();
+    }
+};
+
+// ---- 单元测试：内存当磁盘，可以掉电（和 ctree.zig 的测试一样的办法） ----
+
+/// 测试里读写用的“用户内存”：就是一个切片。
+const SliceOut = struct {
+    buf: []u8,
+    fn put(o: SliceOut, at: usize, bytes: []const u8) error{BadAddress}!void {
+        @memcpy(o.buf[at..][0..bytes.len], bytes);
+    }
+};
+
+const SliceIn = struct {
+    data: []const u8,
+    fn get(i: SliceIn, at: usize, dst: []u8) error{BadAddress}!void {
+        @memcpy(dst, i.data[at..][0..dst.len]);
+    }
+};
+
+/// 读到一半“用户内存”坏了：第二次 get 失败。
+const FailingIn = struct {
+    calls: *usize,
+    fn get(i: FailingIn, at: usize, dst: []u8) error{BadAddress}!void {
+        _ = at;
+        i.calls.* += 1;
+        if (i.calls.* > 1) return error.BadAddress;
+        @memset(dst, 'x');
+    }
+};
+
+var test_disk: [][block_size]u8 = &.{};
+var test_budget: ?usize = null;
+var test_crashed = false;
+var test_writes: usize = 0;
+var test_vol: Volume = .{};
+
+fn testTransfer(block: u64, data: *[block_size]u8, write_: bool) void {
+    if (!write_) {
+        data.* = test_disk[block];
+        return;
+    }
+    test_writes += 1;
+    if (test_crashed) return;
+    if (test_budget) |*left| {
+        if (left.* == 0) {
+            test_crashed = true;
+            return;
+        }
+        left.* -= 1;
+    }
+    test_disk[block] = data.*;
+}
+
+fn testReboot() void {
+    test_budget = null;
+    test_crashed = false;
+    bio.init(.{ .blocks = test_disk.len, .transfer = testTransfer });
+}
+
+fn testSetup(blocks: usize) !Fs {
+    if (test_disk.len != blocks) {
+        std.testing.allocator.free(test_disk);
+        test_disk = try std.testing.allocator.alloc([block_size]u8, blocks);
+    }
+    for (test_disk) |*b| @memset(b, 0);
+    test_writes = 0;
+    testReboot();
+    try Fs.format(&test_vol, blocks);
+    return Fs.mount(&test_vol);
+}
+
+fn testFree() void {
+    std.testing.allocator.free(test_disk);
+    test_disk = &.{};
+}
+
+fn readAll(fs: *Fs, path: []const u8, buf: []u8) ![]u8 {
+    const ino = try fs.resolve(root_ino, path);
+    const n = try fs.read(ino, 0, buf.len, SliceOut{ .buf = buf });
+    return buf[0..n];
+}
+
+fn writeAt(fs: *Fs, ino: u64, off: u64, data: []const u8) !void {
+    _ = try fs.run(Fs.write, .{ ino, off, data.len, SliceIn{ .data = data } });
+}
+
+test "目录：创建、查找、路径（. ..、多余的 /）、各种错误" {
+    var fs = try testSetup(256);
+    defer testFree();
+    const a = try fs.run(Fs.create, .{ root_ino, "/a", Kind.dir });
+    const b = try fs.run(Fs.create, .{ root_ino, "a/b", Kind.dir });
+    const f = try fs.run(Fs.create, .{ b, "../f", Kind.file });
+    try std.testing.expectEqual(a, try fs.resolve(root_ino, "a"));
+    try std.testing.expectEqual(b, try fs.resolve(root_ino, "//a///b/"));
+    try std.testing.expectEqual(f, try fs.resolve(b, "../f"));
+    try std.testing.expectEqual(f, try fs.resolve(b, "/a/./b/../f"));
+    try std.testing.expectEqual(root_ino, try fs.resolve(b, "../../.."));
+    try std.testing.expectEqual(root_ino, try fs.resolve(f, "/"));
+    try std.testing.expectEqual(Kind.dir, (try fs.stat(b)).kind);
+
+    try std.testing.expectError(error.Exists, fs.run(Fs.create, .{ root_ino, "/a/f", Kind.file }));
+    try std.testing.expectError(error.NotFound, fs.resolve(root_ino, "/a/x"));
+    try std.testing.expectError(error.NotFound, fs.resolve(root_ino, ""));
+    try std.testing.expectError(error.NotDir, fs.resolve(root_ino, "/a/f/x"));
+    try std.testing.expectError(error.NotDir, fs.run(Fs.create, .{ root_ino, "/a/f/x", Kind.file }));
+    try std.testing.expectError(error.NotFound, fs.run(Fs.create, .{ root_ino, "/nope/x", Kind.file }));
+    for ([_][]const u8{ "/", "", "/a/.", "/a/..", ".." }) |p| {
+        try std.testing.expectError(error.InvalidName, fs.run(Fs.create, .{ root_ino, p, Kind.file }));
+    }
+    const long: [max_name + 1]u8 = @splat('x');
+    try std.testing.expectError(error.NameTooLong, fs.run(Fs.create, .{ root_ino, &long, Kind.file }));
+    _ = try fs.run(Fs.create, .{ root_ino, long[0..max_name], Kind.file });
+    try std.testing.expectError(error.IsDir, fs.read(a, 0, 1, SliceOut{ .buf = &.{} }));
+
+    // 删除：目录不空不行；删了之后找不到；inode 号不重用
+    try std.testing.expectError(error.NotEmpty, fs.run(Fs.unlink, .{ root_ino, "/a" }));
+    try fs.run(Fs.unlink, .{ root_ino, "/a/f" });
+    try fs.run(Fs.unlink, .{ root_ino, "/a/b" });
+    try fs.run(Fs.unlink, .{ root_ino, "a" });
+    try std.testing.expectError(error.NotFound, fs.resolve(root_ino, "/a"));
+    try std.testing.expectError(error.NotFound, fs.run(Fs.unlink, .{ root_ino, "/a" }));
+    try std.testing.expectError(error.InvalidName, fs.run(Fs.unlink, .{ root_ino, "/" }));
+    try std.testing.expect(try fs.run(Fs.create, .{ root_ino, "/a", Kind.file }) > f);
+    _ = try fs.check();
+}
+
+test "readdir 列出所有名字；名字的散列相同时也分得开" {
+    var fs = try testSetup(512);
+    defer testFree();
+    // 两个 crc32c 相同的名字（事先找好的：按 "n<数字>" 依次试，第一对撞上的）
+    const n0 = "n1371838";
+    const n1 = "n2000402";
+    try std.testing.expectEqual(nameHash(n0), nameHash(n1));
+    const ino0 = try fs.run(Fs.create, .{ root_ino, n0, Kind.file });
+    const ino1 = try fs.run(Fs.create, .{ root_ino, n1, Kind.dir });
+    try std.testing.expectEqual(ino0, try fs.resolve(root_ino, n0));
+    try std.testing.expectEqual(ino1, try fs.resolve(root_ino, n1));
+    // 再加 60 个普通名字，readdir 一个不少、不重复
+    for (0..60) |j| {
+        var buf: [16]u8 = undefined;
+        _ = try fs.run(Fs.create, .{ root_ino, try std.fmt.bufPrint(&buf, "file{d}", .{j}), Kind.file });
+    }
+    var cookie: u64 = 0;
+    var count: usize = 0;
+    var found: [2]bool = @splat(false);
+    var name: [max_name]u8 = undefined;
+    while (try fs.readdir(root_ino, cookie, &name)) |d| : (cookie = d.next) {
+        const nm = name[0..d.name_len];
+        if (std.mem.eql(u8, nm, n0)) found[0] = true;
+        if (std.mem.eql(u8, nm, n1)) found[1] = d.kind == .dir;
+        try std.testing.expectEqual(d.ino, try fs.resolve(root_ino, nm));
+        count += 1;
+    }
+    try std.testing.expectEqual(62, count);
+    try std.testing.expect(found[0] and found[1]);
+    // 删掉第一个，第二个还在
+    try fs.run(Fs.unlink, .{ root_ino, n0 });
+    try std.testing.expectEqual(ino1, try fs.resolve(root_ino, n1));
+    try std.testing.expectError(error.NotFound, fs.resolve(root_ino, n0));
+    try std.testing.expectError(error.NotDir, fs.readdir(try fs.resolve(root_ino, "file1"), 0, &name));
+    _ = try fs.check();
+}
+
+test "文件内容：内联、长大换成数据块、跨页、洞、覆盖、截断、删除后块都还回来" {
+    var fs = try testSetup(512);
+    defer testFree();
+    try fs.vol.commit();
+    const baseline = fs.vol.free_count;
+    const f = try fs.run(Fs.create, .{ root_ino, "/f", Kind.file });
+    var buf: [5 * block_size]u8 = undefined;
+
+    // 内联：小文件不占数据块
+    try writeAt(&fs, f, 0, "hello");
+    try writeAt(&fs, f, 3, "LO world");
+    try std.testing.expectEqualStrings("helLO world", try readAll(&fs, "/f", &buf));
+    try writeAt(&fs, f, 20, "!"); // 中间补 0
+    try std.testing.expectEqualStrings("helLO world\x00\x00\x00\x00\x00\x00\x00\x00\x00!", try readAll(&fs, "/f", &buf));
+    try std.testing.expect(try fs.page0Inline(f));
+    // 正好 inline_max 字节还是内联
+    const fill: [inline_max]u8 = @splat('i');
+    try writeAt(&fs, f, 21, fill[0 .. inline_max - 21]);
+    try std.testing.expectEqual(inline_max, (try fs.stat(f)).size);
+    try std.testing.expect(try fs.page0Inline(f));
+    // 再长一个字节：换成数据块，内容不变
+    try writeAt(&fs, f, inline_max, "+");
+    try std.testing.expect(!try fs.page0Inline(f));
+    const got = try readAll(&fs, "/f", &buf);
+    try std.testing.expectEqual(inline_max + 1, got.len);
+    try std.testing.expectEqualStrings("helLO world", got[0..11]);
+    try std.testing.expectEqual('+', got[inline_max]);
+
+    // 跨页的写，和中间的洞：写第 0 页末尾到第 1 页开头，再写第 4 页
+    var data: [block_size + 100]u8 = undefined;
+    for (&data, 0..) |*c, i| c.* = @truncate(i * 7);
+    try writeAt(&fs, f, block_size - 50, &data);
+    try writeAt(&fs, f, 4 * block_size + 10, "end");
+    try std.testing.expectEqual(4 * block_size + 13, (try fs.stat(f)).size);
+    const all = try readAll(&fs, "/f", &buf);
+    try std.testing.expectEqualSlices(u8, &data, all[block_size - 50 ..][0..data.len]);
+    try std.testing.expect(std.mem.allEqual(u8, all[2 * block_size + 50 .. 4 * block_size + 10], 0)); // 洞
+    try std.testing.expectEqualStrings("end", all[4 * block_size + 10 ..]);
+    // 第 3 页是洞，不占块（第 2 页写了开头的 50 字节）；读到末尾之后返回 0
+    try std.testing.expectEqual(null, try fs.vol.lookup(Fs.extentKey(f, 3), null));
+    try std.testing.expect(try fs.vol.lookup(Fs.extentKey(f, 2), null) != null);
+    try std.testing.expectEqual(0, try fs.read(f, 10 * block_size, 10, SliceOut{ .buf = &buf }));
+    try std.testing.expectEqual(3, try fs.read(f, 4 * block_size + 10, 100, SliceOut{ .buf = &buf }));
+    _ = try fs.check();
+
+    // 写到一半“用户内存”坏了：整个写作废，文件不变
+    const before = try fs.stat(f);
+    var calls: usize = 0;
+    try std.testing.expectError(error.BadAddress, fs.run(Fs.write, .{ f, 0, 3 * block_size, FailingIn{ .calls = &calls } }));
+    try std.testing.expectEqual(before.size, (try fs.stat(f)).size);
+    try std.testing.expectEqualSlices(u8, all, try readAll(&fs, "/f", buf[0..all.len]));
+    try std.testing.expectError(error.FileTooBig, fs.run(Fs.write, .{ f, max_file_size, 1, SliceIn{ .data = "x" } }));
+
+    // 截断、再写：又从内联开始；删除文件之后块全还回来
+    try fs.run(Fs.truncate, .{f});
+    try std.testing.expectEqual(0, (try fs.stat(f)).size);
+    try writeAt(&fs, f, 0, "again");
+    try std.testing.expect(try fs.page0Inline(f));
+    try std.testing.expectEqualStrings("again", try readAll(&fs, "/f", &buf));
+    try writeAt(&fs, f, 0, &data);
+    try fs.run(Fs.unlink, .{ root_ino, "/f" });
+    _ = try fs.check();
+    try std.testing.expectEqual(baseline, fs.vol.free_count);
+}
+
+test "数据块的校验和：磁盘上的内容坏了读出来是 Corrupt；重新挂载后内容还在" {
+    var fs = try testSetup(256);
+    defer testFree();
+    const f = try fs.run(Fs.create, .{ root_ino, "/big", Kind.file });
+    var data: [2 * block_size]u8 = undefined;
+    for (&data, 0..) |*c, i| c.* = @truncate(i * 3);
+    try writeAt(&fs, f, 0, &data);
+    testReboot();
+    fs = try Fs.mount(&test_vol);
+    var buf: [2 * block_size]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, &data, try readAll(&fs, "/big", &buf));
+    _ = try fs.check();
+    // 找到第 1 页的数据块，在磁盘上改一个字节
+    var e: BlockExtent = undefined;
+    _ = try fs.vol.lookup(Fs.extentKey(f, 1), std.mem.asBytes(&e));
+    test_disk[e.blockno][7] ^= 1;
+    testReboot();
+    fs = try Fs.mount(&test_vol); // 挂载不读数据块
+    try std.testing.expectError(error.Corrupt, readAll(&fs, "/big", &buf));
+    try std.testing.expectEqual(block_size, try fs.read(f, 0, block_size, SliceOut{ .buf = &buf })); // 第 0 页没坏
+}
+
+/// 掉电测试：一串随机的文件系统操作（每个操作提交一次），在每一次写盘之后掉电，重新挂载后
+/// 检查通过，所有文件的内容正好是某一个操作做完之后的样子，并且不早于最后一个做完了的操作。
+const FsModel = struct {
+    files: [5]std.ArrayListUnmanaged(u8) = @splat(.empty),
+    exists: [5]bool = @splat(false),
+
+    fn deinit(m: *FsModel) void {
+        for (&m.files) |*f| f.deinit(std.testing.allocator);
+    }
+
+    fn clone(m: *const FsModel) !FsModel {
+        var c: FsModel = .{ .exists = m.exists };
+        for (&c.files, m.files) |*d, s| d.* = try s.clone(std.testing.allocator);
+        return c;
+    }
+};
+
+fn fsPath(buf: []u8, i: usize) []const u8 {
+    return std.fmt.bufPrint(buf, "/d/f{d}", .{i}) catch unreachable;
+}
+
+const FsCrashRun = struct {
+    snapshots: std.ArrayListUnmanaged(FsModel) = .empty,
+    completed: u64 = 0,
+
+    fn deinit(r: *FsCrashRun) void {
+        for (r.snapshots.items) |*m| m.deinit();
+        r.snapshots.deinit(std.testing.allocator);
+    }
+
+    /// 事务号 g 对应 snapshots[g - first_gen]
+    var first_gen: u64 = 0;
+
+    fn run(r: *FsCrashRun, budget: ?usize) !void {
+        var fs = try testSetup(96);
+        _ = try fs.run(Fs.create, .{ root_ino, "/d", Kind.dir });
+        var model: FsModel = .{};
+        defer model.deinit();
+        first_gen = fs.vol.generation;
+        try r.snapshots.append(std.testing.allocator, try model.clone());
+        r.completed = fs.vol.generation;
+        test_budget = budget;
+        var prng = std.Random.DefaultPrng.init(7);
+        const rng = prng.random();
+        var data: [3 * block_size]u8 = undefined;
+        for (0..25) |step_no| {
+            const i = rng.uintLessThan(usize, model.files.len);
+            var pbuf: [16]u8 = undefined;
+            const path = fsPath(&pbuf, i);
+            // 先记下这一步之后的内容（掉电在提交的那一刻的话，这一步可能算做了）
+            var next = try model.clone();
+            const gen_before = fs.vol.generation;
+            const result = step(&fs, &next, i, path, rng, step_no, &data);
+            if (test_crashed) {
+                // 这一步的提交可能写下去了
+                if (fs.vol.dirty or fs.vol.generation != gen_before) try r.snapshots.append(std.testing.allocator, next) else next.deinit();
+                return;
+            }
+            result catch |err| switch (err) {
+                error.NoSpace => {
+                    next.deinit();
+                    continue;
+                },
+                else => return err,
+            };
+            if (fs.vol.generation == gen_before) {
+                next.deinit(); // 什么都没改（比如截断一个空文件）
+            } else {
+                try r.snapshots.append(std.testing.allocator, next);
+            }
+            model.deinit();
+            model = try r.snapshots.items[r.snapshots.items.len - 1].clone();
+            r.completed = fs.vol.generation;
+        }
+    }
+};
+
+/// 对文件 i 做一个随机操作（不存在就创建；否则删除、截断、或者在随机位置写一段），同时改 next。
+fn step(fs: *Fs, next: *FsModel, i: usize, path: []const u8, rng: std.Random, step_no: usize, data: []u8) !void {
+    if (!next.exists[i]) {
+        next.exists[i] = true;
+        _ = try fs.run(Fs.create, .{ root_ino, path, Kind.file });
+        return;
+    }
+    const ino = try fs.resolve(root_ino, path);
+    const f = &next.files[i];
+    switch (rng.uintLessThan(u8, 4)) {
+        0 => {
+            next.exists[i] = false;
+            f.clearRetainingCapacity();
+            try fs.run(Fs.unlink, .{ root_ino, path });
+        },
+        1 => {
+            f.clearRetainingCapacity();
+            try fs.run(Fs.truncate, .{ino});
+        },
+        else => {
+            const off = rng.uintAtMost(usize, 2 * block_size);
+            const len = 1 + rng.uintLessThan(usize, data.len);
+            for (data[0..len], 0..) |*c, j| c.* = @truncate(step_no * 31 + j);
+            if (f.items.len < off + len) {
+                const old = f.items.len;
+                try f.resize(std.testing.allocator, off + len);
+                @memset(f.items[old..], 0);
+            }
+            @memcpy(f.items[off..][0..len], data[0..len]);
+            _ = try fs.run(Fs.write, .{ ino, off, len, SliceIn{ .data = data[0..len] } });
+        },
+    }
+}
+
+fn fsExpect(fs: *Fs, m: *const FsModel) !void {
+    var buf: [6 * block_size]u8 = undefined;
+    for (m.files, m.exists, 0..) |f, ex, i| {
+        var pbuf: [16]u8 = undefined;
+        const path = fsPath(&pbuf, i);
+        if (!ex) {
+            try std.testing.expectError(error.NotFound, fs.resolve(root_ino, path));
+            continue;
+        }
+        try std.testing.expectEqualSlices(u8, f.items, try readAll(fs, path, &buf));
+    }
+}
+
+test "掉电：文件系统操作之间、写数据块、写节点、写超级块的任何时候掉电，重新挂载后都是某一步做完的样子" {
+    defer testFree();
+    var full: FsCrashRun = .{};
+    defer full.deinit();
+    try full.run(null);
+    const total = test_writes;
+    try std.testing.expect(total > 100);
+    for (0..total + 1) |budget| {
+        var r: FsCrashRun = .{};
+        defer r.deinit();
+        try r.run(budget);
+        testReboot();
+        var fs = Fs.mount(&test_vol) catch |err| {
+            std.debug.print("crash after {d} of {d} writes: mount failed: {s}\n", .{ budget, total, @errorName(err) });
+            return err;
+        };
+        _ = try fs.check();
+        const gen = fs.vol.generation;
+        try std.testing.expect(gen >= r.completed);
+        const idx = gen - FsCrashRun.first_gen;
+        try std.testing.expect(idx < r.snapshots.items.len);
+        fsExpect(&fs, &r.snapshots.items[idx]) catch |err| {
+            std.debug.print("crash after {d} of {d} writes: generation {d}: contents differ\n", .{ budget, total, gen });
+            return err;
+        };
+        // 挂载之后接着写一个新文件：挂载时算漏了哪个块（当成了空闲块），这里就会分配到它、改写它
+        const ino = fs.run(Fs.create, .{ root_ino, "/new", Kind.file }) catch |err| switch (err) {
+            error.NoSpace => continue,
+            else => return err,
+        };
+        var data: [3 * block_size]u8 = @splat(0xee);
+        _ = fs.run(Fs.write, .{ ino, 0, data.len, SliceIn{ .data = &data } }) catch |err| switch (err) {
+            error.NoSpace => continue,
+            else => return err,
+        };
+        _ = try fs.check();
+        try fsExpect(&fs, &r.snapshots.items[idx]);
+    }
+}

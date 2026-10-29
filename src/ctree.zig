@@ -75,6 +75,12 @@ pub const Root = struct {
     level: u8,
 };
 
+/// 树外的块（文件数据）：叶子里的某个条目指向它，记着它是哪个事务写的（释放时要用，见 Volume.free）。
+pub const DataRef = struct {
+    blockno: u64,
+    generation: u64,
+};
+
 /// 每块一位。8 KiB 一个，比内核栈的一半还大：只在原地改（clear、下面的循环），不要写成
 /// `.initEmpty()`、`complement()` 这类会在栈上造一个临时值的写法
 const Bitmap = std.bit_set.ArrayBitSet(usize, max_blocks);
@@ -99,6 +105,9 @@ pub const Volume = struct {
     /// 挂载、检查时走树用的临时位图
     seen: Bitmap = .{ .masks = @splat(0) },
     free_count: u64 = 0,
+    /// 叶子里的条目指向的树外的块（文件系统的数据块）。挂载、检查走树时对每个条目调用它，
+    /// 返回的块也算用着的（同一块被引用两次是 Corrupt）。由文件系统在挂载之前设好，没有就是 null
+    data_refs: ?*const fn (key: Key, data: []const u8) ?DataRef = null,
 
     // ---- 格式化、挂载、提交 ----
 
@@ -212,6 +221,17 @@ pub const Volume = struct {
         if (v.free_count < n) return error.NoSpace;
     }
 
+    /// 分配一个数据块（树外的块，比如文件的内容），返回块号，它属于当前事务（generation = transid）。
+    /// 调用方把内容写下去，再在树里插一个指向它的条目（data_refs 要认得这个条目）。
+    pub fn allocData(v: *Volume) Error!u64 {
+        return v.alloc();
+    }
+
+    /// 数据块 blockno（事务 generation 写的）不再被引用了：和节点一样，属于已提交的树的要等提交之后才能再用。
+    pub fn freeData(v: *Volume, blockno: u64, generation: u64) void {
+        v.free(blockno, generation);
+    }
+
     /// 当前树的高度（层数）。
     fn height(v: *const Volume) usize {
         return @as(usize, v.root.level) + 1;
@@ -316,6 +336,19 @@ pub const Volume = struct {
             }
             // 这个叶子里没有更大的键了，去下一个叶子：它的键都 >= upper
             k = upper orelse return null;
+        }
+    }
+
+    /// 树里最大的键，空树返回 null（文件系统挂载时用它算下一个 inode 号）。
+    pub fn lastKey(v: *Volume) Error!?Key {
+        var r = v.root;
+        while (true) {
+            const b = try v.readNode(r.blockno, r.generation, r.level);
+            defer bio.release(b);
+            const n = Node.of(b.data);
+            if (r.level == 0) return if (n.nritems() == 0) null else n.key(n.nritems() - 1);
+            const last = n.ptrs()[n.nritems() - 1];
+            r = .{ .blockno = last.blockno, .generation = last.generation, .level = r.level - 1 };
         }
     }
 
@@ -554,6 +587,13 @@ pub const Volume = struct {
             var end: usize = block_size;
             for (its, 0..) |it, i| {
                 if (it.offset + it.size != end or it.size > btree.max_data) return error.Corrupt;
+                if (v.data_refs) |refs| {
+                    if (refs(it.key, n.itemData(i))) |d| {
+                        if (d.blockno < super_blocks or d.blockno >= v.blocks or v.seen.isSet(d.blockno) or
+                            d.generation > v.transid) return error.Corrupt;
+                        v.seen.set(d.blockno);
+                    }
+                }
                 end = it.offset;
                 if (i > 0 and !its[i - 1].key.lessThan(it.key)) return error.Corrupt;
                 if (lo != null and it.key.lessThan(lo.?)) return error.Corrupt;

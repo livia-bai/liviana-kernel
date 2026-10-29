@@ -207,14 +207,20 @@ small 模式下同一个程序的代码段只有 0x3bc 字节，ELF 文件约 13
 ## 单元测试
 
 ```zig
-const unit_tests = b.addTest(.{ .root_module = b.createModule(.{
-    .root_source_file = b.path("src/tests.zig"),
-    .target = b.graph.host,
-    .optimize = optimize,
-}) });
+const test_filter = b.option([]const u8, "test-filter", "Only run the unit tests whose names contain this text");
+const unit_tests = b.addTest(.{
+    .root_module = b.createModule(.{
+        .root_source_file = b.path("src/tests.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    }),
+    .filters = if (test_filter) |f| &.{f} else &.{},
+});
 const test_step = b.step("test", "Run the unit tests on the host");
 test_step.dependOn(&b.addRunArtifact(unit_tests).step);
 ```
+
+- `-Dtest-filter=文字`：只编译、运行名字里含这段文字的测试（0.17 的测试程序运行时不接受过滤参数，过滤要在编译时给）。
 
 - `zig build test` 编译 `src/tests.zig` 引用到的各个文件里的 `test` 块，然后运行。
 - `.target = b.graph.host`：测试编译成**主机**的程序（比如 x86_64 Linux）直接运行，不是 RISC-V，所以只能测不碰硬件的代码（[testing.md](testing.md#单元测试zig-build-test)）。
