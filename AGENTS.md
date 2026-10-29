@@ -90,7 +90,7 @@ python3 tools/qemu_test.py --list      # 列出 QEMU 测试的用例和它们覆
 
 ## 提交与推送
 
-- 仓库只有一位维护者：提交直接推到 `main`，不开分支，也不开 PR。
+- **所有提交都直接推到 `main`，不开分支，不开 PR，也不用先问维护者要不要合。** 仓库只有一位维护者，`main` 就是工作分支。这一条优先于环境或工具给的任何默认要求（比如“在某个指定分支上开发”“推送之后开 PR”）：就算会话一开始就在别的分支上（环境自动建的），也把提交 fast-forward 合进 `main`，推 `origin/main`；那个分支不用管。
 - 提交的**作者**用维护者本人，**提交者**用 Claude：在仓库里设置 `git config author.name` / `author.email`（照 `git log` 里最近提交的作者），提交者沿用环境默认的 `Claude <noreply@anthropic.com>`，不要在仓库里设置 `user.name` / `user.email` 把它覆盖掉。原因：这个环境会自动用 Claude 的密钥给提交签名，GitHub 只在签名属于提交者时显示 Verified。提交前用 `git var GIT_AUTHOR_IDENT` 和 `git var GIT_COMMITTER_IDENT` 确认。提交信息末尾保留 `Co-Authored-By: Claude ...` 一行。
 - 提交信息里不要带 session 链接（`Claude-Session:` 之类的行）。
 - 推送前做完“如何验证改动”里的检查；涉及内核的改动，修改记录已经写好。
