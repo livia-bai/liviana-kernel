@@ -78,11 +78,12 @@ fn kmain(hartid: usize, dtb_addr: usize) callconv(.c) noreturn {
 
     plic.init(hartid);
     timer.init(info.timebase_hz);
-    riscv.enableInterrupts();
-    uart.print("[ok] interrupts enabled: timer at {d} Hz, keyboard via UART + PLIC\n", .{timer.tick_hz});
+    uart.print("[ok] interrupt sources enabled: timer at {d} Hz, keyboard via UART + PLIC\n", .{timer.tick_hz});
 
     // 和 xv6 的 main 一样：建好第一个进程 init，然后启动栈就交给调度器，永远不回来。
-    // init 再启动 shell（user/init.zig、user/sh.zig）
+    // init 再启动 shell（user/init.zig、user/sh.zig）。
+    // 全局的中断开关 sstatus.SIE 这里不开：内核代码都关着中断运行（拿锁时也要求这样，见 spinlock.zig），
+    // 调度器每一轮开头才开一下。
     proc.userinit() catch |err| std.debug.panic("cannot start init: {s}", .{@errorName(err)});
     proc.scheduler();
 }

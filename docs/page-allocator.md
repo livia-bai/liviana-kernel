@@ -89,7 +89,8 @@ pub fn free(page: *align(size) Page) void {
 | `vm.init` | 内核根页表、中间级页表（共 5 页） | 从不 |
 | `vm.walk` | 建映射时缺的中间级页表 | 用户区的页表在 `vm.destroyUserSpace` 时释放 |
 | `vm.createUserSpace` | 进程的根页表 | `vm.destroyUserSpace` |
-| `vm.allocUserPage` | 用户程序的代码、数据、栈（`exec` 加载时），`fork` 复制的每一页（`vm.cloneUserSpace`） | `vm.destroyUserSpace`（`exec` 换掉旧的地址空间时；父进程 `wait` 回收子进程时） |
+| `vm.allocUserPage` | 用户程序的代码、数据、栈（`exec` 加载时），`fork` 复制的每一页（`vm.cloneUserSpace`），堆（`sbrk` → `vm.growUser`） | `vm.destroyUserSpace`（`exec` 换掉旧的地址空间时；父进程 `wait` 回收子进程时）；堆缩小时 `vm.shrinkUser` |
+| `pipe.create` | 每个管道一页（缓冲区 2048 字节和状态） | 两端都关了（`pipe.close`） |
 | `meminfo` 系统调用（shell 的 `mem` 命令） | 只读 `free_pages`、`total_pages` | — |
 
 一个用户程序运行时用多少页：根页表 1 + 第 1 级页表 1 + 第 0 级页表 2（各段所在的 `0x4000_0000..0x4020_0000` 一张，栈所在的 `0x7fe0_0000..0x8000_0000` 一张）+ 各段占的页 + 栈 4 页。以 Debug 版 `hello` 为例：代码 19 页 + 只读数据 4 页 + 数据 1 页，合计 4 + 24 + 4 = 32 页。用 GDB 在进程第一次进入 U 模式前停下读 `page.free_pages`，实测正好从 32052 降到 32020（单进程版本时测的，当时停在 `proc.switchToUser`；之后内核的 `.bss` 变大了，空闲页的绝对数会不同，差值不变）。
@@ -98,7 +99,9 @@ pub fn free(page: *align(size) Page) void {
 
 ## 并发
 
-分配器没有锁，也不关中断。安全的前提是：它只在启动阶段和系统调用里调用（`kmain`、`fork`、`exec`、`wait`），从不在中断处理程序里调用，而且只有一个 hart。以后如果中断处理程序需要分配内存，或者支持多核，就要加锁或者在分配时关中断。
+空闲链表和 `free_pages` 由一把自旋锁 `page.lock` 保护（[process.md](process.md#锁)），为多核做准备：几个 hart 会同时分配、释放。`alloc` 只在锁里摘下一页，清零放在锁外面（这一页已经是自己的了），持锁的时间很短。
+
+拿锁时中断必须关着（`Spinlock.acquire` 检查）。现在分配器只在启动阶段和系统调用里调用（`kmain`、`fork`、`exec`、`wait`、`sbrk`、`pipe`），从不在中断处理程序里调用，内核代码又都关着中断运行，所以满足。`kmain` 在创建 init 时就会分配页，这也是 `kmain` 不再打开 `sstatus.SIE` 的原因之一（[boot.md](boot.md#kmain-的初始化顺序)）。`meminfo` 系统调用读 `free_pages` 不拿锁：只是读一个数，读到稍旧的值也没关系。
 
 ## 限制和以后可以做的
 

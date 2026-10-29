@@ -5,8 +5,10 @@ const std = @import("std");
 const sys = @import("sys");
 const program = @import("program");
 
-/// 内核跳到这里时 sp 已经指向用户栈顶，其他寄存器都是 0。main 的返回值就是退出码。
-export fn _start() noreturn {
+/// 内核跳到这里时 a0 = argc，a1 = sp = 栈顶的命令行参数数组（见 proc.pushArgs），其他寄存器都是 0。
+/// main 的返回值就是退出码。
+export fn _start(argc: usize, argv: [*]const sys.abi.Arg) callconv(.c) noreturn {
+    sys.argv = argv[0..argc];
     sys.exit(program.main());
 }
 

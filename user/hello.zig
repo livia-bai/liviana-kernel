@@ -9,7 +9,7 @@ pub fn main() u8 {
 
     // 内核会检查 write 收到的指针：传一个内核地址进去，只会得到错误，不会把内核的内存打印出来
     const kernel_text: [*]const u8 = @ptrFromInt(0x8020_0000);
-    if (sys.write(kernel_text[0..16])) |_| {
+    if (sys.write(sys.stdout, kernel_text[0..16])) |_| {
         sys.print("the kernel leaked its own memory!\n", .{});
     } else |err| {
         sys.print("write() refused a kernel pointer: {s}\n", .{@errorName(err)});

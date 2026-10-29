@@ -9,6 +9,7 @@ const plic = @import("plic.zig");
 const timer = @import("timer.zig");
 const proc = @import("proc.zig");
 const syscall = @import("syscall.zig");
+const spinlock = @import("spinlock.zig");
 
 /// 陷阱发生时被打断的上下文。regs[i] 就是寄存器 xi（x0 恒为 0，它的槽位不用）。
 /// 布局必须和 trapEntry、trapExit 里的汇编一致。
@@ -106,7 +107,7 @@ fn trapEntry() align(4) callconv(.naked) noreturn {
 }
 
 /// 按 sp 指向的 TrapFrame 恢复上下文，执行 sret 回到被打断的地方。
-/// 除了陷阱返回，新进程第一次被调度时也从这里进入 U 模式（见 proc.spawn）。
+/// 除了陷阱返回，新进程第一次被调度时也从这里进入 U 模式（见 proc.forkret）。
 ///
 /// 先写回 sstatus：其中 SIE 为 0，之后不会再被中断打断；SPP 决定 sret 回到哪个特权级。
 /// 如果要回到 U 模式，把这个 TrapFrame 的上沿（也就是内核栈顶）存进 sscratch，
@@ -189,7 +190,10 @@ fn handleTrap(frame: *TrapFrame) callconv(.c) void {
         }
     }
     // 回到 U 模式之前：被 kill 了（比如在 yield、sleep 里等着的时候，或者刚才的串口中断是 Ctrl-C）就在这里结束
-    if (from_user) proc.checkKilled();
+    if (from_user) {
+        proc.checkKilled();
+        spinlock.assertNoneHeld();
+    }
 }
 
 fn handleExternal() void {
@@ -197,9 +201,8 @@ fn handleExternal() void {
     switch (irq) {
         0 => return, // 没有待处理的中断
         plic.uart0_irq => {
-            uart.onInterrupt();
             // 和 xv6 的 consoleintr 一样在中断里直接处理：Ctrl-C 杀掉前台进程，叫醒等输入的进程
-            if (uart.takeCtrlC()) proc.interruptForeground();
+            if (uart.onInterrupt()) proc.interruptForeground();
             proc.wakeup(uart.rx_chan);
         },
         else => uart.print("[trap] unexpected external interrupt {d}\n", .{irq}),

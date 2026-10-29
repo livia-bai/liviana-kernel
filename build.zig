@@ -40,6 +40,7 @@ pub fn build(b: *std.Build) void {
     const user_programs = [_]UserProgram{
         .{ .name = "init" },  .{ .name = "sh" },   .{ .name = "hello" },
         .{ .name = "fault" }, .{ .name = "spin" }, .{ .name = "ticker" },
+        .{ .name = "echo" },  .{ .name = "cat" },  .{ .name = "wc" },
     };
     const test_programs = [_]UserProgram{
         .{ .name = "t_sys", .dir = "user/tests" },
@@ -52,6 +53,9 @@ pub fn build(b: *std.Build) void {
         .{ .name = "t_sleep", .dir = "user/tests" },
         .{ .name = "t_fork", .dir = "user/tests" },
         .{ .name = "t_read", .dir = "user/tests" },
+        .{ .name = "t_args", .dir = "user/tests" },
+        .{ .name = "t_pipe", .dir = "user/tests" },
+        .{ .name = "t_sbrk", .dir = "user/tests" },
         // 数据段没有任何权限，用来验证 ELF 加载器会拒绝它
         .{ .name = "t_noperm", .dir = "user/tests", .linker_script = "user/tests/noperm.ld" },
     };

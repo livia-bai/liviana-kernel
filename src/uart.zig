@@ -1,7 +1,11 @@
 //! QEMU virt 机器上的 NS16550A 串口驱动，同时承担“屏幕”和“键盘”：
 //! 输出用轮询，输入用中断——收到字符时串口经 PLIC 发来外部中断，中断处理程序把字符放进环形缓冲区。
+//!
+//! 输出没有加锁：多核时几个 hart 同时输出，字符会交错在一起，但不会出错；
+//! panic 时也要能输出，不能去等一把可能永远拿不到的锁。
 
 const std = @import("std");
+const Spinlock = @import("spinlock.zig").Spinlock;
 
 pub const base: usize = 0x1000_0000;
 pub const mmio_size: usize = 0x100;
@@ -48,21 +52,27 @@ fn getc() ?u8 {
     return reg(.rbr_thr).*;
 }
 
-// 接收环形缓冲区：中断处理程序写入，read 系统调用（关着中断）读出。
+// 接收环形缓冲区：中断处理程序写入，read 系统调用读出（file.consoleRead）。
 // 索引用 u8，+% 回绕正好对应 256 字节的缓冲区。
 var rx_buf: [256]u8 = undefined;
 var rx_head: u8 = 0;
 var rx_tail: u8 = 0;
 
-/// 等键盘输入的进程（read 系统调用）睡在这个通道上，收到字符后陷阱处理程序用它 proc.wakeup。
+/// 保护接收缓冲区。中断处理程序也要拿它：拿着它的代码都关着中断，同一个 hart 上不会被中断打断，
+/// 所以不会自己等自己；多核时串口中断可能在另一个 hart 上处理。
+pub var rx_lock: Spinlock = .init("uart rx");
+
+/// 等键盘输入的进程睡在这个通道上，收到字符后陷阱处理程序用它 proc.wakeup。
 pub const rx_chan: *const anyopaque = &rx_buf;
 
-/// Ctrl-C（ASCII 0x03）不进缓冲区，只记下来，陷阱处理程序据此结束前台进程。
+/// Ctrl-C（ASCII 0x03）不进缓冲区，陷阱处理程序据此结束前台进程。
 const ctrl_c = 0x03;
-var ctrl_c_pressed = false;
 
-/// 串口中断处理：把硬件 FIFO 里的字符全部搬进环形缓冲区，满了就丢弃。
-pub fn onInterrupt() void {
+/// 串口中断处理：把硬件 FIFO 里的字符全部搬进环形缓冲区，满了就丢弃。返回这次有没有按过 Ctrl-C。
+pub fn onInterrupt() bool {
+    rx_lock.acquire();
+    defer rx_lock.release();
+    var ctrl_c_pressed = false;
     while (getc()) |c| {
         if (c == ctrl_c) {
             ctrl_c_pressed = true;
@@ -72,26 +82,27 @@ pub fn onInterrupt() void {
         rx_buf[rx_head] = c;
         rx_head +%= 1;
     }
+    return ctrl_c_pressed;
 }
 
-/// 缓冲区里有没有字符。调用方需保证此时中断已关闭。
+/// 缓冲区里有没有字符。调用方要拿着 rx_lock，下同。
 pub fn hasInput() bool {
+    std.debug.assert(rx_lock.holding());
     return rx_tail != rx_head;
 }
 
-/// 取出一个已收到的字符。调用方需保证此时中断已关闭。
-pub fn read() ?u8 {
+/// 看一眼下一个字符，不取出来。
+pub fn peek() ?u8 {
+    std.debug.assert(rx_lock.holding());
     if (rx_tail == rx_head) return null;
-    const c = rx_buf[rx_tail];
-    rx_tail +%= 1;
-    return c;
+    return rx_buf[rx_tail];
 }
 
-/// 上次调用以来是否按过 Ctrl-C。调用方需保证此时中断已关闭。
-pub fn takeCtrlC() bool {
-    const pressed = ctrl_c_pressed;
-    ctrl_c_pressed = false;
-    return pressed;
+/// 取出一个已收到的字符。
+pub fn read() ?u8 {
+    const c = peek() orelse return null;
+    rx_tail +%= 1;
+    return c;
 }
 
 /// 接入 std.Io.Writer 接口，这样就能用标准库的格式化输出（{d}、{x}、{s} 等）。

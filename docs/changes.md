@@ -2,6 +2,18 @@
 
 每次改了内核（`src/`、`user/`、`build.zig`、链接脚本），在最上面加几行：新增了什么功能，修了什么 bug。最新的在前面。
 
+## 2026-10-29 命令行参数、文件描述符和管道、sbrk；为多核加锁
+
+- 新增：命令行参数。`exec` 多了 `argv`、`argc` 两个参数（最多 16 个、共 1024 字节，超出返回 `-E2BIG`），内核把它们复制到新程序的栈顶，`_start` 从 `a0`、`a1` 拿到，用户程序用 `sys.argv`、`sys.arg(i)` 读。shell 的 `run NAME ARGS...` 按空格拆参数。
+- 新增：文件描述符。每个进程有 16 项的 fd 表，指向全局文件表里的 `File`（串口或管道的一端，带引用计数）；init 打开串口作为 0、1、2 号 fd，`fork` 复制 fd 表，`exec` 保留，进程结束时全部关掉。`read`、`write` 的第一个参数改成 fd；新增系统调用 `close`、`dup`、`pipe`，错误码 `EBADF`、`EMFILE`、`ENFILE`、`EPIPE`。
+- 新增：管道（`src/pipe.zig`，2048 字节的环形缓冲区，一页一个）。读空管道、写满管道时睡下等对方；写端都关了读到结尾，读端都关了写返回 `-EPIPE`。在串口上按 Ctrl-D 时 `read` 返回 0。
+- 新增：shell 的管道 `run A | B | ...`（最多 4 个程序），照 xv6 由一个 fork 出来的“组长”建管道、启动各个程序。Ctrl-C 改成杀前台进程和它的所有子孙，所以一次结束整条管道。新增用户程序 `echo`、`cat`、`wc`。
+- 新增：系统调用 `sbrk`。堆从程序最后一个段之后的页边界开始，按页映射，缩小时释放整页和空出来的页表；不能缩到起点下面、不能长进栈。新增 `vm.growUser`、`vm.shrinkUser`。
+- 新增：自旋锁 `src/spinlock.zig`，加在页分配器、文件表、管道、串口输入缓冲区上；`proc.sleep` 改成 `sleep(chan, lock)`，在睡下之后放开锁、醒来再拿上。`sched` 和回到 U 模式之前检查没有拿着锁。
+- 改动：`kmain` 不再打开 `sstatus.SIE`，内核代码从头到尾关着中断运行，只有调度器每一轮开头开一下（拿锁要求中断关着，`userinit` 里就要分配页）。启动日志改成 `[ok] interrupt sources enabled: ...`。`uart.takeCtrlC` 去掉了，`uart.onInterrupt` 直接返回有没有按过 Ctrl-C。
+- 修复：shell `fork` 出前台程序后才 `setfg`，子进程先运行的话，程序刚开始运行时按的 Ctrl-C 会被忽略（QEMU 测试在 Debug 模式下碰到过）。现在子进程在 `exec` 之前自己先 `setfg`。
+- 新增：回归测试 `t_args`、`t_pipe`、`t_sbrk`，QEMU 测试用例 `args`、`pipe`、`sbrk`；管道、文件表、自旋锁、命令行参数布局、`growUser`/`shrinkUser` 的单元测试。
+
 ## 2026-10-27 fork、exec、wait；init 和 shell 搬到用户态
 
 - 新增：系统调用 `read`（阻塞读键盘，不回显）、`fork`、`exec`、`wait`、`kill`、`getppid`、`setfg`、`procinfo`、`meminfo`、`listprog`、`shutdown`，照 xv6 实现。进程有了父进程；`fork` 逐页复制地址空间（`vm.cloneUserSpace`）和 `TrapFrame`；`exec` 加载成功后才换掉旧的地址空间；`exit` 之后进程变成 zombie，由父进程 `wait` 取走结束状态（退出码，或者被杀时的 `0x100`）并回收，父进程先结束的子进程交给 init。新增 `vm.copyToUser`、`vm.checkUser`，写用户内存时要求页可写。

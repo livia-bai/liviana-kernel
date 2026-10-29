@@ -104,9 +104,10 @@ export fn _start() linksection(".text.boot") callconv(.naked) noreturn {
 | 5 | `dtb.parse(dtb_addr)` | `[ok] device tree: 128 MiB RAM at 0x80000000, timebase 10000000 Hz` | 页分配器要知道内存范围和保留区，定时器要知道时钟频率 |
 | 6 | `page.init(vm.kernelEnd(), info.memory.end(), info.reserved())` | `[ok] page allocator: N free pages (... KiB)` | 建页表需要分配页 |
 | 7 | `vm.init(info.memory)` | `[ok] Sv39 paging enabled: ...` | 写 `satp` 打开分页。恒等映射保证这一刻前后地址不变 |
-| 8 | `plic.init(hartid)`、`timer.init(info.timebase_hz)` | — | 配置外部中断和第一次时钟中断，并在 `sie` 里打开对应的使能位 |
-| 9 | `riscv.enableInterrupts()` | `[ok] interrupts enabled: timer at 100 Hz, keyboard via UART + PLIC` | 最后才置 `sstatus.SIE`，之前的初始化都不会被中断打断 |
-| 10 | `proc.userinit()` + `proc.scheduler()` | `Type 'help' for commands.`、`> ` | 和 xv6 的 `main` 一样：建好第一个进程 init，启动栈交给调度器，`kmain` 不再返回。之后的两行是 shell（init 启动的）打印的 |
+| 8 | `plic.init(hartid)`、`timer.init(info.timebase_hz)` | `[ok] interrupt sources enabled: timer at 100 Hz, keyboard via UART + PLIC` | 配置外部中断和第一次时钟中断，并在 `sie` 里打开对应的使能位。全局开关 `sstatus.SIE` 不在这里开，见下文 |
+| 9 | `proc.userinit()` + `proc.scheduler()` | `Type 'help' for commands.`、`> ` | 和 xv6 的 `main` 一样：建好第一个进程 init，启动栈交给调度器，`kmain` 不再返回。之后的两行是 shell（init 启动的）打印的 |
+
+**`kmain` 不打开 `sstatus.SIE`**：OpenSBI 交过来时它是 0，之后一直保持 0，直到调度器第一轮开头开一下。以前 `kmain` 在第 9 步之前就打开了，`userinit` 是开着中断运行的；加了自旋锁之后，`userinit` 里分配页（`page.alloc`）要拿锁，`Spinlock.acquire` 检查到中断开着，直接 panic（`acquire: interrupts are enabled`）。现在内核代码从头到尾都关着中断，只有调度器开头那一下例外。时钟中断在第 8 步就预约了，到调度器开中断时已经挂起，马上被处理，计时不受影响。
 
 任何一步失败（设备树格式不对、建页表时内存不够）都会 `std.debug.panic`，打印原因后停机。
 
@@ -121,7 +122,7 @@ proc.scheduler();
 
 之后启动栈上永远运行着调度器：扫描进程表、切到 `runnable` 的进程、等它切回来，一个都没有就 `wfi`。它只管调度，别的什么都不做。init 被调度后启动 shell（[user-programs.md](user-programs.md#init-和-sh)），之后的一切都由用户程序通过系统调用驱动。调度器的代码和“为什么要先关中断再 `wfi`”见 [process.md](process.md#调度器)。
 
-内核里只有两个地方开着中断：调度器每一轮开头开一下再关上，以及 `wfi` 被唤醒之后的下一轮开头。其余时间（初始化之后的所有内核代码：调度器扫描、陷阱处理、系统调用）都关着中断；用户程序在 U 模式运行时中断是开着的。
+内核里只有调度器每一轮开头开一下中断再关上。其余时间（初始化、调度器扫描、陷阱处理、系统调用）都关着中断；用户程序在 U 模式运行时中断是开着的。
 
 ## panic 处理
 

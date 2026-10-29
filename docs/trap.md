@@ -130,10 +130,10 @@ ld    sp, 16(sp)            # 最后恢复 sp
 sret
 ```
 
-- `trapExit` 是 `pub` 的，因为除了陷阱返回，新进程也从这里**第一次**进入 U 模式：`proc.spawn` 在进程内核栈顶构造一个 `TrapFrame`，再构造一个 `ra` = `proc.forkret`、`sp` = 这个 `TrapFrame` 的上下文；第一次被调度时 `switchContext` 恢复这个上下文、`ret` 进 `forkret`，它检查完 `killed` 再跳进 `trapExit`（[process.md](process.md#创建进程)）。
+- `trapExit` 是 `pub` 的，因为除了陷阱返回，新进程也从这里**第一次**进入 U 模式：`proc.userinit`、`fork`、`exec` 在进程内核栈顶准备好 `TrapFrame`（`startFrame` 或复制父进程的），再构造一个 `ra` = `proc.forkret`、`sp` = 这个 `TrapFrame` 的上下文；第一次被调度时 `switchContext` 恢复这个上下文、`ret` 进 `forkret`，它检查完 `killed` 再跳进 `trapExit`（[process.md](process.md#创建进程)）。
 - SPP 的掩码 `0x100` 通过 `"i"`（立即数）约束传入：`%[spp]`。如果放进 `comptimePrint` 的参数结构体里，`trapEntry` 那边用不到这个字段，`comptimePrint` 会报“unused argument”。
-- “`addi t0, sp, 272` 就是内核栈顶”成立的前提是：来自 U 模式的陷阱，`TrapFrame` 总是压在进程内核栈的最顶端。`trapEntry` 从 `sscratch`（= 栈顶）减去 272 压栈，`proc.spawn` 也把初始的 `TrapFrame` 放在栈顶下方 272 字节处，所以一直成立。
-- 用户程序被打断时 `sstatus` 的值原样写回，包括 `SPIE = 1`，所以 `sret` 回到 U 模式后中断是开着的。写回的值里 `SIE` 必须是 0（陷阱入口保存的值天然如此，`proc.spawn` 构造初始值时专门清掉了），否则恢复寄存器的途中就会被中断打断。
+- “`addi t0, sp, 272` 就是内核栈顶”成立的前提是：来自 U 模式的陷阱，`TrapFrame` 总是压在进程内核栈的最顶端。`trapEntry` 从 `sscratch`（= 栈顶）减去 272 压栈，`proc.frameOf` 也把初始的 `TrapFrame` 放在栈顶下方 272 字节处，所以一直成立。
+- 用户程序被打断时 `sstatus` 的值原样写回，包括 `SPIE = 1`，所以 `sret` 回到 U 模式后中断是开着的。写回的值里 `SIE` 必须是 0（陷阱入口保存的值天然如此，`proc.startFrame` 构造初始值时专门清掉了），否则恢复寄存器的途中就会被中断打断。
 - 写 `sscratch` 发生在写回 `sstatus`（`SIE = 0`）之后、`sret` 之前，这段时间不会有中断进来，不会出现“人在内核里、`sscratch` 却不为 0”的窗口。
 
 ## 分发
@@ -180,7 +180,8 @@ const from_user = frame.sstatus & riscv.sstatus_spp == 0;
 陷阱处理全程 `sstatus.SIE = 0`（硬件进陷阱时清零，`handleTrap` 里没有任何地方打开它），所以：
 
 - 不会有嵌套的陷阱，除非处理程序自己出了异常（那是内核 bug，会 panic）。
-- 系统调用都是关着中断执行的。会阻塞的系统调用（`sleep`）不在里面开中断等，而是 `proc.sleep(chan)` 切回调度器，由中断处理程序 `wakeup` 它。以后再加阻塞的调用也照这个办法做。
+- 系统调用都是关着中断执行的。会阻塞的系统调用（`sleep`、`read`、管道的 `write`、`wait`）不在里面开中断等，而是 `proc.sleep(chan, lock)` 切回调度器，由中断处理程序或别的进程 `wakeup` 它。以后再加阻塞的调用也照这个办法做。
+- 自旋锁要求拿锁时中断关着（[process.md](process.md#锁)），陷阱处理程序里随时可以拿锁。`handleTrap` 回到 U 模式之前检查没有拿着任何锁（`spinlock.assertNoneHeld()`），漏放的锁在这里就会被发现。
 - 进程切换（`proc.switchContext`）都发生在关中断时：调度器关着中断扫描进程表，进程这边是在陷阱处理程序里调用 `proc.sched`。
 - 中断只可能打断 U 模式，或者调度器每一轮开头开中断的那一下。
 
@@ -188,4 +189,4 @@ const from_user = frame.sstatus & riscv.sstatus_spp == 0;
 
 - **处理新的中断源**：在 PLIC 里使能它（`plic.init`），在 `handleExternal` 的 `switch` 里加一个分支。
 - **处理新的异常**：来自 U 模式的，加到 `from_user` 分支的 `switch` 里（比如以后实现按需分页，可以在这里处理缺页，而不是直接杀进程）；来自内核的，加到最后一个分支里。
-- **改 `TrapFrame`**：同时检查 `trapEntry`、`trapExit`、`proc.spawn` 里构造初始 `TrapFrame` 的代码和 `syscall.dispatch` 读参数的下标。
+- **改 `TrapFrame`**：同时检查 `trapEntry`、`trapExit`、`proc.startFrame`（构造初始 `TrapFrame`，`a0`/`a1`/`sp` 传命令行参数）和 `syscall.dispatch` 读参数的下标。

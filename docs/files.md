@@ -1,0 +1,160 @@
+# 文件：fd、串口和管道
+
+涉及文件：`src/file.zig`（文件表、串口的读写）、`src/pipe.zig`（管道）、`src/syscall.zig` 的 `read`、`write`、`close`、`dup`、`pipe`、`src/proc.zig` 的 `Process.files`
+
+照 xv6 的 `file.c`、`pipe.c`、`sysfile.c` 写。没有文件系统，所以“文件”只有两种：**串口**和**管道的一端**。用户程序用 fd（一个小整数）指代打开的文件，`read`/`write` 不关心 fd 背后是哪一种。
+
+## 三层结构
+
+```
+进程 A 的 fd 表            文件表（全局，32 项）              底下的东西
+files[0] ──┐
+files[1] ──┼──────────→  File{ ref = 6, console }  ──→  串口（uart.zig）
+files[2] ──┘         ┌→
+files[3] ──────────┐ │
+                   │ │   File{ ref = 1, pipe, 读端 } ──┐
+进程 B 的 fd 表     │ │                                 ├→  Pipe（一页：缓冲区 + 状态）
+files[0] ──────────┼─┘   File{ ref = 2, pipe, 写端 } ──┘
+files[1] ──────────┴──────────↗
+...
+```
+
+- **fd 表**（`Process.files: [abi.max_fds]?*File`，16 项）：每个进程一个，下标就是 fd。只有进程自己会改它，不用加锁。
+- **文件表**（`file.table: [32]File`）：全局，每个 `File` 带引用数 `ref`，`ref = 0` 表示空槽位。`fork` 复制 fd 表、`dup` 复制 fd，都只是让两个 fd 指向同一个 `File`（`ref` 加 1）。
+- **底下的东西**：串口不需要状态；管道是一个 `Pipe`，读端和写端是两个不同的 `File`，指向同一个 `Pipe`。
+
+为什么要中间这一层，而不是 fd 表直接指向管道：fd 表里的每一项要知道自己是读端还是写端；同一个“打开”被 `fork`、`dup` 共享时，要知道什么时候最后一个引用没了，才能真正关掉（管道的一端关了，另一端才会读到结尾或写失败）。xv6 的 `struct file` 还记着读写位置（`off`），这里没有文件系统，用不着。
+
+## 文件表
+
+```zig
+pub const File = struct {
+    ref: u32 = 0,
+    kind: Kind = .none,          // .none（空槽位）、.console、.pipe
+    readable: bool = false,
+    writable: bool = false,
+    pipe: *pipe.Pipe = undefined,
+};
+
+pub fn openConsole() error{TooManyFiles}!*File
+pub fn openPipe() error{ TooManyFiles, OutOfMemory }![2]*File   // { 读端, 写端 }
+pub fn dup(f: *File) *File
+pub fn close(f: *File) void
+pub fn read(f: *File, space: *vm.PageTable, ptr: usize, len: usize) Error!usize
+pub fn write(f: *File, space: *vm.PageTable, ptr: usize, len: usize) Error!usize
+```
+
+- 文件表由 `file.lock` 保护：分配槽位（`alloc`）、改引用数（`dup`、`close`）都要拿它。`File` 的其他字段分配出来之后就不变了，读写时不用拿锁。
+- **`close` 先放开文件表的锁，再去关管道**：管道有自己的锁，这样两把锁不会嵌套，就不用规定加锁顺序。最后一个引用关掉时，先把槽位清空（别的进程马上就能用），再关底下的东西。
+- `openPipe` 先分配两个 `File`，再分配 `Pipe`；任何一步失败，`errdefer` 把已经分配的还回去。
+- `read`/`write` 先检查方向（`readable`/`writable`，不对是 `NotReadable`/`NotWritable`，系统调用返回 `-EBADF`），再按 `kind` 分给串口或管道。
+
+**谁打开、谁关掉**：
+
+- init 启动时（`proc.userinit`）打开一次串口，作为 0、1、2 号 fd（同一个 `File`，`ref = 3`）。之后所有进程都是 `fork` 出来的，继承这三个 fd，所以串口的 `File` 只有一个，`ref` 随进程数变化。
+- `pipe` 系统调用创建管道。
+- 进程结束时（`proc.finish`）关掉 fd 表里所有的文件（[process.md](process.md#exit变成-zombie)）。`exec` 不碰 fd 表：shell 在子进程里先把标准输入输出换成管道，再 `exec`，新程序直接用 0、1 号 fd（[shell.md](shell.md#管道)）。
+
+单元测试（`file.zig` 末尾）检查：`dup` 之后关一次，管道的写端还开着，再关一次才关上；表只剩一个空位时 `openPipe` 失败，不漏槽位也不漏页。
+
+## 串口
+
+```zig
+fn consoleWrite(space: *vm.PageTable, ptr: usize, len: usize) Error!usize
+fn consoleRead(space: *vm.PageTable, ptr: usize, len: usize) Error!usize
+```
+
+- **写**：用户内存按块（128 字节、不跨页）复制到栈上，再 `uart.write`。部分写的语义见 [syscalls.md](syscalls.md#write)。
+- **读**：拿着 `uart.rx_lock` 检查输入缓冲区（[devices.md](devices.md#输入环形缓冲区)），空着就 `proc.sleep(uart.rx_chan, &uart.rx_lock)`，串口中断叫醒它；被 kill 了就返回。有字符就有多少读多少（最多 `len`），每次最多 64 个放进栈上的缓冲区，再 `copyToUser`。调用方（`read` 系统调用）已经检查过目标范围可写，`copyToUser` 不会失败。
+- **Ctrl-D（`0x04`）表示输入结束**，和 Unix 终端一样：读到它就停下。它前面有字符的话先返回这些字符，Ctrl-D 留在缓冲区里；下一次 `read` 读掉它、返回 0。所以单独按一次 Ctrl-D，`read` 返回 0。`cat`、`wc` 直接从键盘读时靠它结束；shell 读到 0 就忽略。
+- 不回显、不做行编辑（shell 自己做），Ctrl-C 在串口中断里就被截下了（[process.md](process.md#ctrl-c)），读不到。
+
+## 管道
+
+```zig
+pub const size = 2048;
+
+pub const Pipe = struct {
+    lock: Spinlock = .init("pipe"),
+    nread: usize = 0,        // 读走的总字节数
+    nwrite: usize = 0,       // 写进的总字节数
+    read_open: bool = true,  // 读端还开着
+    write_open: bool = true, // 写端还开着
+    data: [size]u8 = undefined,
+};
+
+pub fn create() error{OutOfMemory}!*Pipe
+pub fn close(p: *Pipe, writable: bool) void
+pub fn write(p: *Pipe, space: *vm.PageTable, ptr: usize, len: usize) Error!usize
+pub fn read(p: *Pipe, space: *vm.PageTable, ptr: usize, len: usize) Error!usize
+```
+
+- **一个管道占一页**（`page.alloc`），编译期断言 `@sizeOf(Pipe) <= 4096`。两端都关了才 `page.free`。
+- **环形缓冲区**：`nread`、`nwrite` 只增不减，`nwrite - nread` 是缓冲区里的字节数，下标是它们对 `size` 取模。64 位的计数器不会回绕（每秒写 1 GB 也要几百年），所以不用像 xv6 那样担心回绕时取模出错。
+- **所有字段由 `lock` 保护**，读写两端的进程拿着它等待。这是“为多核准备”的锁里真正有用的一把：多核时读写两端的进程会在不同的 hart 上同时运行。
+
+### 写
+
+```zig
+p.lock.acquire();
+defer p.lock.release();
+var done: usize = 0;
+defer if (done > 0) proc.wakeup(&p.nread);
+while (done < len) {
+    if (!p.read_open) return if (done == 0) error.BrokenPipe else done;
+    if (proc.isKilled()) return done;
+    if (p.nwrite - p.nread == size) {        // 满了
+        proc.wakeup(&p.nread);
+        proc.sleep(&p.nwrite, &p.lock);
+        continue;
+    }
+    // 复制一段：不超过空位、不越过缓冲区末尾、不跨用户页
+    ...
+}
+```
+
+- **写完全部字节才返回**（和 xv6 一样）：满了就叫醒读的进程，自己睡在 `&nwrite` 上，读的进程读走一些之后叫醒它。所以写 5000 字节进一个 2048 字节的管道，要来回几次（`t_pipe` 检查了读的一方至少读了 3 次）。
+- **读端都关了**：一个字节都没写进去返回 `BrokenPipe`（`-EPIPE`），写进去一部分的返回这部分的字节数。睡在满的管道上时读端关了，`pipe.close` 叫醒它，它看到 `read_open = false` 就返回。没有 `SIGPIPE`：写的程序自己处理错误（`echo` 以 1 结束）。
+- 坏地址的处理和串口一样：每段不跨页，前面的都写进去了，返回已经写进去的字节数；一个字节都没写进去才返回 `BadAddress`。
+- 两个 `defer` 按相反的顺序执行：先叫醒读的进程，再放开锁。
+
+### 读
+
+```zig
+p.lock.acquire();
+defer p.lock.release();
+while (p.nread == p.nwrite and p.write_open) {
+    if (proc.isKilled()) return 0;
+    proc.sleep(&p.nread, &p.lock);
+}
+// 有多少读多少，最多 len；读走了东西就叫醒写的进程
+```
+
+- **空着、写端还开着时等**；空着、写端都关了，返回 0（读到结尾）。缓冲区里还有数据时，就算写端已经关了，也先把数据读完。
+- 有多少读多少，不等凑满 `len`。
+- **复制成功了才算读走**：`copyToUser` 失败的那一段留在管道里（`read` 系统调用先检查过整个目标范围，正常情况下不会失败）。
+
+### 关
+
+```zig
+pub fn close(p: *Pipe, writable: bool) void {
+    p.lock.acquire();
+    if (writable) { p.write_open = false; proc.wakeup(&p.nread); }
+    else { p.read_open = false; proc.wakeup(&p.nwrite); }
+    const unused = !p.read_open and !p.write_open;
+    p.lock.release();
+    if (unused) page.free(...);
+}
+```
+
+关一端时叫醒等在另一端的进程：读的会读到结尾，写的会得到 `BrokenPipe`。释放在放开锁之后：这时两端都关了，没有人还能拿到这个管道。
+
+单元测试（`pipe.zig` 末尾）只测不需要等待的路径（等待要切换进程，只能在 QEMU 里测）：写 1500、读 1000、再写 1500 越过缓冲区末尾，内容不错；要 3000 只给 2000；坏地址时数据不动；写端关了先读完剩下的再读到结尾；读端关了写返回 `BrokenPipe`；两端都关了页还回去。阻塞、叫醒、被 kill 的情况由回归测试 `t_pipe` 在 QEMU 里测（[testing.md](testing.md#回归测试程序)）。
+
+## 限制和以后可以做的
+
+- 没有文件系统，没有 `open`：文件只有串口和管道。
+- 没有 `dup2`，重定向靠“`close` 再 `dup`，拿到编号最小的空闲 fd”。
+- 没有非阻塞读写，没有 `poll`/`select`。
+- 没有信号：写一个读端已经关了的管道只返回 `-EPIPE`，程序自己决定怎么办。
+- 管道缓冲区固定 2048 字节，写满了就要等读的一方；`write` 写完全部字节才返回，一次大的写会被拆成很多次切换。

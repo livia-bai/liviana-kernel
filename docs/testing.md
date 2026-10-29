@@ -20,11 +20,14 @@ zig build test --summary all   # 显示通过了几个
 | --- | --- |
 | `src/dtb.zig` | 用测试里的 `TestFdt` 按 FDT 格式拼一份设备树，检查解析出的内存、时钟频率、保留区；截断、魔数不对、缺少时钟频率时返回错误 |
 | `src/page.zig` | 先分配低地址、分配时清零、跳过保留区、内存用完时报 `OutOfMemory` |
-| `src/vm.zig` | 能用大页时用大页（比较用掉的页表数）；`copyFromUser` 只读得到 U 模式可读的用户页，`copyToUser` 只写得进 U 模式可写的页，`checkUser` 检查整个范围（跨页、溢出、长度 0）；`cloneUserSpace` 复制内容和权限、两边互不影响；释放用户空间后不漏页 |
-| `src/proc.zig` | 加载真正的用户程序 `hello`（`build.zig` 把用户程序的 ELF 也交给了单元测试）；拒绝截断、魔数不对、不是 RISC-V、程序头越界、没有权限的段；`wakeup` 只叫醒睡在同一个通道上的进程；`kill` 只做标记、叫醒在睡的进程、只记第一次的原因、拒绝 init 和不存在的 pid；`wait` 只找自己的子进程、按 pid 挑；`reparent` 把子进程交给 init 并叫醒它 |
+| `src/vm.zig` | 能用大页时用大页（比较用掉的页表数）；`copyFromUser` 只读得到 U 模式可读的用户页，`copyToUser` 只写得进 U 模式可写的页，`checkUser` 检查整个范围（跨页、溢出、长度 0）；`cloneUserSpace` 复制内容和权限、两边互不影响；`growUser`/`shrinkUser` 按页映射和释放、跨 2 MiB 时页表也释放、内存不够时不留下半截；释放用户空间后不漏页 |
+| `src/proc.zig` | 加载真正的用户程序 `hello`（`build.zig` 把用户程序的 ELF 也交给了单元测试）；拒绝截断、魔数不对、不是 RISC-V、程序头越界、没有权限的段；命令行参数在栈顶的布局（16 字节对齐、指向正确的字节、没有参数时 `sp` 是栈顶）和堆的起点；`wakeup` 只叫醒睡在同一个通道上的进程；`kill` 只做标记、叫醒在睡的进程、只记第一次的原因、拒绝 init 和不存在的 pid；`wait` 只找自己的子进程、按 pid 挑；`reparent` 把子进程交给 init 并叫醒它 |
 | `src/abi.zig` | 系统调用返回值和错误码的互相转换 |
+| `src/spinlock.zig` | 拿锁、放锁、`holding`、记录拿着几把锁 |
+| `src/pipe.zig` | 管道不需要等待的路径：环形缓冲区回绕、有多少读多少、坏地址时数据不动、写端关了读到结尾、读端关了写返回 `BrokenPipe`、两端都关了释放 |
+| `src/file.zig` | `dup` 加引用、最后一个 `close` 才关掉管道；文件表满了 `openPipe` 失败且不漏 |
 
-为什么页表能在主机上测：内核对物理内存做了恒等映射，页表里的地址就是能直接用的指针。测试拿一块按 4 KiB 对齐的数组交给页分配器当作“物理内存”，页表就建在这块数组里，代码不用改。只有 `vm.activate` 这类写 CSR 的函数不能在主机上调用，测试也不会用到它们：Zig 只编译被用到的函数，所以这些文件里的 RISC-V 内联汇编不影响在主机上编译。
+为什么页表能在主机上测：内核对物理内存做了恒等映射，页表里的地址就是能直接用的指针。测试拿一块按 4 KiB 对齐的数组交给页分配器当作“物理内存”，页表就建在这块数组里，代码不用改。只有 `vm.activate` 这类写 CSR 的函数不能在主机上调用，测试也不会用到它们：Zig 只编译被用到的函数，所以这些文件里的 RISC-V 内联汇编不影响在主机上编译。例外是被测的函数在不会走到的路径上调用了它们：管道的读写在等待时调用 `proc.sleep` → `proc.sched`（读 `sstatus`、切换上下文），测试只走不需要等待的路径，但 `sched` 照样要编译。所以 `sched` 开头在主机上直接 `@panic`（编译期判断，不是 RISC-V 时后面的汇编不会被编译），`Spinlock.acquire` 在主机上不检查 `sstatus`。
 
 ## QEMU 测试（tools/qemu_test.py）
 
@@ -47,8 +50,11 @@ python3 tools/qemu_test.py --list         # 列出用例和它们覆盖的文件
 | `syscall` | `t_sys`：`write` 的各种边界情况、不存在的调用号 | `user/tests/t_sys.zig` |
 | `fork` | `t_fork`（自己检查 37 项，见下文）；`t_read` 分几次读完一行，睡在 `read` 里时按 Ctrl-C 能结束它；杀掉 shell 后 init 重新启动一个 | `user/hello.zig`、`user/tests/t_fork.zig`、`user/tests/t_read.zig` |
 | `protection` | `t_wx`、`t_stack`、`t_priv`、`t_fp`、`t_noperm`：硬件和加载器的各种保护 | `user/linker.ld`、对应的测试程序 |
+| `args` | shell 按空格拆参数（多个空格算一个），`t_args` 看到的 argc、argv、退出码；`echo` 带参数、不带参数；超过 16 个参数时 shell 报错；`t_args check`（自己检查 11 项） | `user/echo.zig`、`user/tests/t_args.zig` |
+| `pipe` | `t_pipe`（自己检查 31 项）；shell 的管道：`echo \| wc`、`echo \| cat \| cat \| wc`、`t_args \| wc` 的结果，找不到的程序、空的一段、超过 4 个程序时报错；后台管道；对 `cat \| wc` 按 Ctrl-C 杀掉三个进程（组长、cat、wc），之后 `ps` 里没有剩下的；对 `cat \| wc` 输入 `abc` 再按 Ctrl-D，wc 打印 `0 1 3` | `src/pipe.zig`、`user/echo.zig`、`user/cat.zig`、`user/wc.zig`、`user/tests/t_pipe.zig`、`user/tests/t_args.zig` |
+| `sbrk` | `t_sbrk`（自己检查 25 项） | `user/tests/t_sbrk.zig` |
 
-`build.zig`、链接脚本、`src/` 下的 `main.zig`、`riscv.zig`、`trap.zig`、`vm.zig`、`page.zig`、`dtb.zig`、`uart.zig`、`proc.zig`、`syscall.zig`、`abi.zig`，以及 `user/` 下的 `start.zig`、`sys.zig`、`init.zig`、`sh.zig` 是核心文件：所有用例都要经过 init、shell 和系统调用，改了它们就跑全部用例；没登记过的内核文件也一样。只改了文档时，`--changed` 什么都不跑。
+`build.zig`、链接脚本、`src/` 下的 `main.zig`、`riscv.zig`、`trap.zig`、`vm.zig`、`page.zig`、`dtb.zig`、`uart.zig`、`proc.zig`、`syscall.zig`、`abi.zig`、`spinlock.zig`、`file.zig`，以及 `user/` 下的 `start.zig`、`sys.zig`、`init.zig`、`sh.zig` 是核心文件：所有用例都要经过 init、shell 和系统调用，改了它们就跑全部用例；没登记过的内核文件也一样。只改了文档时，`--changed` 什么都不跑。
 
 优化模式默认只用 safe：既有安全检查（整数溢出、越界），也开了优化。改了内联汇编、MMIO、中断、页表、进出 U 模式的代码时，再加 `--all-modes`：release 模式下编译器会更激进地利用类型系统的承诺，漏写的 `volatile`、clobber，写错的 `noreturn`，往往只在 release 模式下出问题。
 
@@ -86,6 +92,9 @@ FAIL  safe   fork        14 checks
 | `t_noperm` | 数据段 `FLAGS(0)` 的 ELF（用 `user/tests/noperm.ld` 链接） | `run: cannot load t_noperm: BadElf` |
 | `t_fork` | `fork` 的返回值和地址空间复制；`wait` 的退出码、nohang、没有子进程、别人的子进程、坏的 options、写不进状态时不回收；`kill` 睡着的子进程、init、不存在的 pid；`setfg` 不存在的 pid；`exec` 不存在的程序、太长的名字、坏 ELF、坏指针，成功后 pid 不变；孤儿交给 init（孙进程的 `getppid()` 变成 1）；`fork` 到进程表满（`EAGAIN`）再全部回收；`procinfo`、`meminfo`、`listprog`、`read` 的坏参数和边界 | 每项失败打印 `FAIL: ...`；最后 `N checks, 0 failed`，退出码 0 |
 | `t_read` | 每次最多 `read` 3 个字节，读到回车为止 | 输入 `hello world` 回车：`got "hello world" in N reads`，N ≥ 4 |
+| `t_args` | 不带 `check` 时打印 argc、每个参数、总字节数，退出码是 argc。`t_args check`：`argv` 在栈顶那一页、16 字节对齐；17 个参数、1026 字节的参数返回 `ArgsTooLong`；`argv` 指针、参数指针指向内核时 `EFAULT`；长度为 0 的参数不检查指针；正好 16 个参数、1024 字节；没有参数。要看子进程收到的参数时，把它的 stdout 接到管道上读回来比较 | 每项失败打印 `FAIL: ...`；最后 `N checks, 0 failed`，退出码 0 |
+| `t_pipe` | 基本读写、fd 编号最小；往读端写、从写端读是 `BadFd`；写端关了读到结尾；子进程写 5000 字节（比缓冲区大，要等）、父进程读完一字不差且读了至少 3 次；读的一方先睡下；读端关了写返回 `BrokenPipe`；写满之后读端才关，睡着的写者被叫醒、只写出一部分；睡在管道读、写里时被 kill；坏的 fd、坏指针；`dup` 到 fd 表满、`pipe` 在只剩一个空位时失败且不漏；`fork` 继承 fd、子进程关 stdout 不影响父进程 | 同上 |
+| `t_sbrk` | 堆一开始是空的；长 3 页多：返回原来的末尾、清零、按页映射（最后一页的页尾能写，下一页缺页）；内核通过管道读写堆里的内存；`fork` 复制堆；缩到页中间：这一页还在，后面的页缺页；再长回来是清零的；缩到起点下面、`minInt`、长进栈、`maxInt`、超过物理内存都失败，失败时不漏页、`brk` 不变；一个字节一个字节地长过页边界；全部还回去 | 同上；中间有几行 `killed: store_page_fault`，是故意去碰没映射的页的子进程 |
 
 ### 加一个回归测试
 

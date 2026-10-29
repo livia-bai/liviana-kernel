@@ -23,7 +23,7 @@ fn startShell() usize {
             continue;
         };
         if (pid == 0) {
-            sys.exec("sh") catch |err| sys.print("init: cannot exec sh: {s}\n", .{@errorName(err)});
+            sys.exec("sh", &.{"sh"}) catch |err| sys.print("init: cannot exec sh: {s}\n", .{@errorName(err)});
             sys.exit(1);
         }
         return pid;

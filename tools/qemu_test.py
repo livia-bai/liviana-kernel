@@ -374,10 +374,74 @@ def case_fork(q, c, mode):
         exited(c, q.command("run hello"), "hello", 0)
 
 
+def check_counts(c, out, name):
+    """t_args check、t_pipe、t_sbrk 这类自己检查边界情况的测试程序：失败的项打印 FAIL，最后打印通过的项数。"""
+    c.contains(out, r"\d+ checks, 0 failed", f"run {name}")
+    c.expect("FAIL" not in out, f"run {name}:\n{indent(out)}")
+    exited(c, out, name, 0)
+
+
+def case_args(q, c, mode):
+    # shell 按空格拆参数，多个空格算一个；argv[0] 是程序名，退出码是 argc
+    out = q.command("run t_args one  two   three")
+    c.contains(out, r'argc=4\nargv\[0\]="t_args"\nargv\[1\]="one"\nargv\[2\]="two"\nargv\[3\]="three"\n'
+                    r"total 17 bytes\n", "run t_args")
+    exited(c, out, "t_args", 4)
+    c.contains(q.command("run echo hello,   world"), r"\nhello, world\n", "run echo")
+    c.contains(q.command("run echo"), r"echo\n\n\[proc\]", "run echo without arguments")
+    c.contains(q.command("run t_args " + " ".join(["x"] * 16)), r"run: too many arguments \(at most 16\)", "run t_args x*16")
+    check_counts(c, q.command("run t_args check"), "t_args")
+
+
+def case_pipe(q, c, mode):
+    check_counts(c, q.command("run t_pipe"), "t_pipe")
+    # shell 的管道：前一个程序的输出接到后一个的输入，读到结尾才结束；“组长”是 fork 出来的 sh
+    out = q.command("run echo hello world | wc")
+    c.contains(out, r"\n1 2 12\n", "run echo | wc")
+    exited(c, out, "echo", 0)
+    exited(c, out, "wc", 0)
+    exited(c, out, "sh", 0)
+    c.contains(q.command("run echo a b c | cat | cat | wc"), r"\n1 3 6\n", "run echo | cat | cat | wc")
+    c.contains(q.command("run t_args x y|wc"), r"\n5 7 62\n", "run t_args | wc")
+    c.contains(q.command("run echo a | nope"), r"no such program: nope", "run echo | nope")
+    c.contains(q.command("run echo a |"), r"run: empty command in the pipeline", "run echo |")
+    c.contains(q.command("run echo | echo | echo | echo | echo"), r"run: too many programs in the pipeline \(at most 4\)",
+               "run with 5 programs")
+    # 后台管道
+    m = c.contains(q.command("run echo bg | wc &"), r"\[proc\] pid (\d+) \(pipeline\) started in the background",
+                   "run echo | wc &")
+    if m:
+        q.wait_for(lambda t: re.search(rf"pid {m.group(1)} \(sh\) exited", t), COMMAND_TIMEOUT, "the background pipeline")
+    # Ctrl-C 结束前台管道里的所有程序：cat 在等键盘，wc 在等 cat
+    start = len(q.text())
+    prompts = q.text().count(PROMPT)
+    q.send("run cat | wc\r")
+    time.sleep(0.3)
+    q.send("\x03")
+    # 三个进程被杀的顺序、和提示符谁先谁后取决于调度，都等到再检查
+    killed = [rf"\[proc\] pid \d+ \({name}\) killed: interrupted by Ctrl-C" for name in ("cat", "wc", "sh")]
+    out = q.wait_for(lambda t: t.count(PROMPT) > prompts and all(re.search(k, t[start:]) for k in killed),
+                     COMMAND_TIMEOUT, "Ctrl-C to kill cat | wc")[start:]
+    c.expect(out.count("^C") == 1, f"run cat | wc + Ctrl-C:\n{indent(out)}")
+    c.expect(ps_table(q, c) == {}, "ps: processes left after Ctrl-C on a pipeline")
+    # 在键盘上按 Ctrl-D：cat 读到结尾
+    start = len(q.text())
+    prompts = q.text().count(PROMPT)
+    q.send("run cat | wc\r")
+    time.sleep(0.3)
+    q.send("abc\x04")
+    out = q.wait_for(lambda t: t.count(PROMPT) > prompts, COMMAND_TIMEOUT, "the prompt after Ctrl-D on cat | wc")[start:]
+    c.contains(out, r"\n0 1 3\n", "run cat | wc + Ctrl-D")
+
+
+def case_sbrk(q, c, mode):
+    check_counts(c, q.command("run t_sbrk"), "t_sbrk")
+
+
 # 每个用例覆盖的文件。改了 CORE 里的文件（或者没列出的内核文件）就跑全部用例。
 CORE = ["build.zig", "linker.ld", "src/main.zig", "src/riscv.zig", "src/trap.zig", "src/vm.zig", "src/page.zig",
-        "src/dtb.zig", "src/uart.zig", "src/proc.zig", "src/syscall.zig", "src/abi.zig", "user/start.zig",
-        "user/sys.zig", "user/init.zig", "user/sh.zig", "tools/qemu_test.py"]
+        "src/dtb.zig", "src/uart.zig", "src/proc.zig", "src/syscall.zig", "src/abi.zig", "src/spinlock.zig",
+        "src/file.zig", "user/start.zig", "user/sys.zig", "user/init.zig", "user/sh.zig", "tools/qemu_test.py"]
 NOT_KERNEL = ["src/tests.zig"]  # 只在单元测试里用
 CASES = {
     # 名字: (函数, 覆盖的文件)
@@ -392,6 +456,10 @@ CASES = {
     "protection": (case_protection, ["user/linker.ld", "user/tests/t_wx.zig", "user/tests/t_stack.zig",
                                      "user/tests/t_priv.zig", "user/tests/t_fp.zig", "user/tests/t_noperm.zig",
                                      "user/tests/noperm.ld"]),
+    "args": (case_args, ["user/echo.zig", "user/tests/t_args.zig"]),
+    "pipe": (case_pipe, ["src/pipe.zig", "user/echo.zig", "user/cat.zig", "user/wc.zig", "user/tests/t_pipe.zig",
+                         "user/tests/t_args.zig"]),
+    "sbrk": (case_sbrk, ["user/tests/t_sbrk.zig"]),
 }
 
 
@@ -439,7 +507,7 @@ def check_boot(q, c):
         rf"\[ok\] device tree: \d+ MiB RAM at 0x80000000, timebase {TIMEBASE_HZ} Hz",
         r"\[ok\] page allocator: \d+ free pages",
         r"\[ok\] Sv39 paging enabled",
-        r"\[ok\] interrupts enabled: timer at 100 Hz",
+        r"\[ok\] interrupt sources enabled: timer at 100 Hz",
     ]:
         c.contains(text, pattern, "boot log")
 

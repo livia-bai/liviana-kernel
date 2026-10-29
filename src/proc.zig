@@ -9,14 +9,23 @@
 //! - 进程之间有父子关系：fork 复制当前进程，exec 换掉地址空间，exit 之后变成 zombie，等父进程 wait 回收。
 //!   第一个进程 init（pid 1）由 kmain 创建，父进程先结束的孤儿交给它回收。
 //! - kill 只做标记、叫醒在睡的进程；被杀的进程回到 U 模式之前自己结束（checkKilled）。
+//! - 每个进程有自己的 fd 表（files），指向全局文件表里的 File（file.zig）。fork 复制 fd 表，
+//!   exec 保留，结束时全部关掉。
 //!
 //! 用户地址空间（都在 vm.user_base..vm.user_end 之内）：
 //!   0x4000_0000 起    程序的各个段（user/linker.ld），按段设置 R/W/X，都带 U 位
+//!   紧接着            堆：从最后一个段之后的页边界（heap_start）到 brk，sbrk 调整，可读写
 //!   ...              不映射
 //!   栈底下面一页      不映射，栈溢出时触发缺页异常，而不是悄悄踩坏别的数据
-//!   0x8000_0000 往下  16 KiB 用户栈，可读写
+//!   0x8000_0000 往下  16 KiB 用户栈，可读写。最顶上放着 exec 传进来的命令行参数
+//!
+//! 锁：现在只有一个 hart，进程表、current、调度器的上下文都没有加锁，靠“内核全程关中断”保证不被打断。
+//! 多核时要像 xv6 那样给每个进程加锁（state、chan、killed 等）、给父子关系加 wait_lock，
+//! current 和 scheduler_context 改成每个 hart 一份。等待已经统一成 sleep(chan, lock) 的写法，
+//! 等的条件由传进来的锁保护（管道、键盘），到时候 sleep 内部再补上进程锁就行。
 
 const std = @import("std");
+const builtin = @import("builtin");
 const elf = std.elf;
 const build_options = @import("build_options");
 const riscv = @import("riscv.zig");
@@ -25,6 +34,9 @@ const page = @import("page.zig");
 const vm = @import("vm.zig");
 const trap = @import("trap.zig");
 const abi = @import("abi.zig");
+const file = @import("file.zig");
+const spinlock = @import("spinlock.zig");
+const Spinlock = spinlock.Spinlock;
 
 pub const Program = struct {
     name: []const u8,
@@ -49,6 +61,8 @@ pub fn find(name: []const u8) ?*const Program {
 const stack_size = 16 * 1024;
 const stack_top = vm.user_end;
 const stack_bottom = stack_top - stack_size;
+/// 堆最多长到栈下面的保护页为止
+const heap_limit = stack_bottom - page.size;
 
 pub const max_procs = abi.max_procs;
 
@@ -73,6 +87,11 @@ pub const Process = struct {
     xstatus: u32 = 0,
     /// 在 U 模式运行期间来过的时钟中断数，大致就是用掉的 CPU 时间（单位 10 ms）
     ticks: u64 = 0,
+    /// 打开的文件，下标就是 fd。只有进程自己会改（没有线程），不用加锁
+    files: [abi.max_fds]?*file.File = @splat(null),
+    /// 堆的起点（程序最后一个段之后的页边界）和当前的末尾，见 sbrk
+    heap_start: usize = 0,
+    brk: usize = 0,
 };
 
 /// 进程表。槽位 i 的进程用 kernel_stacks[i] 作内核栈。
@@ -118,17 +137,20 @@ fn frameOf(p: *Process) *trap.TrapFrame {
     return @ptrCast(@alignCast(stack[stack.len - @sizeOf(trap.TrapFrame) ..]));
 }
 
-/// 从程序入口开始运行的 TrapFrame：除了 sp 以外寄存器全为 0。
-fn startFrame(frame: *trap.TrapFrame, entry: usize) void {
+/// 从程序入口开始运行的 TrapFrame：a0 = argc，a1 = sp = 栈上 Arg 数组的地址（见 pushArgs），
+/// 其他寄存器全为 0。
+fn startFrame(frame: *trap.TrapFrame, image: Image) void {
     frame.* = .{
         .regs = @splat(0),
-        .sepc = entry,
+        .sepc = image.entry,
         // SPP = 0：sret 回到 U 模式；SPIE = 1：回到 U 模式后打开中断，时钟和键盘照常工作。
         // SIE 必须清掉：trapExit 一开始就写回 sstatus，SIE = 1 的话恢复寄存器的途中就可能被中断打断。
         // （内核代码都是关着中断运行的，读到的 SIE 本来就是 0，但不依赖这一点。）
         .sstatus = (riscv.read(.sstatus) & ~(riscv.sstatus_spp | riscv.sstatus_sie)) | riscv.sstatus_spie,
     };
-    frame.regs[2] = stack_top;
+    frame.regs[2] = image.sp;
+    frame.regs[10] = image.argc;
+    frame.regs[11] = image.sp;
 }
 
 /// 新进程第一次被调度时的内核上下文：switchContext 恢复它之后 ret 到 forkret，sp 正指向它的 TrapFrame。
@@ -136,24 +158,29 @@ fn firstContext(p: *Process) Context {
     return .{ .ra = @intFromPtr(&forkret), .sp = @intFromPtr(frameOf(p)), .s = @splat(0) };
 }
 
-pub const SpawnError = error{ TooManyProcesses, OutOfMemory, BadElf };
+pub const SpawnError = error{ TooManyProcesses, OutOfMemory, BadElf, TooManyFiles };
 
-/// 创建第一个进程 init（对应 xv6 的 userinit）：加载嵌在内核里的 init 程序，状态为 runnable。
-/// kmain 在启动调度器之前调用。
+/// 创建第一个进程 init（对应 xv6 的 userinit）：加载嵌在内核里的 init 程序，命令行参数是 "init"，
+/// 打开串口作为 0、1、2 号 fd，状态为 runnable。kmain 在启动调度器之前调用。
 pub fn userinit() SpawnError!void {
     const program = find("init") orelse @panic("no init program (see build.zig)");
     const p = try allocSlot();
-    const space = try vm.createUserSpace();
-    errdefer vm.destroyUserSpace(space);
-    const entry = try load(space, program.image);
+    const image = try loadImage(program, &.{"init"});
+    errdefer vm.destroyUserSpace(image.space);
+    const console = try file.openConsole();
     p.* = .{
         .state = .runnable,
         .pid = next_pid,
         .name = program.name,
-        .space = space,
+        .space = image.space,
         .context = firstContext(p),
+        .heap_start = image.brk,
+        .brk = image.brk,
     };
-    startFrame(frameOf(p), entry);
+    p.files[abi.stdin] = console;
+    p.files[abi.stdout] = file.dup(console);
+    p.files[abi.stderr] = file.dup(console);
+    startFrame(frameOf(p), image);
     next_pid += 1;
     init_proc = p;
 }
@@ -162,6 +189,7 @@ pub const ForkError = error{ TooManyProcesses, OutOfMemory };
 
 /// 复制当前进程（对应 xv6 的 fork），返回子进程的 pid。子进程有一份内容相同的地址空间（逐页复制），
 /// TrapFrame 也是复制的，所以它被调度后从同一个 ecall 之后继续执行，只是 a0（fork 的返回值）是 0。
+/// 打开的文件和父进程共用（引用数加 1）。
 /// 由系统调用处理程序调用：这时 handleTrap 已经把父进程 TrapFrame 里的 sepc 加过 4 了。
 pub fn fork() ForkError!usize {
     const parent = current.?;
@@ -177,29 +205,96 @@ pub fn fork() ForkError!usize {
         .space = space,
         .parent = parent,
         .context = firstContext(child),
+        .heap_start = parent.heap_start,
+        .brk = parent.brk,
     };
+    for (&child.files, parent.files) |*c, f| c.* = if (f) |x| file.dup(x) else null;
     next_pid += 1;
     return child.pid;
 }
 
 pub const ExecError = error{ NoSuchProgram, OutOfMemory, BadElf };
 
-/// 用程序 name 替换当前进程的地址空间（对应 xv6 的 exec）。成功时 TrapFrame 已经改成从新程序的入口开始，
-/// 系统调用返回后就进入新程序；失败时原来的地址空间和 TrapFrame 都不变，系统调用照常返回错误。
-/// pid、父进程、ticks 不变。
-pub fn exec(name: []const u8) ExecError!void {
+/// 用程序 name 替换当前进程的地址空间（对应 xv6 的 exec），args 是命令行参数（在内核内存里，
+/// 个数和总长度由调用方检查过）。成功时 TrapFrame 已经改成从新程序的入口开始，系统调用返回后就进入新程序；
+/// 失败时原来的地址空间和 TrapFrame 都不变，系统调用照常返回错误。pid、父进程、ticks、打开的文件不变。
+pub fn exec(name: []const u8, args: []const []const u8) ExecError!void {
     const p = current.?;
     const program = find(name) orelse return error.NoSuchProgram;
-    const space = try vm.createUserSpace();
-    errdefer vm.destroyUserSpace(space);
-    const entry = try load(space, program.image);
+    const image = try loadImage(program, args);
     // 先切到新的地址空间，才能释放正在用的旧页表
     const old = p.space;
-    p.space = space;
-    vm.activate(space);
+    p.space = image.space;
+    vm.activate(image.space);
     vm.destroyUserSpace(old);
     p.name = program.name;
-    startFrame(frameOf(p), entry);
+    p.heap_start = image.brk;
+    p.brk = image.brk;
+    startFrame(frameOf(p), image);
+}
+
+/// 加载好的程序：新的地址空间，入口，栈指针（也是栈上 Arg 数组的地址），参数个数，堆的起点。
+const Image = struct {
+    space: *vm.PageTable,
+    entry: usize,
+    sp: usize,
+    argc: usize,
+    brk: usize,
+};
+
+/// 新建地址空间，加载程序，把命令行参数复制到栈顶。失败时不留下任何东西。
+fn loadImage(program: *const Program, args: []const []const u8) LoadError!Image {
+    const space = try vm.createUserSpace();
+    errdefer vm.destroyUserSpace(space);
+    const loaded = try load(space, program.image);
+    return .{ .space = space, .entry = loaded.entry, .sp = pushArgs(space, args), .argc = args.len, .brk = loaded.brk };
+}
+
+/// 把命令行参数复制到用户栈的顶端，返回栈上 Arg 数组的地址，新程序的 sp 就从这里开始：
+///
+///   stack_top
+///   参数的字节    各个参数依次往下放，不以 0 结尾
+///   （对齐到 16）
+///   Arg 数组      argc 个 { ptr, len }，ptr 指向上面的字节    <- 返回值（16 字节对齐，RISC-V 的 sp 要求）
+///
+/// 参数最多 abi.max_args 个、总共 abi.max_arg_bytes 字节，加起来远小于一页，栈的最顶上一页一定放得下。
+fn pushArgs(space: *vm.PageTable, args: []const []const u8) usize {
+    std.debug.assert(args.len <= abi.max_args);
+    var argv: [abi.max_args]abi.Arg = undefined;
+    var sp: usize = stack_top;
+    for (args, argv[0..args.len]) |a, *arg| {
+        sp -= a.len;
+        vm.copyToUser(space, sp, a) catch unreachable; // 栈已经映射好了
+        arg.* = .{ .ptr = sp, .len = a.len };
+    }
+    std.debug.assert(stack_top - sp <= abi.max_arg_bytes);
+    sp = std.mem.alignBackward(usize, sp - args.len * @sizeOf(abi.Arg), 16);
+    vm.copyToUser(space, sp, std.mem.sliceAsBytes(argv[0..args.len])) catch unreachable;
+    return sp;
+}
+
+pub const SbrkError = error{ OutOfMemory, InvalidArgument };
+
+/// 把当前进程的堆末尾移动 increment 字节，返回原来的末尾（对应 xv6 的 growproc）。
+/// 堆按页映射：变大时把新跨进来的页映射上（清零、可读写），变小时把整个落在新末尾之后的页释放掉。
+/// 不能小于堆的起点（InvalidArgument），不能长进栈下面的保护页（OutOfMemory）。失败时什么都不变。
+pub fn sbrk(increment: isize) SbrkError!usize {
+    const p = current.?;
+    const old = p.brk;
+    const new = if (increment >= 0)
+        std.math.add(usize, old, @intCast(increment)) catch return error.OutOfMemory
+    else
+        std.math.sub(usize, old, @abs(increment)) catch return error.InvalidArgument;
+    if (new < p.heap_start) return error.InvalidArgument;
+    if (new > heap_limit) return error.OutOfMemory;
+    if (new > old) {
+        try vm.growUser(p.space, old, new, .{ .r = true, .w = true });
+    } else if (new < old) {
+        vm.shrinkUser(p.space, old, new);
+        riscv.sfenceVma(); // 释放的页可能还在 TLB 里
+    }
+    p.brk = new;
+    return old;
 }
 
 /// 新进程（init 和 fork 出来的子进程）第一次被调度时从这里开始（对应 xv6 的 forkret），sp 指向它的 TrapFrame。
@@ -244,9 +339,12 @@ pub fn scheduler() noreturn {
 /// 当前进程切回调度器（对应 xv6 的 sched()）。调用前要先把自己的状态改掉（不再是 running）。
 /// 等调度器下次挑中这个进程时，switchContext 才返回，从这里接着往下执行。
 fn sched() void {
+    // 单元测试在主机上运行，不会走到这里（管道等的测试只走不需要等待的路径），但会被编译
+    if (comptime !builtin.cpu.arch.isRISCV()) @panic("sched() in a unit test");
     const p = current.?;
     std.debug.assert(p.state != .running);
     std.debug.assert(riscv.read(.sstatus) & riscv.sstatus_sie == 0);
+    spinlock.assertNoneHeld(); // 拿着锁切走的话，别的进程再拿这把锁就会死锁
     switchContext(&p.context, &scheduler_context);
 }
 
@@ -259,15 +357,20 @@ pub fn yield() void {
 /// 当前进程睡在 chan 上，直到别人调用 wakeup(chan)。
 ///
 /// 醒来不代表等的条件已经满足（同一个 chan 上可能有好几个进程在等不同的东西，也可能被 kill 叫醒），
-/// 所以调用方要在循环里检查条件：`while (!条件) sleep(chan);`。
-/// xv6 要传一把锁进来防止“检查完条件、还没睡下时 wakeup 已经发生”（lost wakeup）。这里只有一个 hart，
-/// 进程和调度器都关着中断运行，检查条件到睡下之间不会有中断处理程序插进来，所以不需要锁。
-pub fn sleep(chan: *const anyopaque) void {
+/// 所以调用方要在循环里检查条件：`while (!条件) sleep(chan, lock);`。
+///
+/// lock 是保护这个条件的锁，调用方拿着它检查条件、拿着它调用 sleep；sleep 睡下之后放开它，
+/// 醒来再重新拿上（xv6 的写法）。这样“检查完条件、还没睡下”的时候，改条件的一方（要先拿这把锁）
+/// 插不进来，不会丢掉 wakeup（lost wakeup）。现在只有一个 hart、全程关中断，这一点本来就成立；
+/// 多核时还要在这里拿上进程自己的锁，直到切回调度器为止。条件没有锁保护的（时钟 tick、wait）传 null。
+pub fn sleep(chan: *const anyopaque, lock: ?*Spinlock) void {
     const p = current.?;
     p.chan = chan;
     p.state = .sleeping;
+    if (lock) |l| l.release();
     sched();
     p.chan = null;
+    if (lock) |l| l.acquire();
 }
 
 /// 叫醒所有睡在 chan 上的进程。只改状态，不切换，中断处理程序里也能调用。
@@ -291,6 +394,13 @@ pub fn killCurrent(comptime reason: []const u8, args: anytype) noreturn {
     finish(p, abi.killed_status);
 }
 
+/// 当前进程是否被 kill 了。等待的循环里用它提前返回，回到陷阱处理程序后结束。
+/// 单元测试里没有当前进程，返回 false。
+pub fn isKilled() bool {
+    const p = current orelse return false;
+    return p.killed != null;
+}
+
 /// 当前进程被 kill 过的话就结束它，否则返回。陷阱处理程序回到 U 模式之前、新进程第一次进入 U 模式之前调用，
 /// 所以被杀的进程不会再执行一条用户指令。
 pub fn checkKilled() callconv(.c) void {
@@ -298,12 +408,17 @@ pub fn checkKilled() callconv(.c) void {
     if (p.killed) |reason| killCurrent("{s}", .{reason});
 }
 
-/// 结束当前进程（对应 xv6 的 exit 的后半部分）：子进程交给 init，自己变成 zombie，
+/// 结束当前进程（对应 xv6 的 exit 的后半部分）：关掉打开的文件，子进程交给 init，自己变成 zombie，
 /// 叫醒在 wait 里等的父进程，切回调度器，不再回来。地址空间和槽位由父进程 wait 时回收：
 /// 这时进程还在用自己的内核栈和地址空间，不能自己释放。
+/// 文件要在这里关：管道的写端关了，读的进程才能读到结尾，不能等到父进程来回收。
 fn finish(p: *Process, status: u32) noreturn {
     const init = init_proc.?;
     if (p == init) std.debug.panic("init exited (status {d})", .{status});
+    for (&p.files) |*f| {
+        if (f.*) |x| file.close(x);
+        f.* = null;
+    }
     reparent(p, init);
     p.xstatus = status;
     p.state = .zombie;
@@ -333,7 +448,7 @@ pub fn waitChild(pid: usize, nohang: bool) WaitError!?*Process {
     while (true) {
         if (try findZombieChild(p, pid)) |c| return c;
         if (nohang or p.killed != null) return null;
-        sleep(p);
+        sleep(p, null);
     }
 }
 
@@ -353,6 +468,7 @@ fn findZombieChild(p: *Process, pid: usize) WaitError!?*Process {
 /// 回收 zombie：释放地址空间（所有用户页和页表），腾出槽位。内核栈是静态的，留给下一个用这个槽位的进程。
 pub fn reap(c: *Process) void {
     std.debug.assert(c.state == .zombie);
+    for (c.files) |f| std.debug.assert(f == null); // finish 关掉了
     vm.destroyUserSpace(c.space);
     c.* = .{};
 }
@@ -370,14 +486,26 @@ pub fn kill(pid: usize, reason: []const u8) KillError!void {
     if (p.state == .sleeping) p.state = .runnable;
 }
 
-/// 用户按了 Ctrl-C：杀掉前台进程。没有前台进程（或者它已经结束了）时什么也不做，
-/// 所以在 shell 里随手按的 Ctrl-C 不会留到下一个程序。由串口的中断处理程序调用，
-/// 和 xv6 的 consoleintr 处理控制字符一样。
+/// 用户按了 Ctrl-C：杀掉前台进程和它的所有子孙进程（shell 运行管道时，各个阶段都是前台进程的子进程）。
+/// 没有前台进程（或者它已经结束了）时什么也不做，所以在 shell 里随手按的 Ctrl-C 不会留到下一个程序。
+/// 由串口的中断处理程序调用，和 xv6 的 consoleintr 处理控制字符一样。
+/// kill 只做标记，标记的时候谁也没有结束，父子关系还是完整的，一遍就能找全。
 pub fn interruptForeground() void {
-    const p = findPid(foreground) orelse return;
-    if (p.state == .zombie or p == init_proc) return;
+    const fg = findPid(foreground) orelse return;
+    if (fg.state == .zombie or fg == init_proc) return;
     uart.write("^C\n");
-    kill(p.pid, "interrupted by Ctrl-C") catch unreachable;
+    for (&table) |*p| {
+        if (p.state != .unused and isDescendant(p, fg)) kill(p.pid, "interrupted by Ctrl-C") catch unreachable;
+    }
+}
+
+/// p 是不是 ancestor 自己或者它的子孙。
+fn isDescendant(p: *Process, ancestor: *Process) bool {
+    var q: ?*Process = p;
+    while (q) |x| : (q = x.parent) {
+        if (x == ancestor) return true;
+    }
+    return false;
 }
 
 pub fn findPid(pid: usize) ?*Process {
@@ -447,8 +575,9 @@ fn contextAsm(comptime op: []const u8, comptime base: []const u8) []const u8 {
 
 const LoadError = error{ BadElf, OutOfMemory };
 
-/// 把 ELF 镜像的各个 PT_LOAD 段装进地址空间、映射用户栈，返回入口地址。
-fn load(space: *vm.PageTable, image: []const u8) LoadError!usize {
+/// 把 ELF 镜像的各个 PT_LOAD 段装进地址空间、映射用户栈，返回入口地址和堆的起点
+/// （最后一个段之后的页边界：段的最后一页已经映射了，堆从下一页开始，权限不会和段混在一起）。
+fn load(space: *vm.PageTable, image: []const u8) LoadError!struct { entry: usize, brk: usize } {
     const Ehdr = elf.Elf64.Ehdr;
     const Phdr = elf.Elf64.Phdr;
     if (image.len < @sizeOf(Ehdr)) return error.BadElf;
@@ -460,12 +589,14 @@ fn load(space: *vm.PageTable, image: []const u8) LoadError!usize {
         return error.BadElf;
     }
 
+    var brk: usize = vm.user_base;
     for (0..ehdr.phnum) |i| {
         const offset = std.math.add(usize, ehdr.phoff, i * @sizeOf(Phdr)) catch return error.BadElf;
         if (offset > image.len or image.len - offset < @sizeOf(Phdr)) return error.BadElf;
         const phdr = std.mem.bytesToValue(Phdr, image[offset..][0..@sizeOf(Phdr)]);
         if (phdr.type != .LOAD or phdr.memsz == 0) continue;
         try loadSegment(space, image, phdr);
+        brk = @max(brk, std.mem.alignForward(usize, phdr.vaddr + phdr.memsz, page.size));
     }
 
     var addr = stack_bottom;
@@ -475,7 +606,7 @@ fn load(space: *vm.PageTable, image: []const u8) LoadError!usize {
             error.AlreadyMapped => unreachable, // loadSegment 保证了段都在栈下面
         };
     }
-    return ehdr.entry;
+    return .{ .entry = ehdr.entry, .brk = brk };
 }
 
 fn loadSegment(space: *vm.PageTable, image: []const u8, phdr: elf.Elf64.Phdr) LoadError!void {
@@ -520,7 +651,7 @@ fn testLoad(image: []const u8) !usize {
         vm.destroyUserSpace(space);
         std.testing.expectEqual(before, page.free_pages) catch @panic("leaked pages");
     }
-    const entry = try load(space, image);
+    const entry = (try load(space, image)).entry;
     // 入口可读，栈的两端可读，栈下面的保护页没有映射
     var buf: [2]u8 = undefined;
     try std.testing.expect(entry >= vm.user_base and entry < stack_bottom);
@@ -533,6 +664,35 @@ fn testLoad(image: []const u8) !usize {
 
 test "加载真正的用户程序 hello" {
     _ = try testLoad(@embedFile("hello"));
+}
+
+test "命令行参数复制到栈顶，Arg 数组 16 字节对齐，指向栈上的字节" {
+    const base = @intFromPtr(&test_memory);
+    page.init(base, base + test_memory.len, &.{});
+    vm.kernel_root = @ptrCast(try page.alloc());
+    const hello: Program = .{ .name = "hello", .image = @embedFile("hello") };
+    const image = try loadImage(&hello, &.{ "hello", "", "world!" });
+    defer vm.destroyUserSpace(image.space);
+    try std.testing.expectEqual(3, image.argc);
+    try std.testing.expectEqual(0, image.sp % 16);
+    try std.testing.expect(image.sp < stack_top and stack_top - image.sp <= 64);
+
+    var argv: [3]abi.Arg = undefined;
+    try vm.copyFromUser(image.space, std.mem.sliceAsBytes(&argv), image.sp);
+    const expected = [_][]const u8{ "hello", "", "world!" };
+    for (argv, expected) |a, e| {
+        var buf: [16]u8 = undefined;
+        try std.testing.expect(a.ptr > image.sp and a.ptr + a.len <= stack_top);
+        try vm.copyFromUser(image.space, buf[0..a.len], a.ptr);
+        try std.testing.expectEqualStrings(e, buf[0..a.len]);
+    }
+
+    // 没有参数：sp 就是栈顶
+    const empty = try loadImage(&hello, &.{});
+    defer vm.destroyUserSpace(empty.space);
+    try std.testing.expectEqual(stack_top, empty.sp);
+    // 堆从最后一个段之后的页边界开始
+    try std.testing.expect(image.brk % page.size == 0 and image.brk > vm.user_base and image.brk <= heap_limit);
 }
 
 test "ELF 加载器拒绝坏文件" {

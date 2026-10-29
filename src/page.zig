@@ -6,10 +6,13 @@
 
 const std = @import("std");
 const dtb = @import("dtb.zig");
+const Spinlock = @import("spinlock.zig").Spinlock;
 
 pub const size = 4096;
 pub const Page = [size]u8;
 
+/// 保护 free_list 和 free_pages（多核时几个 hart 会同时分配、释放）
+var lock: Spinlock = .init("page");
 var free_list: std.SinglyLinkedList = .{};
 /// 归分配器管的地址范围，用来检查 free 收到的地址
 var range: dtb.Region = .{ .base = 0, .size = 0 };
@@ -43,9 +46,12 @@ fn isReserved(addr: usize, reserved: []const dtb.Region) bool {
 
 /// 分配一页并清零。
 pub fn alloc() error{OutOfMemory}!*align(size) Page {
-    const node = free_list.popFirst() orelse return error.OutOfMemory;
-    free_pages -= 1;
-    const page: *align(size) Page = @ptrCast(@alignCast(node));
+    lock.acquire();
+    const node = free_list.popFirst();
+    if (node != null) free_pages -= 1;
+    lock.release();
+    // 清零放在锁外面：这一页已经是自己的了
+    const page: *align(size) Page = @ptrCast(@alignCast(node orelse return error.OutOfMemory));
     @memset(page, 0);
     return page;
 }
@@ -55,6 +61,8 @@ pub fn free(page: *align(size) Page) void {
     if (addr < range.base or addr >= range.end()) {
         std.debug.panic("page.free: 0x{x} was not handed out by the page allocator", .{addr});
     }
+    lock.acquire();
+    defer lock.release();
     free_list.prepend(@ptrCast(page));
     free_pages += 1;
 }

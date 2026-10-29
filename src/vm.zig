@@ -196,6 +196,65 @@ pub fn allocUserPage(root: *PageTable, va: usize, perm: Perm) MapError!*align(pa
     return p;
 }
 
+/// 把用户区 [alignForward(old_end), alignForward(new_end)) 的页都映射上（清零，权限 perm），
+/// 用来把一段内存（堆）从 old_end 长到 new_end（old_end < new_end，都按字节算）。
+/// 内存不够时把这次映射上的页都释放掉，地址空间保持原样。
+pub fn growUser(root: *PageTable, old_end: usize, new_end: usize, perm: Perm) error{OutOfMemory}!void {
+    std.debug.assert(old_end <= new_end and new_end <= user_end);
+    const start = std.mem.alignForward(usize, old_end, page.size);
+    var va = start;
+    errdefer shrinkUser(root, va, start);
+    while (va < new_end) : (va += page.size) {
+        _ = allocUserPage(root, va, perm) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.AlreadyMapped => unreachable, // 调用方保证 old_end 之后没有映射
+        };
+    }
+}
+
+/// growUser 反过来：把用户区 [alignForward(new_end), alignForward(old_end)) 的页取消映射并释放
+/// （new_end <= old_end）。因此空出来的第 0 级页表也释放掉：不然堆长到很大再缩回来，
+/// 每 2 MiB 会留下一张空页表，直到进程结束。
+/// 改的可能是正在用的页表，调用方要刷新 TLB。
+pub fn shrinkUser(root: *PageTable, old_end: usize, new_end: usize) void {
+    std.debug.assert(new_end <= old_end);
+    const start = std.mem.alignForward(usize, new_end, page.size);
+    var va = start;
+    while (va < old_end) : (va += page.size) {
+        const pte = leafOf(root, va) orelse unreachable; // growUser 映射过的页
+        page.free(@ptrFromInt(pte.addr()));
+        pte.* = .{};
+    }
+    // 第 1 级页表（整个用户区只有一张）里还有栈的映射，不会空，不用管
+    var region = std.mem.alignBackward(usize, start, levelSize(1));
+    while (region < old_end) : (region += levelSize(1)) {
+        const l2 = root[vpn(region, 2)];
+        if (!l2.v or l2.isLeaf()) continue;
+        const l1: *Pte = &@as(*PageTable, @ptrFromInt(l2.addr()))[vpn(region, 1)];
+        if (!l1.v or l1.isLeaf()) continue;
+        const table: *PageTable = @ptrFromInt(l1.addr());
+        for (table) |pte| {
+            if (pte.v) break;
+        } else {
+            page.free(@ptrCast(@alignCast(table)));
+            l1.* = .{};
+        }
+    }
+}
+
+/// 找到用户地址 va 的第 0 级页表项（已经映射了的 4 KiB 页），没有就返回 null。不分配页表。
+fn leafOf(root: *PageTable, va: usize) ?*Pte {
+    var table = root;
+    var l: u2 = 2;
+    while (l > 0) : (l -= 1) {
+        const pte = table[vpn(va, l)];
+        if (!pte.v or pte.isLeaf()) return null;
+        table = @ptrFromInt(pte.addr());
+    }
+    const pte = &table[vpn(va, 0)];
+    return if (pte.v) pte else null;
+}
+
 /// 复制一个用户地址空间（fork 用）：新建一个地址空间，用户区里每一页都分配一页新的物理内存，
 /// 复制内容，按原来的权限映射到同一个地址。之后两边各改各的，互不影响。
 pub fn cloneUserSpace(src: *PageTable) error{OutOfMemory}!*PageTable {
@@ -280,7 +339,7 @@ pub fn checkUser(root: *PageTable, va: usize, len: usize, write: bool) error{Bad
 }
 
 /// 测试用的“物理内存”：页分配器管理这块数组，页表就建在里面。
-var test_memory: [64 * page.size]u8 align(page.size) = undefined;
+var test_memory: [600 * page.size]u8 align(page.size) = undefined;
 
 fn testInit() void {
     const base = @intFromPtr(&test_memory);
@@ -384,6 +443,50 @@ test "cloneUserSpace 复制每一页的内容和权限，两边互不影响，�
     destroyUserSpace(dst);
     destroyUserSpace(src);
     try std.testing.expectEqual(before, page.free_pages);
+}
+
+test "growUser、shrinkUser 按页映射和释放，内存不够时不留下半截" {
+    testInit();
+    kernel_root = @ptrCast(try page.alloc());
+    const space = try createUserSpace();
+    _ = try allocUserPage(space, user_base, .{ .r = true, .x = true }); // 程序的段
+    const heap = user_base + page.size;
+
+    // 长 1 字节也要映射一整页；再长到页中间，不用新的页
+    try growUser(space, heap, heap + 1, .{ .r = true, .w = true });
+    try copyToUser(space, heap, "x");
+    const one = page.free_pages;
+    try growUser(space, heap + 1, heap + 100, .{ .r = true, .w = true });
+    try std.testing.expectEqual(one, page.free_pages);
+    // 跨过两页的边界
+    try growUser(space, heap + 100, heap + 2 * page.size + 1, .{ .r = true, .w = true });
+    try copyToUser(space, heap + 3 * page.size - 1, "y");
+    try std.testing.expectError(error.BadAddress, copyToUser(space, heap + 3 * page.size, "z"));
+
+    // 缩到页中间：这一页还在，后面两页释放
+    shrinkUser(space, heap + 2 * page.size + 1, heap + 10);
+    try std.testing.expectEqual(one, page.free_pages);
+    try std.testing.expectError(error.BadAddress, copyToUser(space, heap + page.size, "z"));
+    try copyToUser(space, heap + page.size - 1, "z");
+    shrinkUser(space, heap + 10, heap);
+    try std.testing.expectError(error.BadAddress, copyToUser(space, heap, "z"));
+
+    // 跨过 2 MiB 的边界，要一张新的第 0 级页表；缩回来时它也被释放
+    const before = page.free_pages;
+    try growUser(space, heap, heap + (2 << 20), .{ .r = true, .w = true });
+    try copyToUser(space, heap + (2 << 20) - 1, "z");
+    shrinkUser(space, heap + (2 << 20), heap);
+    try std.testing.expectEqual(before, page.free_pages);
+    try std.testing.expectError(error.BadAddress, copyToUser(space, heap + (2 << 20) - 1, "z"));
+
+    // 内存不够：一页都不留，页表也不留
+    var hoard: std.SinglyLinkedList = .{};
+    while (page.free_pages > 3) hoard.prepend(@ptrCast(try page.alloc()));
+    const left = page.free_pages;
+    try std.testing.expectError(error.OutOfMemory, growUser(space, heap, heap + 10 * page.size, .{ .r = true, .w = true }));
+    try std.testing.expectEqual(left, page.free_pages);
+    try std.testing.expectError(error.BadAddress, copyToUser(space, heap, "z"));
+    destroyUserSpace(space);
 }
 
 test "cloneUserSpace 内存不够时不漏页" {

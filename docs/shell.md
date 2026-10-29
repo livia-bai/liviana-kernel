@@ -6,8 +6,9 @@
 
 | shell 做的事 | 用到的系统调用 |
 | --- | --- |
-| 读键盘、回显 | `read`、`write` |
-| 运行程序 | `fork`、`exec`、`wait` |
+| 读键盘、回显 | `read`、`write`（0、1 号 fd，都是串口） |
+| 运行程序（带参数） | `fork`、`exec`、`wait` |
+| 管道 | `pipe`、`close`、`dup` |
 | 前台程序和 Ctrl-C | `setfg` |
 | `ps`、`mem`、`uptime`、`run` 列出程序 | `procinfo`、`meminfo`、`uptime`、`listprog` |
 | `kill`、`shutdown` | `kill`、`shutdown` |
@@ -33,8 +34,8 @@ pub fn main() u8 {
 | --- | --- |
 | `\r` 或 `\n` | 换行，返回这一行 |
 | `0x08`（Backspace）或 `0x7f`（Delete） | 行不为空时删掉最后一个字符，并输出 `\x08 \x08`（光标左移、用空格盖掉、再左移） |
-| 可打印字符 `' '..'~'` | 行没满（64 字节）时追加并回显；满了就忽略 |
-| 其他（包括方向键产生的转义序列、Tab） | 忽略 |
+| 可打印字符 `' '..'~'` | 行没满（128 字节）时追加并回显；满了就忽略 |
+| 其他（包括方向键产生的转义序列、Tab、Ctrl-D） | 忽略。Ctrl-D 单独按时 `read` 返回 0，也忽略 |
 
 - 终端（QEMU `-nographic` 下就是你的终端）处于原始模式，按回车发送的是 `\r`。
 - Ctrl-C 不会被读到：内核在串口中断里就把它截下了（[process.md](process.md#ctrl-c)）。
@@ -44,15 +45,17 @@ pub fn main() u8 {
 ## 前台和后台
 
 ```zig
-fn run(arg: []const u8) void {
+fn run(input: []const u8) void {
+    // 去掉末尾的 &，按 | 和空格拆开（parse），检查每个程序都存在
     ...
-    const pid = sys.fork() catch |err| { ... return; };
+    const pid = sys.fork() catch |err| return forkFailed(err);
     if (pid == 0) {
-        sys.exec(name) catch |err| sys.print("run: cannot load {s}: {s}\n", .{ name, @errorName(err) });
-        sys.exit(127);
+        if (!background) sys.setfg(sys.getpid()) catch {};
+        if (stages.len == 1) execStage(&stages[0]);   // 一个程序：直接 exec 成它
+        sys.exit(runPipeline(stages));                // 管道：这个子进程当“组长”
     }
     if (background) {
-        sys.print("[proc] pid {d} ({s}) started in the background\n", .{ pid, name });
+        sys.print("[proc] pid {d} ({s}) started in the background\n", .{ pid, what });
         return;
     }
     sys.setfg(pid) catch {};
@@ -61,11 +64,55 @@ fn run(arg: []const u8) void {
 }
 ```
 
-- 先用 `listprog` 确认有这个程序，没有就打印 `no such program: NAME` 和程序列表，不 `fork`。
-- `fork` 出子进程，子进程 `exec` 成要运行的程序。`exec` 失败（比如 ELF 不合法）时，子进程打印原因并以 127 结束；这时它还是 shell 的副本，内核打印的名字是 `sh`。
-- **前台**（`run NAME`）：`setfg(pid)` 告诉内核按 Ctrl-C 时杀掉它，然后 `wait(pid)` 睡着等它结束、回收它，再 `setfg(null)`。所以输出顺序是：程序的输出、`[proc] ... exited ...`，然后才是 `> `。
-- **后台**（`run NAME &`）：打印 `[proc] pid N (NAME) started in the background` 后马上回到提示符。它的输出和 shell 的输出会交错在一起，没有作业控制，只能用 `kill` 结束它。后台进程和 shell 谁先运行取决于调度，所以程序的第一行输出可能出现在 `started in the background` 前面。
+- 先用 `listprog` 确认每个程序都有，没有就打印 `no such program: NAME` 和程序列表，不 `fork`。
+- `fork` 出子进程，子进程 `exec` 成要运行的程序，命令行参数就是拆出来的那些词（第一个是程序名，[命令解析](#命令解析)）。`exec` 失败（比如 ELF 不合法）时，子进程打印原因并以 127 结束；这时它还是 shell 的副本，内核打印的名字是 `sh`。
+- **前台**（`run NAME`）：`setfg(pid)` 告诉内核按 Ctrl-C 时杀掉它（和它的子孙），然后 `wait(pid)` 睡着等它结束、回收它，再 `setfg(null)`。子进程在 `exec` 之前也先 `setfg(自己的 pid)`：`fork` 之后先运行父进程还是子进程不一定，只靠父进程登记的话，子进程可能已经开始运行、等着输入了，父进程还没来得及 `setfg`，这时按的 Ctrl-C 没人管。QEMU 测试在 Debug 模式下碰到过一次：`t_read` 打印了 `reading`，测试马上按 Ctrl-C，结果没有任何反应。所以输出顺序是：程序的输出、`[proc] ... exited ...`，然后才是 `> `。
+- **后台**（`run NAME &`）：打印 `[proc] pid N (NAME) started in the background`（管道是 `(pipeline)`）后马上回到提示符。它的输出和 shell 的输出会交错在一起，没有作业控制，只能用 `kill` 结束它。后台进程和 shell 谁先运行取决于调度，所以程序的第一行输出可能出现在 `started in the background` 前面。
 - **回收后台进程**：每次打印提示符之前，`reapBackground` 用 `wait(null, nohang)` 把已经结束的子进程都回收掉。它们的结束信息内核已经打印过了；不回收的话会一直是 zombie，占着进程表的槽位。
+
+## 管道
+
+`run A | B | C`：A 的标准输出接到 B 的标准输入，B 的接到 C 的，最多 4 个程序（`max_stages`：进程表 8 个槽位，init、shell、组长占三个，再留一个余量）。和 xv6 的 `sh` 一样，shell 自己不建管道，而是 fork 一个子进程当**组长**（`runPipeline`），由它来建：
+
+```zig
+for (stages, 0..) |*st, i| {
+    if (!is_last) p = sys.pipe() ...;
+    const pid = sys.fork() ...;
+    if (pid == 0) {
+        if (prev) |fd| { close(stdin); dup(fd); close(fd); }          // 标准输入换成上一个管道的读端
+        if (!is_last) { close(stdout); dup(p[1]); close(p[0]); close(p[1]); }  // 标准输出换成这个管道的写端
+        execStage(st);
+    }
+    if (prev) |fd| close(fd);       // 组长自己不用的那一端都关掉
+    if (!is_last) { close(p[1]); prev = p[0]; }
+}
+// 等所有程序结束，以最后一个程序的退出码结束
+```
+
+- **重定向靠 `close` 再 `dup`**：`dup` 返回编号最小的空闲 fd，刚关掉 0 号，`dup` 出来的就是 0 号（[syscalls.md](syscalls.md#closeduppipe)）。子进程 `exec` 之后打开的文件不变，新程序直接从 0 号读、往 1 号写，不知道自己在管道里。
+- **用不着的一端都要关掉**，包括组长自己手里的：管道的写端只要还有一个开着，读的一方就读不到结尾。比如组长忘了关 `p[1]`，`run echo hi | wc` 里 echo 结束了，wc 也永远等不到结尾。
+- **为什么要组长**：Ctrl-C 只认一个前台进程（`setfg`），内核杀的是前台进程和它的子孙（[process.md](process.md#ctrl-c)）。所有程序都是组长的子进程，把组长设成前台进程，按一次 Ctrl-C 整条管道都结束了。组长是 shell `fork` 出来的，内核打印的名字是 `sh`：
+
+  ```
+  > run echo hello world | wc
+  [proc] pid 60 (echo) exited with code 0
+  1 2 12
+  [proc] pid 61 (wc) exited with code 0
+  [proc] pid 59 (sh) exited with code 0
+  ```
+
+  对 `run cat | wc` 按 Ctrl-C（cat 在等键盘，wc 在等 cat）：
+
+  ```
+  ^C
+  [proc] pid 73 (sh) killed: interrupted by Ctrl-C
+  [proc] pid 74 (cat) killed: interrupted by Ctrl-C
+  [proc] pid 75 (wc) killed: interrupted by Ctrl-C
+  ```
+
+  组长被杀时 cat、wc 还没结束，它们被交给 init，由 init 回收。
+- 组长 `pipe` 或 `fork` 失败时打印原因，关掉已经建好的管道，等已经启动的程序结束，以 1 结束。
+- 前一个程序先结束：后一个程序读完管道里剩下的，读到结尾。后一个程序先结束：前一个程序再写就得到 `BrokenPipe`（`echo` 以 1 结束）。
 
 ## 命令解析
 
@@ -77,8 +124,15 @@ const cmd = std.meta.stringToEnum(Command, name) orelse { ... "unknown command" 
 ```
 
 - 去掉首尾空格；空行什么也不做。
-- 第一个空格之前是命令名，之后是参数（`std.mem.cutScalar` 是 0.17 新增的，返回分割点前后两段）。参数只有 `run` 和 `kill` 用，它们会再去掉首尾空格。
+- 第一个空格之前是命令名，之后是参数（`std.mem.cutScalar` 是 0.17 新增的，返回分割点前后两段）。参数只有 `run` 和 `kill` 用。
 - 命令名用 `std.meta.stringToEnum` 转成 `Command` 枚举，不认识就打印 `unknown command: NAME (try 'help')`。
+
+`run` 的参数再拆一次（`parse`）：
+
+- 末尾的 `&` 表示后台运行，`&` 前面有没有空格都行（`run spin&` 也可以）。
+- 剩下的按 `|` 拆成几段（`std.mem.splitScalar`），每段按空格拆成词（`std.mem.tokenizeScalar`，连续的空格算一个）。第一个词是程序名，所有词（包括程序名）就是它的命令行参数。词是 `line` 里的切片，不复制。
+- 没有引号、没有转义：参数里不能有空格和 `|`。
+- 某一段是空的（`run echo a |`）打印 `run: empty command in the pipeline`；一段超过 16 个词（`abi.max_args`）打印 `run: too many arguments (at most 16)`；超过 4 段打印 `run: too many programs in the pipeline (at most 4)`。
 
 ## 命令
 
@@ -87,9 +141,10 @@ const cmd = std.meta.stringToEnum(Command, name) orelse { ... "unknown command" 
 | `help` | 列出命令 | |
 | `uptime` | 开机时长（`uptime` 系统调用，精度一个 tick） | `up 3.26s` |
 | `mem` | 物理页的使用情况（`meminfo`，[page-allocator.md](page-allocator.md)） | `31600 of 31676 pages free (126400 KiB), 4 KiB each` |
-| `run` | 列出所有用户程序（`listprog`） | `programs: init sh hello fault spin ticker` |
-| `run NAME` | 在前台运行用户程序 `NAME`，等它结束；Ctrl-C 结束它 | 程序自己的输出 + `[proc] pid 3 (hello) exited with code 0` |
-| `run NAME &` | 在后台运行，马上回到提示符 | `[proc] pid 4 (spin) started in the background` |
+| `run` | 列出所有用户程序（`listprog`） | `programs: init sh hello fault spin ticker echo cat wc` |
+| `run NAME [ARGS...]` | 在前台运行用户程序 `NAME`，带上参数，等它结束；Ctrl-C 结束它 | 程序自己的输出 + `[proc] pid 3 (hello) exited with code 0` |
+| `run A \| B \| ...` | 管道（[管道](#管道)） | `run echo one two three \| wc` 打印 `1 3 14` |
+| `run ... &` | 在后台运行，马上回到提示符 | `[proc] pid 4 (spin) started in the background` |
 | `ps` | 列出进程（`procinfo`）：pid、父进程、状态、用掉的时钟 tick 数、名字 | 见下文 |
 | `kill PID` | 结束进程 | `[proc] pid 4 (spin) killed: kill()` |
 | `shutdown` | 打印 `bye!`，通过 SBI 关机，QEMU 退出，退出码 0 | `bye!` |
@@ -98,7 +153,6 @@ const cmd = std.meta.stringToEnum(Command, name) orelse { ... "unknown command" 
 
 - `uptime` 显示 `ms / 1000` 秒和 `ms % 1000 / 10` 百分之一秒（补零到两位），所以 `up 3.05s` 不会显示成 `3.5s`。内核按 tick 计时，百分之一秒正好是 tick 数。
 - 进程表满了打印 `run: too many processes (at most 8)`（`fork` 返回 `TooManyProcesses`；8 是 `abi.max_procs`，其中 init 和 shell 占两个），ELF 加载失败打印 `run: cannot load NAME: BadElf`（或 `OutOfMemory`）。
-- `run` 的参数以 `&` 结尾就是后台运行，`&` 前面有没有空格都行（`run spin&` 也可以）。
 - `ps` 的输出（一个后台的 `spin` 在死循环）：
 
   ```

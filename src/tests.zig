@@ -8,4 +8,7 @@ test {
     _ = @import("page.zig");
     _ = @import("vm.zig");
     _ = @import("proc.zig");
+    _ = @import("spinlock.zig");
+    _ = @import("pipe.zig");
+    _ = @import("file.zig");
 }

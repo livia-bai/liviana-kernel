@@ -9,7 +9,7 @@ pub fn main() u8 {
     var len: usize = 0;
     var calls: usize = 0;
     while (true) {
-        const n = sys.read(line[len..@min(len + 3, line.len)]) catch return 1;
+        const n = sys.read(sys.stdin, line[len..@min(len + 3, line.len)]) catch return 1;
         calls += 1;
         len += n;
         if (n == 0 or line[len - 1] == '\r' or len == line.len) break;

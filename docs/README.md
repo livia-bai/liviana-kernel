@@ -18,7 +18,8 @@ liviana-kernel 的详细文档，按功能组织，讲这个用 Zig 写的 RISC-
 | [page-allocator.md](page-allocator.md) | 物理页分配器 |
 | [paging.md](paging.md) | Sv39 分页：页表格式、建立映射、内核页表、用户地址空间 |
 | [user-programs.md](user-programs.md) | 用户程序：运行时（`start.zig`、`sys.zig`）、示例程序、怎么写新程序 |
-| [process.md](process.md) | 进程：进程表、ELF 加载器、`userinit`/`fork`/`exec`、xv6 式调度（`scheduler`/`sched`/`sleep`/`wakeup`）、切换上下文、`exit`/`wait`/`kill`、Ctrl-C |
+| [process.md](process.md) | 进程：进程表、ELF 加载器、`userinit`/`fork`/`exec`、命令行参数、`sbrk`、xv6 式调度（`scheduler`/`sched`/`sleep`/`wakeup`）、切换上下文、`exit`/`wait`/`kill`、Ctrl-C、锁 |
+| [files.md](files.md) | 文件：fd 表、文件表、串口和管道的读写 |
 | [syscalls.md](syscalls.md) | 系统调用：调用约定、调用列表、访问用户内存、怎么加新调用 |
 | [shell.md](shell.md) | shell（用户程序）：输入处理、前台和后台进程、命令 |
 | [testing.md](testing.md) | 测试与调试：单元测试、QEMU 测试（`tools/qemu_test.py`）、回归测试程序、QEMU 日志、GDB、症状速查 |
@@ -34,13 +35,16 @@ liviana-kernel 的详细文档，按功能组织，讲这个用 Zig 写的 RISC-
 | `src/riscv.zig` | [riscv-sbi.md](riscv-sbi.md) | |
 | `src/sbi.zig` | [riscv-sbi.md](riscv-sbi.md#sbi-调用sbizig) | [devices.md](devices.md#定时器timerzig) |
 | `src/trap.zig` | [trap.md](trap.md) | [process.md](process.md)、[syscalls.md](syscalls.md) |
-| `src/uart.zig` | [devices.md](devices.md#串口uartzig) | [process.md](process.md#sleepwakeup) |
+| `src/uart.zig` | [devices.md](devices.md#串口uartzig) | [files.md](files.md#串口) |
 | `src/plic.zig` | [devices.md](devices.md#plicpliczig) | |
 | `src/timer.zig` | [devices.md](devices.md#定时器timerzig) | |
 | `src/dtb.zig` | [devicetree.md](devicetree.md) | |
 | `src/page.zig` | [page-allocator.md](page-allocator.md) | |
 | `src/vm.zig` | [paging.md](paging.md) | [syscalls.md](syscalls.md#访问用户内存) |
 | `src/proc.zig` | [process.md](process.md) | |
+| `src/spinlock.zig` | [process.md](process.md#锁) | |
+| `src/file.zig` | [files.md](files.md) | [syscalls.md](syscalls.md#closeduppipe) |
+| `src/pipe.zig` | [files.md](files.md#管道) | |
 | `src/syscall.zig` | [syscalls.md](syscalls.md) | [process.md](process.md) |
 | `src/abi.zig` | [syscalls.md](syscalls.md#abizig) | [build.md](build.md#用户程序) |
 | `user/start.zig` | [user-programs.md](user-programs.md#startzig) | |
@@ -49,6 +53,7 @@ liviana-kernel 的详细文档，按功能组织，讲这个用 Zig 写的 RISC-
 | `user/init.zig` | [user-programs.md](user-programs.md#init-和-sh) | [process.md](process.md#结束进程) |
 | `user/sh.zig` | [shell.md](shell.md) | [user-programs.md](user-programs.md#init-和-sh) |
 | `user/hello.zig`、`user/fault.zig`、`user/spin.zig`、`user/ticker.zig` | [user-programs.md](user-programs.md#示例程序) | |
+| `user/echo.zig`、`user/cat.zig`、`user/wc.zig` | [user-programs.md](user-programs.md#echocatwc) | [shell.md](shell.md#管道) |
 | `user/tests/*.zig`、`user/tests/noperm.ld` | [testing.md](testing.md#回归测试程序) | [build.md](build.md#用户程序) |
 | `src/tests.zig` | [testing.md](testing.md#单元测试zig-build-test) | [build.md](build.md#单元测试) |
 | `tools/qemu_test.py` | [testing.md](testing.md#qemu-测试toolsqemu_testpy) | |

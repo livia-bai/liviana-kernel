@@ -1,7 +1,8 @@
 //! shell：读一行命令，执行，再读下一行。由 init 启动，对应 xv6 的 user/sh.c（简化得多）。
 //!
-//! 它是一个普通的用户程序，内核里的功能都通过系统调用使用：`run` 用 fork + exec 启动程序，
+//! 它是一个普通的用户程序，内核里的功能都通过系统调用使用：`run` 用 fork + exec 启动程序（带上命令行参数），
 //! 前台运行时用 setfg 告诉内核按 Ctrl-C 该杀谁，再 wait 它结束；`ps`、`mem` 用 procinfo、meminfo。
+//! `run a | b | c` 用 pipe、dup、close 把前一个程序的标准输出接到后一个程序的标准输入。
 //! 键盘输入用 read 一个字节一个字节地读，回显和退格都由 shell 自己做。
 
 const std = @import("std");
@@ -10,7 +11,10 @@ const abi = sys.abi;
 
 const Command = enum { help, uptime, mem, run, ps, kill, shutdown };
 
-var line: [64]u8 = undefined;
+var line: [128]u8 = undefined;
+
+/// 一个管道最多几个程序。进程表只有 abi.max_procs 个槽位，init、shell 和管道的“组长”（见 runPipeline）占三个。
+const max_stages = 4;
 
 pub fn main() u8 {
     sys.print("Type 'help' for commands.\n", .{});
@@ -27,7 +31,8 @@ fn readLine() []const u8 {
     var len: usize = 0;
     while (true) {
         var c: [1]u8 = undefined;
-        _ = sys.read(&c) catch continue; // 缓冲区在自己的栈上，不会出错
+        // 缓冲区在自己的栈上，不会出错。读到 0 是按了 Ctrl-D，忽略
+        if ((sys.read(sys.stdin, &c) catch 0) == 0) continue;
         switch (c[0]) {
             '\r', '\n' => {
                 sys.print("\n", .{});
@@ -67,8 +72,10 @@ fn execute(input: []const u8) void {
             \\help        show this message
             \\uptime      time since boot
             \\mem         free physical pages
-            \\run NAME    run a user program and wait for it (without NAME: list them)
-            \\run NAME &  run it in the background
+            \\run NAME [ARGS...]
+            \\            run a user program and wait for it (without NAME: list them)
+            \\run A | B   run A and B with A's output piped into B (up to 4 programs)
+            \\run ... &   run it in the background
             \\ps          list processes
             \\kill PID    kill a process
             \\shutdown    power off through SBI
@@ -94,35 +101,152 @@ fn execute(input: []const u8) void {
     }
 }
 
-fn run(arg: []const u8) void {
-    // 末尾的 & 表示后台运行
-    const background = std.mem.endsWith(u8, arg, "&");
-    const name = std.mem.trim(u8, if (background) arg[0 .. arg.len - 1] else arg, " ");
-    if (!programExists(name)) {
-        if (name.len != 0) sys.print("no such program: {s}\n", .{name});
-        listPrograms();
-        return;
+/// 一个要运行的程序：程序名是 args[0]。
+const Stage = struct {
+    args: [sys.abi.max_args][]const u8 = undefined,
+    argc: usize = 0,
+
+    fn name(st: *const Stage) []const u8 {
+        return st.args[0];
     }
-    const pid = sys.fork() catch |err| {
-        switch (err) {
-            error.TooManyProcesses => sys.print("run: too many processes (at most {d})\n", .{abi.max_procs}),
-            else => sys.print("run: cannot fork: {s}\n", .{@errorName(err)}),
+};
+
+const ParseError = error{ EmptyCommand, TooManyArguments, TooManyStages };
+
+/// 把 run 的参数拆成用 | 隔开的几段，每段按空格拆成命令行参数。参数是 line 里的切片。
+fn parse(arg: []const u8, stages: *[max_stages]Stage) ParseError![]Stage {
+    var n: usize = 0;
+    var parts = std.mem.splitScalar(u8, arg, '|');
+    while (parts.next()) |part| {
+        if (n == max_stages) return error.TooManyStages;
+        const st = &stages[n];
+        st.* = .{};
+        var words = std.mem.tokenizeScalar(u8, part, ' ');
+        while (words.next()) |w| {
+            if (st.argc == st.args.len) return error.TooManyArguments;
+            st.args[st.argc] = w;
+            st.argc += 1;
         }
+        if (st.argc == 0) return error.EmptyCommand;
+        n += 1;
+    }
+    return stages[0..n];
+}
+
+fn run(input: []const u8) void {
+    // 末尾的 & 表示后台运行
+    const trimmed = std.mem.trim(u8, input, " ");
+    const background = std.mem.endsWith(u8, trimmed, "&");
+    const arg = std.mem.trim(u8, if (background) trimmed[0 .. trimmed.len - 1] else trimmed, " ");
+    if (arg.len == 0) return listPrograms();
+    var buf: [max_stages]Stage = undefined;
+    const stages = parse(arg, &buf) catch |err| {
+        sys.print("run: {s}\n", .{switch (err) {
+            error.EmptyCommand => "empty command in the pipeline",
+            error.TooManyArguments => std.fmt.comptimePrint("too many arguments (at most {d})", .{abi.max_args}),
+            error.TooManyStages => std.fmt.comptimePrint("too many programs in the pipeline (at most {d})", .{max_stages}),
+        }});
         return;
     };
-    if (pid == 0) {
-        // 子进程：换成要运行的程序。失败时（比如 ELF 不合法）说明原因，以 127 结束
-        sys.exec(name) catch |err| sys.print("run: cannot load {s}: {s}\n", .{ name, @errorName(err) });
-        sys.exit(127);
+    for (stages) |*st| {
+        if (!programExists(st.name())) {
+            sys.print("no such program: {s}\n", .{st.name()});
+            listPrograms();
+            return;
+        }
     }
+    // 只有一个程序时子进程直接 exec 成它；管道由一个子进程（“组长”）去建，见 runPipeline
+    const pid = sys.fork() catch |err| return forkFailed(err);
+    if (pid == 0) {
+        // 前台的话子进程自己先登记成前台进程，再 exec：父进程的 setfg 可能晚于子进程开始运行
+        // （fork 之后先调度谁不一定），那样程序刚开始运行时按的 Ctrl-C 就没人管了
+        if (!background) sys.setfg(sys.getpid()) catch {};
+        if (stages.len == 1) execStage(&stages[0]);
+        sys.exit(runPipeline(stages));
+    }
+    const what = if (stages.len == 1) stages[0].name() else "pipeline";
     if (background) {
-        sys.print("[proc] pid {d} ({s}) started in the background\n", .{ pid, name });
+        sys.print("[proc] pid {d} ({s}) started in the background\n", .{ pid, what });
         return;
     }
-    // 前台：按 Ctrl-C 时内核杀掉它。等它结束、回收之后再打印提示符
+    // 前台：按 Ctrl-C 时内核杀掉它（和它的子孙，也就是管道里的各个程序）。等它结束、回收之后再打印提示符
     sys.setfg(pid) catch {};
     _ = sys.wait(pid, false) catch {};
     sys.setfg(null) catch {};
+}
+
+fn forkFailed(err: sys.ForkError) void {
+    switch (err) {
+        error.TooManyProcesses => sys.print("run: too many processes (at most {d})\n", .{abi.max_procs}),
+        else => sys.print("run: cannot fork: {s}\n", .{@errorName(err)}),
+    }
+}
+
+/// 在子进程里换成要运行的程序。失败时（比如 ELF 不合法）说明原因，以 127 结束。
+fn execStage(st: *const Stage) noreturn {
+    sys.exec(st.name(), st.args[0..st.argc]) catch |err| sys.print("run: cannot load {s}: {s}\n", .{ st.name(), @errorName(err) });
+    sys.exit(127);
+}
+
+/// 管道的“组长”（shell fork 出来的子进程，和 xv6 的 sh 一样）：依次 fork 出每个程序，
+/// 第 i 个程序的标准输出接到一个新管道的写端，第 i+1 个程序的标准输入接到它的读端，然后等它们全部结束。
+/// 返回最后一个程序的退出码（被杀了是 255），出错时是 1。
+///
+/// 各个程序都是组长的子进程，shell 把组长设为前台进程，按 Ctrl-C 时内核把组长和它们一起杀掉。
+/// 组长自己必须关掉管道的两端：写端还开着的话，后面的程序永远读不到结尾。
+fn runPipeline(stages: []Stage) u8 {
+    var prev: ?sys.Fd = null; // 上一个程序输出的管道的读端
+    var started: usize = 0;
+    var last: usize = 0;
+    var failed = false;
+    for (stages, 0..) |*st, i| {
+        const is_last = i == stages.len - 1;
+        var p: [2]sys.Fd = undefined;
+        if (!is_last) p = sys.pipe() catch |err| {
+            sys.print("run: cannot create a pipe: {s}\n", .{@errorName(err)});
+            failed = true;
+            break;
+        };
+        const pid = sys.fork() catch |err| {
+            forkFailed(err);
+            if (!is_last) {
+                sys.close(p[0]) catch {};
+                sys.close(p[1]) catch {};
+            }
+            failed = true;
+            break;
+        };
+        if (pid == 0) {
+            // close 再 dup：dup 返回最小的空闲 fd，正好是刚关掉的 0 或 1
+            if (prev) |fd| {
+                sys.close(sys.stdin) catch {};
+                _ = sys.dup(fd) catch {};
+                sys.close(fd) catch {};
+            }
+            if (!is_last) {
+                sys.close(sys.stdout) catch {};
+                _ = sys.dup(p[1]) catch {};
+                sys.close(p[0]) catch {};
+                sys.close(p[1]) catch {};
+            }
+            execStage(st);
+        }
+        started += 1;
+        last = pid;
+        if (prev) |fd| sys.close(fd) catch {};
+        prev = null;
+        if (!is_last) {
+            sys.close(p[1]) catch {};
+            prev = p[0];
+        }
+    }
+    if (prev) |fd| sys.close(fd) catch {};
+    var code: u8 = 1;
+    for (0..started) |_| {
+        const r = (sys.wait(null, false) catch break) orelse break;
+        if (r.pid == last and !failed) code = @intCast(@min(r.status, 255));
+    }
+    return code;
 }
 
 fn programExists(name: []const u8) bool {

@@ -87,6 +87,7 @@ const UserProgram = struct {
 const user_programs = [_]UserProgram{
     .{ .name = "init" },  .{ .name = "sh" },   .{ .name = "hello" },
     .{ .name = "fault" }, .{ .name = "spin" }, .{ .name = "ticker" },
+    .{ .name = "echo" },  .{ .name = "cat" },  .{ .name = "wc" },
 };
 const test_programs = [_]UserProgram{
     .{ .name = "t_sys", .dir = "user/tests" },
@@ -172,6 +173,9 @@ pub const user_programs: []const []const u8 = &[_][]const u8{
     "fault",
     "spin",
     "ticker",
+    "echo",
+    "cat",
+    "wc",
 };
 ```
 

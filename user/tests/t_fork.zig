@@ -61,7 +61,7 @@ fn orphanMaker() u8 {
 
 fn execHello() u8 {
     sys.print("child pid {d} execs hello\n", .{sys.getpid()});
-    sys.exec("hello") catch {};
+    sys.exec("hello", &.{"hello"}) catch {};
     return 1;
 }
 
@@ -114,10 +114,10 @@ pub fn main() u8 {
     check(sys.setfg(9999) == error.NoSuchProcess, "setfg a missing pid", .{});
 
     // exec：失败时原来的程序照常运行；成功时 pid 不变
-    check(sys.exec("nope") == error.NoSuchProgram, "exec a missing program", .{});
+    check(sys.exec("nope", &.{}) == error.NoSuchProgram, "exec a missing program", .{});
     const long_name: [40]u8 = @splat('x');
-    check(sys.exec(&long_name) == error.NoSuchProgram, "exec a too-long name", .{});
-    check(sys.exec("t_noperm") == error.BadElf, "exec a bad ELF", .{});
+    check(sys.exec(&long_name, &.{}) == error.NoSuchProgram, "exec a too-long name", .{});
+    check(sys.exec("t_noperm", &.{}) == error.BadElf, "exec a bad ELF", .{});
     check(errno(sys.syscall(.exec, 0x8020_0000, 5, 0)) == .fault, "exec with a bad name pointer", .{});
     {
         const pid = spawn(execHello);
@@ -175,8 +175,8 @@ pub fn main() u8 {
         check(sys.syscall(.listprog, 0, @intFromPtr(&buf), 2) == "init".len, "listprog returns the full length", .{});
         check(sys.listprog(1000, &buf) == null, "listprog out of range", .{});
     }
-    check(errno(sys.syscall(.read, 0x8020_0000, 4, 0)) == .fault, "read into kernel memory", .{});
-    check(sys.syscall(.read, 0, 0, 0) == 0, "read of length 0", .{});
+    check(errno(sys.syscall(.read, sys.stdin, 0x8020_0000, 4)) == .fault, "read into kernel memory", .{});
+    check(sys.syscall(.read, sys.stdin, 0, 0) == 0, "read of length 0", .{});
 
     sys.print("{d} checks, {d} failed\n", .{ checks, failures });
     return failures;

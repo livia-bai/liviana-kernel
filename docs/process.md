@@ -1,13 +1,14 @@
 # 进程：创建、调度和结束
 
-涉及文件：`src/proc.zig`（以及 `src/trap.zig` 的 `trapExit`、`src/vm.zig` 的用户地址空间函数；调用方：`src/main.zig`、`src/trap.zig`、`src/syscall.zig`）
+涉及文件：`src/proc.zig`（以及 `src/trap.zig` 的 `trapExit`、`src/vm.zig` 的用户地址空间函数、`src/spinlock.zig`；调用方：`src/main.zig`、`src/trap.zig`、`src/syscall.zig`、`src/file.zig`、`src/pipe.zig`）
 
 进程表里最多同时有 8 个进程，按时间片轮转（round-robin）抢占式调度。进程的创建、调度和结束都照搬 [xv6](https://github.com/mit-pdos/xv6-riscv)（`kernel/proc.c`）的结构：
 
 - **第一个进程 init 由内核创建**（`userinit`），pid 1。之后的进程都是 `fork` 出来的：init 用 `fork` + `exec` 启动 shell，shell 再用同样的办法运行程序（[user-programs.md](user-programs.md#init-和-sh)）。
 - **调度器 `proc.scheduler()` 只管调度**。`kmain` 初始化完之后调用它，它在启动栈上永远循环：依次扫描进程表，遇到 `runnable` 的进程就切过去，等它切回来再接着往下扫。
 - **进程自己让出 CPU**：先改自己的状态，再调用 `sched()` 切回调度器。时间片用完（`yield`）、等某件事（`sleep`）、结束（`exit`）都是这样。进程之间从不直接切换。
-- **等待用 `sleep(chan)` / `wakeup(chan)`**：`chan` 是任意一个地址，代表“在等什么”。
+- **等待用 `sleep(chan, lock)` / `wakeup(chan)`**：`chan` 是任意一个地址，代表“在等什么”；`lock` 是保护等待条件的锁。
+- **每个进程有自己的 fd 表**，指向全局文件表里的串口或管道（[files.md](files.md)）。`fork` 复制，`exec` 保留，结束时全部关掉。
 - **结束的进程变成 zombie，由父进程 `wait` 回收**。父进程先结束的，子进程交给 init。
 - **`kill` 只做标记**，被杀的进程回到 U 模式之前自己结束。
 
@@ -52,6 +53,9 @@ pub const Process = struct {
     killed: ?[]const u8 = null,        // 被 kill 了的话是原因
     xstatus: u32 = 0,                  // zombie 的结束状态，父进程 wait 时取走
     ticks: u64 = 0,                    // 在 U 模式运行期间来过的时钟中断数
+    files: [abi.max_fds]?*file.File = @splat(null),  // 打开的文件，下标就是 fd
+    heap_start: usize = 0,             // 堆的起点（最后一个段之后的页边界）
+    brk: usize = 0,                    // 堆的末尾，sbrk 调整
 };
 
 pub var table: [max_procs]Process = @splat(.{});
@@ -71,15 +75,16 @@ var scheduler_context: Context = undefined;  // 调度器切到进程时保存�
 | `unused` | `runnable` | 启动时创建 init；`fork` 系统调用 | `userinit`、`fork` |
 | `runnable` | `running` | 调度器扫到它 | `scheduler` |
 | `running` | `runnable` | 时钟中断打断了 U 模式（时间片用完），或者 `yield` 系统调用 | `yield` |
-| `running` | `sleeping` | 等某件事：`sleep` 系统调用等时钟，`read` 等键盘，`wait` 等子进程结束 | `sleep` |
-| `sleeping` | `runnable` | 等的事发生了（时钟中断、串口中断、子进程结束），或者被 kill | `wakeup`、`kill` |
+| `running` | `sleeping` | 等某件事：`sleep` 系统调用等时钟，`read` 等键盘或管道里的数据，`write` 等管道腾出空间，`wait` 等子进程结束 | `sleep` |
+| `sleeping` | `runnable` | 等的事发生了（时钟中断、串口中断、管道被读写或关掉、子进程结束），或者被 kill | `wakeup`、`kill` |
 | `running` | `zombie` | `exit` 系统调用，或者 U 模式下出了异常，或者发现自己被 kill 了 | `exit`、`killCurrent`（经 `finish`） |
 | `zombie` | `unused` | 父进程 `wait` 到它 | `reap` |
 
 - **每个进程一块 16 KiB 的内核栈**，静态分配在 `.bss` 里（8 块共 128 KiB）。不从页分配器要：它一次只给一页，给不出连续的 16 KiB。实测 Debug 模式下跑完全部 QEMU 测试，最深用了 6463 字节，small 模式下 1127 字节。测法：`.bss` 启动时清零，`shutdown` 时从每块栈的底部找第一个不为 0 的字节，取最大值（临时加的代码，没有留在仓库里）。内核栈两侧没有保护页：内核内存是用大页恒等映射的，要在中间挖出不映射的页得拆大页，现在没做。
 - init 和 shell 一直占着两个槽位，所以同时最多运行 6 个别的程序。
 - `current` 只在 `scheduler` 切到进程前设置、切回来后清回 `null`。系统调用和陷阱处理程序用 `current.?` 取当前进程，Debug/safe 模式下没有进程时会 panic。
-- **不需要锁**：只有一个 hart，进程在内核里和调度器都关着中断运行，中断只在 U 模式和调度器开头那一下才会进来。中断处理程序对进程表只做 `wakeup`、`kill`（只改状态和标志）和给 `current.ticks` 加 1。xv6 每个进程一把锁，是因为它有多个 CPU，而且内核里也开着中断。
+- **进程表还没有加锁**：只有一个 hart，进程在内核里和调度器都关着中断运行，中断只在 U 模式和调度器开头那一下才会进来。中断处理程序对进程表只做 `wakeup`、`kill`（只改状态和标志）和给 `current.ticks` 加 1。别的共享数据（页分配器、文件表、管道、串口的输入缓冲区）已经加了自旋锁，为多核做准备，见[锁](#锁)。
+- **`files` 不用加锁**：只有进程自己会改它（`close`/`dup`/`pipe` 系统调用、`fork` 时复制给子进程、结束时关掉），没有线程，别的进程碰不到。
 
 ## 用户地址空间
 
@@ -88,9 +93,10 @@ var scheduler_context: Context = undefined;  // 调度器切到进程时保存�
 | 用户地址 | 内容 | 权限 |
 | --- | --- | --- |
 | `0x4000_0000` 起 | ELF 的各个 PT_LOAD 段（代码 / 只读数据 / 数据和 `.bss`） | 按程序头：`R-X` / `R--` / `RW-`，都带 U |
+| 紧接着最后一个段之后的页边界（`heap_start`）到 `brk` | 堆，`sbrk` 调整（[sbrk](#sbrk堆)），一开始是空的 | `RW-`，带 U |
 | …… | 不映射 | |
 | `0x7fff_b000..0x7fff_c000` | 保护页，不映射 | 栈溢出时触发缺页异常，而不是悄悄踩坏别的数据 |
-| `0x7fff_c000..0x8000_0000` | 用户栈，16 KiB（4 页） | `RW-`，带 U |
+| `0x7fff_c000..0x8000_0000` | 用户栈，16 KiB（4 页）。最顶上是 `exec` 传进来的命令行参数（[命令行参数](#命令行参数)） | `RW-`，带 U |
 
 运行 `hello`（Debug 模式）时在 `syscall.dispatch` 处停下，用 GDB 的 `monitor info mem` 看到的完整映射：
 
@@ -115,7 +121,7 @@ vaddr            paddr            size             attr
 ## ELF 加载器
 
 ```zig
-fn load(space: *vm.PageTable, image: []const u8) LoadError!usize   // 返回入口地址
+fn load(space: *vm.PageTable, image: []const u8) LoadError!struct { entry: usize, brk: usize }  // 入口地址、堆的起点
 fn loadSegment(space: *vm.PageTable, image: []const u8, phdr: elf.Elf64.Phdr) LoadError!void
 const LoadError = error{ BadElf, OutOfMemory };
 ```
@@ -152,17 +158,19 @@ ELF 是构建时嵌进来的，按理是可信的；但加载器按“输入可�
 
 所有段加载完后，映射用户栈：`[栈底, 0x8000_0000)` 的 4 页，`RW-`。前面已经保证段都在保护页之下，所以这里不会 `AlreadyMapped`（写成 `unreachable`）。
 
+返回值里的 `brk` 是**所有段的末尾按页向上取整后的最大值**，也就是堆的起点。段的最后一页已经整页映射了（权限是那个段的，比如只读），堆从下一页开始，堆里的页都是 `RW-`，不会和段的权限混在一起。
+
 ## 创建进程
 
 ```zig
-pub const SpawnError = error{ TooManyProcesses, OutOfMemory, BadElf };
+pub const SpawnError = error{ TooManyProcesses, OutOfMemory, BadElf, TooManyFiles };
 pub fn userinit() SpawnError!void                          // kmain 调用，创建 init
 
 pub const ForkError = error{ TooManyProcesses, OutOfMemory };
 pub fn fork() ForkError!usize                              // fork 系统调用，返回子进程的 pid
 
 pub const ExecError = error{ NoSuchProgram, OutOfMemory, BadElf };
-pub fn exec(name: []const u8) ExecError!void               // exec 系统调用
+pub fn exec(name: []const u8, args: []const []const u8) ExecError!void   // exec 系统调用
 ```
 
 三个函数都要准备一个“下次被调度时从哪里开始”的状态。用户进程第一次被调度时的路径都一样：
@@ -189,9 +197,9 @@ scheduler → switchContext ─ret→ forkret → checkKilled → trapExit ─sr
 
 ### userinit
 
-和 xv6 的 `userinit` 一样，只在启动时调用一次：找一个空槽位；`vm.createUserSpace()` 新建地址空间（复制内核的根页表），`load` 加载嵌在内核里的 `init` 程序（[ELF 加载器](#elf-加载器)）；用 `startFrame(frame, entry)` 构造从入口开始运行的 `TrapFrame`；状态设为 `runnable`，pid 是 1，记进 `init_proc`。没有 `init` 程序是构建配置错了，直接 `@panic`；其他错误 `kmain` 会 panic。
+和 xv6 的 `userinit` 一样，只在启动时调用一次：找一个空槽位；`loadImage` 新建地址空间（`vm.createUserSpace()`，复制内核的根页表）、加载嵌在内核里的 `init` 程序（[ELF 加载器](#elf-加载器)）、把命令行参数 `"init"` 放到栈顶（[命令行参数](#命令行参数)）；**打开串口作为 0、1、2 号 fd**（一个 `File`，引用数 3，[files.md](files.md)），之后所有进程都从 init `fork` 继承它们；用 `startFrame(frame, image)` 构造从入口开始运行的 `TrapFrame`；状态设为 `runnable`，pid 是 1，记进 `init_proc`。没有 `init` 程序是构建配置错了，直接 `@panic`；其他错误 `kmain` 会 panic。
 
-`startFrame` 构造的 `TrapFrame`：所有寄存器为 0，`sepc` = 入口地址，`regs[2]`（`sp`）= `0x8000_0000`，`sstatus = (当前 sstatus & ~(SPP | SIE)) | SPIE`：
+`startFrame` 构造的 `TrapFrame`：`sepc` = 入口地址，`sp`（`regs[2]`）和 `a1`（`regs[11]`）= 栈上 `Arg` 数组的地址，`a0`（`regs[10]`）= `argc`，其他寄存器为 0，`sstatus = (当前 sstatus & ~(SPP | SIE)) | SPIE`：
 
 - `SPP = 0` 让 `sret` 回到 U 模式；`SPIE = 1` 让 U 模式下中断是开着的（时钟和键盘照常工作，抢占和 Ctrl-C 都靠它）。
 - **`SIE` 必须清掉**：`trapExit` 第一步就把 `frame.sstatus` 写回 `sstatus`，`SIE = 1` 的话恢复寄存器的途中就可能被中断打断，而那时 `sscratch` 已经指向进程的内核栈，栈和寄存器都是一半新一半旧的状态。内核代码都是关着中断运行的，读到的 `SIE` 本来就是 0，但不依赖这一点（更早的版本里 shell 在内核里开着中断调用过这里，踩过这个坑）。
@@ -208,7 +216,9 @@ pub fn fork() ForkError!usize {
     frame.* = frameOf(parent).*;
     frame.regs[10] = 0;
     child.* = .{ .state = .runnable, .pid = next_pid, .name = parent.name, .space = space,
-                 .parent = parent, .context = firstContext(child) };
+                 .parent = parent, .context = firstContext(child),
+                 .heap_start = parent.heap_start, .brk = parent.brk };
+    for (&child.files, parent.files) |*c, f| c.* = if (f) |x| file.dup(x) else null;
     next_pid += 1;
     return child.pid;
 }
@@ -216,30 +226,71 @@ pub fn fork() ForkError!usize {
 
 - **地址空间逐页复制**（`vm.cloneUserSpace`，[paging.md](paging.md#复制用户地址空间)）：子进程的每一页都是新分配的，内容和权限和父进程一样，之后各改各的。没有写时复制（copy-on-write）。
 - **`TrapFrame` 原样复制**，只把 `a0` 改成 0。`fork` 是在系统调用里调用的，这时 `handleTrap` 已经把父进程 `TrapFrame` 的 `sepc` 加过 4 了，所以子进程第一次被调度时，经 `forkret` → `trapExit` 回到 U 模式，正好从 `ecall` 的下一条指令继续，看到 `fork` 返回了 0。父进程照常从系统调用返回，`a0` 是子进程的 pid。
+- **打开的文件和父进程共用**：fd 表逐项复制，每个 `File` 的引用数加 1（`file.dup`），所以父子进程的 fd 指向同一个串口、同一个管道的同一端。shell 运行管道就靠这个（[shell.md](shell.md#管道)）。`dup` 只加引用数，不会失败。
+- 堆（`heap_start`、`brk`）也照抄，堆里的页随地址空间一起复制了。
 - 进程表满了是 `TooManyProcesses`，`fork` 系统调用返回 `-EAGAIN`；内存不够是 `OutOfMemory`（`-ENOMEM`），`cloneUserSpace` 自己释放已经复制的部分。
 
 ### exec
 
 ```zig
-pub fn exec(name: []const u8) ExecError!void {
+pub fn exec(name: []const u8, args: []const []const u8) ExecError!void {
     const p = current.?;
     const program = find(name) orelse return error.NoSuchProgram;
-    const space = try vm.createUserSpace();
-    errdefer vm.destroyUserSpace(space);
-    const entry = try load(space, program.image);
+    const image = try loadImage(program, args);   // 新地址空间 + 加载 + 参数放到栈顶
     const old = p.space;
-    p.space = space;
-    vm.activate(space);
+    p.space = image.space;
+    vm.activate(image.space);
     vm.destroyUserSpace(old);
     p.name = program.name;
-    startFrame(frameOf(p), entry);
+    p.heap_start = image.brk;
+    p.brk = image.brk;
+    startFrame(frameOf(p), image);
 }
 ```
 
 - 先把新程序完整加载进**新的**地址空间，全部成功之后才换掉旧的。失败时旧的地址空间和 `TrapFrame` 都没动，系统调用返回错误，原来的程序接着运行（xv6 也是这样）。
+- `args` 已经在**内核内存**里了：参数在旧的地址空间里，换掉之前 `exec` 系统调用就把它们复制到了内核栈上（[syscalls.md](syscalls.md#exec)）。
 - **释放旧的页表之前必须先切走**：这时 `satp` 还指着旧的根页表。
-- 改写 `TrapFrame`：从新程序的入口开始，寄存器全为 0。系统调用返回值写进 `a0` 的是 0，所以新程序看到的寄存器除了 `sp` 都是 0，和 init 第一次运行时一样。
-- pid、父进程、`ticks`、`killed` 都不变；名字换成新程序的。
+- 改写 `TrapFrame`：从新程序的入口开始，`a1`、`sp` 指向参数，其他寄存器为 0。系统调用返回值会写进 `a0`，所以 `exec` 系统调用成功时返回 `argc`，新程序看到 `a0 = argc`，和 init 第一次运行时一样。
+- pid、父进程、`ticks`、`killed`、**打开的文件**都不变；名字换成新程序的；堆重新从新程序的段之后开始（空的）。
+
+### 命令行参数
+
+```zig
+fn pushArgs(space: *vm.PageTable, args: []const []const u8) usize   // 返回栈上 Arg 数组的地址
+
+pub const Arg = extern struct { ptr: usize, len: usize };            // abi.zig
+pub const max_args = 16;
+pub const max_arg_bytes = 1024;
+```
+
+`exec` 把参数复制到新地址空间的栈顶，布局是：
+
+```
+0x8000_0000（stack_top）
+参数的字节        依次往下放：第 0 个在最上面。不以 0 结尾（长度在 Arg 里）
+（向下对齐到 16）
+Arg 数组          argc 个 { ptr, len }，ptr 是上面那些字节的用户地址   ← sp、a1
+```
+
+- 新程序的 `sp` 就从 `Arg` 数组的地址开始，往下才是真正的栈。`Arg` 数组的地址按 16 字节对齐（RISC-V 调用约定要求 `sp` 16 字节对齐）。
+- 和 C 不一样，参数不以 0 结尾、`argv` 数组后面也没有 `NULL`：Zig 用切片，长度和指针一起传，`user/start.zig` 直接把它变成 `[]const abi.Arg`（[user-programs.md](user-programs.md#startzig)）。
+- 最多 16 个参数、加起来最多 1024 字节，所以整块不到 1.3 KiB，栈最顶上那一页一定放得下，`copyToUser` 不会失败（写成 `unreachable`）；剩下的 14 KiB 多给程序当栈用。上限由 `exec` 系统调用检查，超出返回 `-E2BIG`。
+- 用 `loadImage(&hello, &.{ "hello", "", "world!" })` 的单元测试检查了布局：16 字节对齐，每个 `Arg` 指向栈上正确的字节，没有参数时 `sp` 就是栈顶。
+
+### sbrk：堆
+
+```zig
+pub fn sbrk(increment: isize) SbrkError!usize   // 返回原来的 brk
+pub const SbrkError = error{ OutOfMemory, InvalidArgument };
+```
+
+照 xv6 的 `growproc`：堆是 `[heap_start, brk)`，`brk` 按字节记，映射按页。
+
+- **变大**：`vm.growUser` 把 `[alignForward(旧 brk), alignForward(新 brk))` 的页都映射上，清零、`RW-`。`brk` 还在已经映射的那一页里时不用新的页。物理内存不够时把这次映射的页都释放掉，返回 `OutOfMemory`（`-ENOMEM`），`brk` 不变。
+- **变小**：`vm.shrinkUser` 把整个落在新 `brk` 之后的页释放掉，空出来的第 0 级页表也释放（[paging.md](paging.md#堆的增长和缩小)），然后 `sfence.vma`：这些页可能还在 TLB 里，不刷的话进程还能访问已经还给页分配器的页。
+- **边界**：不能小于 `heap_start`（`InvalidArgument`，`-EINVAL`），不能长进栈下面的保护页（`heap_limit` = 栈底 − 4096，超出是 `OutOfMemory`）。`increment` 是有符号的，加减都检查溢出。
+- 回归测试 `t_sbrk` 检查了：新内存清零、按页映射（`brk` 所在页的页尾能写，下一页缺页）、缩小后被释放的页缺页、`fork` 复制堆、各种越界，以及长到超过物理内存时失败、不漏页。
 
 ## 调度
 
@@ -247,7 +298,7 @@ pub fn exec(name: []const u8) ExecError!void {
 pub fn scheduler() noreturn            // kmain 最后调用，不返回
 fn sched() void                        // 当前进程切回调度器
 pub fn yield() void
-pub fn sleep(chan: *const anyopaque) void
+pub fn sleep(chan: *const anyopaque, lock: ?*Spinlock) void
 pub fn wakeup(chan: *const anyopaque) void
 ```
 
@@ -292,6 +343,7 @@ fn sched() void {
     const p = current.?;
     std.debug.assert(p.state != .running);
     std.debug.assert(riscv.read(.sstatus) & riscv.sstatus_sie == 0);
+    spinlock.assertNoneHeld();
     switchContext(&p.context, &scheduler_context);
 }
 
@@ -301,7 +353,7 @@ pub fn yield() void {
 }
 ```
 
-`sched` 是进程切回调度器的唯一入口，切换前检查两件事：状态已经改掉了（不再是 `running`，否则调度器会以为它还在跑），中断是关着的。xv6 的 `sched` 还检查持有的锁，这里没有锁。等调度器下次挑中这个进程时，`switchContext` 才返回，执行从 `sched` 之后继续。
+`sched` 是进程切回调度器的唯一入口，切换前检查三件事：状态已经改掉了（不再是 `running`，否则调度器会以为它还在跑），中断是关着的，没有拿着任何自旋锁（拿着锁切走的话，下一个要这把锁的进程会永远自旋下去）。xv6 的 `sched` 检查的是“只拿着自己的进程锁”，这里还没有进程锁。等调度器下次挑中这个进程时，`switchContext` 才返回，执行从 `sched` 之后继续。
 
 `yield` 由陷阱处理程序调用：时钟中断打断 U 模式时（时间片用完，[trap.md](trap.md#分发)），以及 `yield` 系统调用。只有时钟中断让出 CPU，串口中断不让（和 xv6 一样）：串口中断只是叫醒在 `read` 里等输入的进程（通常是 shell），它最多等当前进程用完这个时间片（10 ms）。
 
@@ -310,12 +362,14 @@ pub fn yield() void {
 ### sleep、wakeup
 
 ```zig
-pub fn sleep(chan: *const anyopaque) void {
+pub fn sleep(chan: *const anyopaque, lock: ?*Spinlock) void {
     const p = current.?;
     p.chan = chan;
     p.state = .sleeping;
+    if (lock) |l| l.release();
     sched();
     p.chan = null;
+    if (lock) |l| l.acquire();
 }
 
 pub fn wakeup(chan: *const anyopaque) void {
@@ -330,19 +384,32 @@ pub fn wakeup(chan: *const anyopaque) void {
 | 谁在等 | 等什么 | 通道 | 谁叫醒 |
 | --- | --- | --- | --- |
 | `sleep` 系统调用 | 时钟走够 | `&timer.ticks` | 每个时钟中断（`trap.handleTrap`） |
-| `read` 系统调用 | 键盘输入 | `uart.rx_chan`（`&rx_buf`） | 串口中断（`trap.handleExternal`） |
+| `read` 系统调用（串口） | 键盘输入 | `uart.rx_chan`（`&rx_buf`） | 串口中断（`trap.handleExternal`） |
+| `read` 系统调用（管道） | 管道里有数据，或者写端都关了 | `&pipe.nread` | 往管道里写了东西（`pipe.write`），写端关了（`pipe.close`） |
+| `write` 系统调用（管道） | 管道腾出空间，或者读端都关了 | `&pipe.nwrite` | 从管道里读走了东西（`pipe.read`），读端关了（`pipe.close`） |
 | `wait` 系统调用 | 子进程结束 | 自己的 `*Process` | 子进程结束时（`finish` 叫醒父进程）；孤儿交给 init 时（`reparent` 叫醒 init） |
 
-规矩是**醒来之后自己检查条件，不满足就再睡**：`while (!条件) sleep(chan);`。醒来不代表条件满足：时钟通道每个 tick 都叫醒所有在等的进程，各自数够了没有；两个进程同时 `read`，一个字符只能给其中一个；被 `kill` 也会醒。`wakeup` 只改状态、不切换，所以中断处理程序里也能调用。
+规矩是**醒来之后自己检查条件，不满足就再睡**：`while (!条件) sleep(chan, lock);`。醒来不代表条件满足：时钟通道每个 tick 都叫醒所有在等的进程，各自数够了没有；两个进程同时 `read`，一个字符只能给其中一个；被 `kill` 也会醒。`wakeup` 只改状态、不切换，所以中断处理程序里也能调用。
 
-**不需要 xv6 那把锁**。xv6 的 `sleep(chan, lk)` 要带一把锁，防止“检查完条件、还没睡下时 `wakeup` 已经发生”（lost wakeup：等的人永远睡下去）。这里进程关着中断运行，从检查条件到 `sleep` 里状态变成 `sleeping`，中间不会有中断处理程序插进来；`wakeup` 只可能在它真正睡下之后才执行。
+**`lock` 是保护等待条件的锁**，照 xv6 的 `sleep(chan, lk)`：调用方拿着它检查条件、拿着它调用 `sleep`；`sleep` 在状态改成 `sleeping` 之后才放开它，醒来后重新拿上再返回，所以调用方的循环里一直拿着锁。改条件的一方（往管道里写、串口中断往缓冲区里放字符）也要先拿这把锁，于是“检查完条件、还没睡下”的时候它插不进来，不会出现 lost wakeup（`wakeup` 发生在睡下之前，等的人永远睡下去）。例子是管道的读：
+
+```zig
+p.lock.acquire();
+defer p.lock.release();
+while (p.nread == p.nwrite and p.write_open) {
+    if (proc.isKilled()) return 0;
+    proc.sleep(&p.nread, &p.lock);
+}
+```
+
+现在只有一个 hart、全程关中断，就算不传锁也不会丢 `wakeup`；但多核时另一个 hart 上的写者随时可能插进来，锁才是真正起作用的东西。条件没有锁保护的（`sleep` 系统调用看 `timer.ticks`、`wait` 看进程表）传 `null`，多核时要补上 tickslock 和 xv6 的 `wait_lock`。多核时 `sleep` 里还要在放开 `lock` 之前拿上进程自己的锁，一直拿到切回调度器为止，否则 `wakeup` 可能在它还没切走时就把它改成 `runnable`，被另一个 hart 的调度器同时运行。
 
 `sleep` 系统调用（`syscall.zig`）就是 xv6 的 `sys_sleep`：
 
 ```zig
 const n = (ms *| timer.tick_hz +| 999) / 1000;
 const start = timer.ticks;
-while (timer.ticks - start < n and proc.current.?.killed == null) proc.sleep(&timer.ticks);
+while (timer.ticks - start < n and !proc.isKilled()) proc.sleep(&timer.ticks, null);
 ```
 
 要睡的 tick 数 `⌈ms × 100 / 1000⌉`，乘法和加法都是饱和运算，`ms` 再大也不会溢出（最多睡到永远，只能被 `kill`）。用户程序看到的 `uptime()` 也是按 tick 算的，所以醒来后 `uptime()` 至少增加了 `ms`；按真实时间算，可能比 `ms` 少不到一个 tick（睡下去时当前 tick 已经过了一部分）。`ms = 0` 时不睡，直接返回。被 kill 了就提前返回，回到陷阱处理程序后结束。
@@ -430,6 +497,10 @@ pub const KillError = error{ NoSuchProcess, PermissionDenied };
 fn finish(p: *Process, status: u32) noreturn {
     const init = init_proc.?;
     if (p == init) std.debug.panic("init exited (status {d})", .{status});
+    for (&p.files) |*f| {
+        if (f.*) |x| file.close(x);
+        f.* = null;
+    }
     reparent(p, init);
     p.xstatus = status;
     p.state = .zombie;
@@ -440,9 +511,10 @@ fn finish(p: *Process, status: u32) noreturn {
 ```
 
 1. **init 不能结束**：所有孤儿都靠它回收，它没了内核就 panic（xv6 也是 `panic("init exiting")`）。正常情况下 init 从不退出，`kill` 也不允许杀它。
-2. **`reparent`：子进程交给 init**。被交过去的子进程可能已经是 zombie 了，所以顺便叫醒 init，让它的 `wait` 重新看一遍。
-3. 记下结束状态：`exit(code)` 是退出码（0..255），被杀的是 `abi.killed_status`（`0x100`），两者不会混淆。
-4. 状态改成 `zombie`，叫醒父进程（它可能在 `wait` 里睡着），切回调度器，再也不回来。
+2. **关掉所有打开的文件**。必须在这里关，不能等父进程回收：管道的写端关了，读的进程才会读到结尾。要是等到 `wait` 回收时才关，读的进程能不能结束就取决于父进程先回收谁：`run echo hi | wc` 的组长要是先 `wait` wc，echo 的写端就一直开着，wc 永远读不到结尾，两边一起卡住。`reap` 断言 zombie 的 fd 表是空的。
+3. **`reparent`：子进程交给 init**。被交过去的子进程可能已经是 zombie 了，所以顺便叫醒 init，让它的 `wait` 重新看一遍。
+4. 记下结束状态：`exit(code)` 是退出码（0..255），被杀的是 `abi.killed_status`（`0x100`），两者不会混淆。
+5. 状态改成 `zombie`，叫醒父进程（它可能在 `wait` 里睡着），切回调度器，再也不回来。
 
 **不在这里释放内存**：进程这时还在用自己的内核栈和地址空间（`satp` 指着它的页表）。地址空间由父进程在 `wait` 里回收，那时运行的是父进程，用的是父进程的页表。zombie 只占一个槽位和它的用户内存，直到被回收。
 
@@ -454,13 +526,13 @@ pub fn waitChild(pid: usize, nohang: bool) WaitError!?*Process {
     while (true) {
         if (try findZombieChild(p, pid)) |c| return c;
         if (nohang or p.killed != null) return null;
-        sleep(p);
+        sleep(p, null);
     }
 }
 ```
 
 - `findZombieChild` 扫一遍进程表，看 `parent == p` 的进程（`pid` 不是 `abi.wait_any` 时只看这一个 pid）：有 zombie 就返回它；有符合条件的子进程但都没结束返回 `null`；一个都没有是 `NoChildren`（`-ECHILD`）。它只看进程表，单元测试直接测它。
-- 都没结束就**睡在自己身上**（`sleep(p)`），子进程的 `finish` 用 `wakeup(p.parent)` 叫醒它。醒来再扫一遍。`nohang` 时不睡，返回 `null`（系统调用返回 0）；被 kill 了也不睡，回到陷阱处理程序后结束。
+- 都没结束就**睡在自己身上**（`sleep(p, null)`），子进程的 `finish` 用 `wakeup(p.parent)` 叫醒它。醒来再扫一遍。`nohang` 时不睡，返回 `null`（系统调用返回 0）；被 kill 了也不睡，回到陷阱处理程序后结束。
 - 找到的 zombie 先交给系统调用处理程序：它把 `xstatus` 写进用户给的地址（写不进去就返回 `-EFAULT`，**不回收**，子进程还在，可以再 `wait`），然后调用 `reap`：释放地址空间，槽位清回 `unused`。xv6 也是先 `copyout` 再 `freeproc`。
 
 ### kill：只做标记
@@ -468,7 +540,7 @@ pub fn waitChild(pid: usize, nohang: bool) WaitError!?*Process {
 **杀别的进程**（`kill`），照 xv6 的做法：**只记下原因（`killed`），在睡的改成 `runnable`，不当场结束它**。被杀的进程可能停在内核栈上的任何地方（`sleep` 里、`yield` 里），只有它自己知道怎么安全地收尾，所以让它自己来：
 
 - 陷阱处理程序回到 U 模式之前调用 `checkKilled()`（[trap.md](trap.md#分发)），新进程第一次进入 U 模式之前 `forkret` 也调用它。`killed` 不为空就 `killCurrent("{s}", .{reason})`。所以**被杀的进程不会再执行一条用户指令**。
-- 睡着的进程被改成 `runnable`，醒来后在 `sleep`、`read`、`wait` 的循环里看到 `killed`，提前返回，接着在 `checkKilled` 里结束。
+- 睡着的进程被改成 `runnable`，醒来后在 `sleep`、`read`、`write`（管道）、`wait` 的循环里看到 `killed`（`proc.isKilled()`），提前返回，接着在 `checkKilled` 里结束。
 - 正在 U 模式运行的进程（Ctrl-C 时前台进程多半是这样）：串口中断打断它，中断处理程序调用 `kill`，回到 U 模式之前 `checkKilled` 就结束它。
 - `kill` 只改标志和状态，所以中断处理程序里也能调用。同一个进程被杀两次，保留第一次的原因。zombie 也能“杀”，什么都不变。
 - 杀 init 是 `PermissionDenied`（`-EPERM`），没有这个进程是 `NoSuchProcess`（`-ESRCH`）。
@@ -492,21 +564,46 @@ pub fn waitChild(pid: usize, nohang: bool) WaitError!?*Process {
 
 ## Ctrl-C
 
-Ctrl-C 结束的是**前台进程**：shell 用 `fork` 启动前台程序后，调用 `setfg(pid)` 告诉内核，等它结束后再 `setfg(0)`（[shell.md](shell.md#前台和后台)）。内核只记一个 pid（`proc.foreground`），后台进程不受影响。
+Ctrl-C 结束的是**前台进程和它的所有子孙**：shell 用 `fork` 启动前台程序后，调用 `setfg(pid)` 告诉内核，等它结束后再 `setfg(0)`（[shell.md](shell.md#前台和后台)）。运行管道时，前台进程是管道的“组长”，各个程序都是它的子进程（[shell.md](shell.md#管道)）。内核只记一个 pid（`proc.foreground`），后台进程不受影响。
 
-1. 串口中断处理程序看到 `0x03`，不放进输入缓冲区，只置位 `ctrl_c_pressed`（[devices.md](devices.md#ctrl-c)）。
-2. 同一个中断里，`trap.handleExternal` 接着调用 `uart.takeCtrlC()`，为真就调用 `proc.interruptForeground()`：前台进程存在、没结束、不是 init 的话，打印 `^C`，`proc.kill(pid, "interrupted by Ctrl-C")`；否则什么也不做，所以在 shell 里随手按的 Ctrl-C 不会留到下一个程序。这和 xv6 的 `consoleintr` 在中断里直接处理控制字符是一个思路。
-3. 前台进程在 U 模式运行的话，这次中断返回之前 `checkKilled` 就结束它；在 `sleep`、`read`、`wait` 里睡着的话，它被叫醒后结束；`runnable` 的话，下次被调度时结束。用户程序就算死循环、从不做系统调用，也不会再回到 U 模式。
-4. 它结束时叫醒在 `wait` 里等它的 shell。
+1. 串口中断处理程序看到 `0x03`，不放进输入缓冲区，`uart.onInterrupt()` 返回 `true`（[devices.md](devices.md#ctrl-c)）。
+2. 同一个中断里，`trap.handleExternal` 接着调用 `proc.interruptForeground()`：前台进程存在、没结束、不是 init 的话，打印 `^C`，然后扫一遍进程表，对前台进程和它的子孙（顺着 `parent` 往上找得到前台进程的）都 `proc.kill(pid, "interrupted by Ctrl-C")`；否则什么也不做，所以在 shell 里随手按的 Ctrl-C 不会留到下一个程序。`kill` 只做标记，标记的时候谁都还没结束、没有被交给 init，父子关系是完整的，一遍就能找全。这和 xv6 的 `consoleintr` 在中断里直接处理控制字符是一个思路。
+3. 被杀的进程在 U 模式运行的话，这次中断返回之前 `checkKilled` 就结束它；在 `sleep`、`read`、`write`、`wait` 里睡着的话，它被叫醒后结束；`runnable` 的话，下次被调度时结束。用户程序就算死循环、从不做系统调用，也不会再回到 U 模式。
+4. 前台进程结束时叫醒在 `wait` 里等它的 shell。
 
 ## 限制和以后可以做的
 
-- 只有一个 hart，调度器不需要锁。多核时就要像 xv6 那样：进程表、页分配器都加锁，`sleep` 带锁，每个 hart 一个调度器上下文和 `current`。
+- 只有一个 hart，进程表和调度器还没有加锁。多核还差的见[锁](#锁)。
 - 内核代码不可抢占：进程在内核里关着中断运行，直到自己调用 `sched`。xv6 在内核里也开着中断，内核代码被时钟中断打断时也会 `yield`。这里内核里没有长时间的计算，不需要。
 - 进程之间没有优先级。
 - 进程表固定 8 项，内核栈是静态的，两侧没有保护页。
 - `fork` 逐页复制整个地址空间，没有写时复制；紧接着 `exec` 的话，复制的内容马上就扔掉了。
-- 没有文件系统，`exec` 只能运行嵌在内核里的程序；没有文件描述符，`read`/`write` 直接对着串口。
-- 没有命令行参数：`exec` 可以在新的用户栈顶放 `argc`/`argv`，通过 `TrapFrame` 的 `a0`、`a1` 传给 `_start`。
-- 只有一个前台进程，没有进程组和信号：Ctrl-C 只杀 `setfg` 设置的那一个进程，它 `fork` 出来的子进程不受影响。
-- 进程不能申请更多内存（没有 `brk`/`mmap`）；用户栈固定 16 KiB，不能增长。
+- 没有文件系统，`exec` 只能运行嵌在内核里的程序，打开的文件只有串口和管道。
+- 只有一个前台进程，没有进程组和信号：Ctrl-C 杀前台进程和它的子孙；前台进程的子孙被交给 init 之后（父进程先结束了）就不算了。
+- 只有 `sbrk`，没有 `mmap`；用户栈固定 16 KiB，不能增长。
+
+## 锁
+
+为多核做准备，共享的数据结构已经加了自旋锁（`src/spinlock.zig`，照 xv6 的 `spinlock.c`）：
+
+| 锁 | 保护什么 | 在哪 |
+| --- | --- | --- |
+| `page.lock` | 空闲页链表、`free_pages` | [page-allocator.md](page-allocator.md) |
+| `file.lock` | 文件表（每个 `File` 的引用数） | [files.md](files.md#文件表) |
+| `Pipe.lock` | 一个管道的缓冲区和两端的状态；读写的进程拿着它睡在管道上 | [files.md](files.md#管道) |
+| `uart.rx_lock` | 串口的输入缓冲区；`read` 拿着它睡在 `uart.rx_chan` 上，串口中断也要拿它 | [devices.md](devices.md#输入环形缓冲区) |
+
+规矩（`spinlock.zig` 的开头也写了）：
+
+- **拿着锁时中断必须关着**，`acquire` 检查这一点。不然中断处理程序在同一个 hart 上去拿同一把锁（比如串口中断拿 `rx_lock`），就会永远自旋。内核本来就全程关着中断，所以 `acquire` 只检查、不负责关中断（xv6 用 `push_off`/`pop_off` 计数）。
+- **不能拿着锁切换进程、回到 U 模式**：`sched` 和 `handleTrap` 回到 U 模式之前都检查 `spinlock.held == 0`。要拿着锁等待的，用 `sleep(chan, lock)`。
+- **锁不嵌套**：现在没有任何地方同时拿两把锁（比如 `file.close` 先放开文件表的锁，再去关管道），所以不用规定加锁顺序。以后要嵌套时先定顺序。
+- 同一个 hart 重复拿同一把锁直接 panic（`holding()` 看 `cpu` 字段）。现在 `cpuId()` 总是 0。
+
+**多核时还要做的**（这一轮只做了上面这些）：
+
+- 每个 hart 一份 `current`、`scheduler_context`、`spinlock.held`（xv6 的 `struct cpu`），`cpuId()` 从 `tp` 读 hart 编号；`kmain` 用 SBI 的 HSM 扩展启动其他 hart，每个 hart 跑自己的调度器。
+- 进程锁：`state`、`chan`、`killed`、`xstatus` 由每个进程自己的锁保护，调度器拿着它切到进程、进程拿着它切回来（xv6 的 `p->lock`），`sleep` 在放开 `lock` 之前拿上它；`wakeup`、`kill`、`findZombieChild` 都要先拿进程锁。
+- `wait_lock`：保护 `parent`，`reparent`、`waitChild`、`interruptForeground` 用；`sleep` 系统调用的 tickslock；`next_pid`、`foreground` 也要加锁或改成原子变量。
+- 串口输出现在没加锁，几个 hart 同时输出时字符会交错；panic 时要能输出，所以输出锁不能是 panic 也要等的那种。
+- 页表：每个进程只在一个 hart 上运行（没有线程），用户页表不用跨 hart 刷 TLB；内核页表启动后不再改。

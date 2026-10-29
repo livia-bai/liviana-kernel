@@ -205,6 +205,22 @@ pub fn checkUser(root: *PageTable, va: usize, len: usize, write: bool) error{Bad
 
 `translateUser` 用软件走一遍页表，把用户虚拟地址翻译成物理地址；要求地址在用户区里，叶子有效、带 U 位、可读（`write` 为 true 时还要可写），否则返回 null。`copyFromUser` / `copyToUser` 在此基础上逐页翻译、逐页复制，是系统调用读写用户内存的唯一途径；`checkUser` 只检查整个范围、不复制。详见 [syscalls.md](syscalls.md#访问用户内存)。
 
+### 堆的增长和缩小
+
+```zig
+pub fn growUser(root: *PageTable, old_end: usize, new_end: usize, perm: Perm) error{OutOfMemory}!void
+pub fn shrinkUser(root: *PageTable, old_end: usize, new_end: usize) void
+fn leafOf(root: *PageTable, va: usize) ?*Pte
+```
+
+`sbrk` 用它们调整堆（[process.md](process.md#sbrk堆)）。`old_end`、`new_end` 按字节算，映射按页：一段内存 `[起点, end)` 占的页是到 `alignForward(end, 4096)` 为止。
+
+- `growUser`：把 `[alignForward(old_end), alignForward(new_end))` 的每一页 `allocUserPage`。中途内存不够时，`errdefer` 调用 `shrinkUser` 把这次映射上的页都释放掉，地址空间保持原样。调用方保证 `old_end` 之后没有映射，所以 `AlreadyMapped` 写成 `unreachable`。
+- `shrinkUser`：把 `[alignForward(new_end), alignForward(old_end))` 的每一页找到页表项（`leafOf`，只查不分配）、还给页分配器、清掉页表项。然后检查这段范围涉及的每个 2 MiB 区域，**第 0 级页表整张都空了就也释放**，清掉指向它的第 1 级页表项。不这样做的话，堆长到 100 多 MiB 再缩回来，每 2 MiB 留下一张空页表，`t_sbrk` 里实测留下了 62 页。第 1 级页表整个用户区只有一张，栈总在里面，不会空，不用管。
+- 改的是正在用的页表，调用方（`proc.sbrk`）要 `sfence.vma`；`vm.zig` 本身不执行特权指令，单元测试才能在主机上运行。
+
+单元测试检查：长 1 字节也映射一整页、再长到页中间不用新的页；跨页；缩到页中间时这一页还在；跨过 2 MiB 边界再缩回来，页和页表都还回去；内存不够时一页不留。
+
 ### 复制用户地址空间
 
 ```zig

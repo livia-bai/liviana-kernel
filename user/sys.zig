@@ -6,13 +6,26 @@ pub const abi = @import("abi");
 
 /// 原始的系统调用：返回值原样返回（错误时是 -errno），回归测试用它测边界情况。
 pub fn syscall(n: abi.Syscall, arg0: usize, arg1: usize, arg2: usize) usize {
+    return syscall4(n, arg0, arg1, arg2, 0);
+}
+
+pub fn syscall4(n: abi.Syscall, arg0: usize, arg1: usize, arg2: usize, arg3: usize) usize {
     return asm volatile ("ecall"
         : [ret] "={a0}" (-> usize),
         : [n] "{a7}" (@backingInt(n)),
           [arg0] "{a0}" (arg0),
           [arg1] "{a1}" (arg1),
           [arg2] "{a2}" (arg2),
+          [arg3] "{a3}" (arg3),
         : .{ .memory = true });
+}
+
+/// 命令行参数，start.zig 在调用 main 之前设好。内核把它们放在栈顶，程序运行期间一直有效。
+pub var argv: []const abi.Arg = &.{};
+
+/// 第 i 个命令行参数，没有就是 null。按惯例第 0 个是程序名。
+pub fn arg(i: usize) ?[]const u8 {
+    return if (i < argv.len) argv[i].slice() else null;
 }
 
 pub fn exit(code: u8) noreturn {
@@ -20,15 +33,29 @@ pub fn exit(code: u8) noreturn {
     unreachable;
 }
 
-pub const WriteError = error{ BadAddress, Unexpected };
+pub const Fd = usize;
+pub const stdin: Fd = abi.stdin;
+pub const stdout: Fd = abi.stdout;
+pub const stderr: Fd = abi.stderr;
 
-pub fn write(bytes: []const u8) WriteError!usize {
-    const ret = syscall(.write, @intFromPtr(bytes.ptr), bytes.len, 0);
+pub const WriteError = error{ BadAddress, BadFd, BrokenPipe, Unexpected };
+
+/// 写 fd，返回写出的字节数（遇到坏地址时可能比 bytes.len 少）。
+pub fn write(fd: Fd, bytes: []const u8) WriteError!usize {
+    const ret = syscall(.write, fd, @intFromPtr(bytes.ptr), bytes.len);
     if (abi.errnoOf(ret)) |e| return switch (e) {
         .fault => error.BadAddress,
+        .badf => error.BadFd,
+        .pipe => error.BrokenPipe,
         else => error.Unexpected,
     };
     return ret;
+}
+
+/// 把 bytes 全部写进 fd。
+pub fn writeAll(fd: Fd, bytes: []const u8) WriteError!void {
+    var done: usize = 0;
+    while (done < bytes.len) done += try write(fd, bytes[done..]);
 }
 
 pub fn getpid() usize {
@@ -55,13 +82,63 @@ pub fn sleep(ms: u64) void {
     _ = syscall(.sleep, ms, 0, 0);
 }
 
-pub const ReadError = error{ BadAddress, Unexpected };
+pub const ReadError = error{ BadAddress, BadFd, Unexpected };
 
-/// 从键盘读最多 buf.len 个字节。没有输入时阻塞；不回显。
-pub fn read(buf: []u8) ReadError!usize {
-    const ret = syscall(.read, @intFromPtr(buf.ptr), buf.len, 0);
+/// 从 fd 读最多 buf.len 个字节，返回读到的字节数，0 表示读到了结尾。没有数据时阻塞。
+/// 从串口读时不回显；单独按 Ctrl-D 读到 0。
+pub fn read(fd: Fd, buf: []u8) ReadError!usize {
+    const ret = syscall(.read, fd, @intFromPtr(buf.ptr), buf.len);
     if (abi.errnoOf(ret)) |e| return switch (e) {
         .fault => error.BadAddress,
+        .badf => error.BadFd,
+        else => error.Unexpected,
+    };
+    return ret;
+}
+
+pub fn close(fd: Fd) error{ BadFd, Unexpected }!void {
+    const ret = syscall(.close, fd, 0, 0);
+    if (abi.errnoOf(ret)) |e| return switch (e) {
+        .badf => error.BadFd,
+        else => error.Unexpected,
+    };
+}
+
+/// 返回编号最小的空闲 fd，它和 fd 指向同一个文件。
+pub fn dup(fd: Fd) error{ BadFd, TooManyOpenFiles, Unexpected }!Fd {
+    const ret = syscall(.dup, fd, 0, 0);
+    if (abi.errnoOf(ret)) |e| return switch (e) {
+        .badf => error.BadFd,
+        .mfile => error.TooManyOpenFiles,
+        else => error.Unexpected,
+    };
+    return ret;
+}
+
+pub const PipeError = error{ TooManyOpenFiles, SystemFdQuotaExceeded, OutOfMemory, Unexpected };
+
+/// 创建管道，返回 { 读端, 写端 }。
+pub fn pipe() PipeError![2]Fd {
+    var fds: [2]u32 = undefined;
+    const ret = syscall(.pipe, @intFromPtr(&fds), 0, 0);
+    if (abi.errnoOf(ret)) |e| return switch (e) {
+        .mfile => error.TooManyOpenFiles,
+        .nfile => error.SystemFdQuotaExceeded,
+        .nomem => error.OutOfMemory,
+        else => error.Unexpected,
+    };
+    return .{ fds[0], fds[1] };
+}
+
+pub const SbrkError = error{ OutOfMemory, InvalidArgument, Unexpected };
+
+/// 把堆的末尾移动 increment 字节，返回原来的末尾。sbrk(0) 只查询。
+/// 新增的内存清零；increment 为正时，返回值就是新内存的起点。
+pub fn sbrk(increment: isize) SbrkError!usize {
+    const ret = syscall(.sbrk, @bitCast(increment), 0, 0);
+    if (abi.errnoOf(ret)) |e| return switch (e) {
+        .nomem => error.OutOfMemory,
+        .inval => error.InvalidArgument,
         else => error.Unexpected,
     };
     return ret;
@@ -80,16 +157,26 @@ pub fn fork() ForkError!usize {
     return ret;
 }
 
-pub const ExecError = error{ NoSuchProgram, OutOfMemory, BadElf, BadAddress, Unexpected };
+pub const ExecError = error{ NoSuchProgram, OutOfMemory, BadElf, BadAddress, ArgsTooLong, Unexpected };
 
-/// 换成嵌在内核里的程序 name 运行。成功时不返回。
-pub fn exec(name: []const u8) ExecError!noreturn {
-    const ret = syscall(.exec, @intFromPtr(name.ptr), name.len, 0);
+/// 换成嵌在内核里的程序 name 运行，命令行参数是 args（按惯例第一个是程序名）。成功时不返回。
+/// 最多 abi.max_args 个参数，加起来最多 abi.max_arg_bytes 字节。
+pub fn exec(name: []const u8, args: []const []const u8) ExecError!noreturn {
+    if (args.len > abi.max_args) return error.ArgsTooLong;
+    var a: [abi.max_args]abi.Arg = undefined;
+    for (args, a[0..args.len]) |s, *x| x.* = .of(s);
+    return execRaw(name, a[0..args.len]);
+}
+
+/// 和 exec 一样，参数已经是 Arg 数组（比如转交自己的 argv）。
+pub fn execRaw(name: []const u8, args: []const abi.Arg) ExecError!noreturn {
+    const ret = syscall4(.exec, @intFromPtr(name.ptr), name.len, @intFromPtr(args.ptr), args.len);
     return switch (abi.errnoOf(ret) orelse .inval) {
         .noent => error.NoSuchProgram,
         .nomem => error.OutOfMemory,
         .noexec => error.BadElf,
         .fault => error.BadAddress,
+        .toobig => error.ArgsTooLong,
         else => error.Unexpected,
     };
 }
@@ -162,33 +249,55 @@ pub fn shutdown() noreturn {
 // 和内核的 uart.zig 一样，接入 std.Io.Writer，用标准库做格式化，输出走 write 系统调用。
 // 一次 print 的输出先攒在缓冲区里，最后用一次 write 写出去：write 在内核里是关着中断整段输出的，
 // 所以一行不会被别的进程的输出从中间打断（超过缓冲区大小的部分会多写几次）。
-var buffer: [256]u8 = undefined;
-var writer: std.Io.Writer = .{
-    .vtable = &.{ .drain = drain },
-    .buffer = &buffer,
+// 写到哪个 fd 由包着 Writer 的 FdWriter 决定。
+const FdWriter = struct {
+    fd: Fd,
+    writer: std.Io.Writer,
+
+    fn init(fd: Fd, buffer: []u8) FdWriter {
+        return .{ .fd = fd, .writer = .{ .vtable = &.{ .drain = drain }, .buffer = buffer } };
+    }
+
+    /// 先写出缓冲区里攒着的内容，再写 data（缓冲区放不下时才会走到这里），返回写出的 data 字节数。
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *FdWriter = @fieldParentPtr("writer", w);
+        try self.put(w.buffered());
+        w.end = 0;
+        var n: usize = 0;
+        for (data[0 .. data.len - 1]) |bytes| {
+            try self.put(bytes);
+            n += bytes.len;
+        }
+        // 最后一段要重复 splat 次（用于填充对齐等）
+        const pattern = data[data.len - 1];
+        for (0..splat) |_| try self.put(pattern);
+        return n + pattern.len * splat;
+    }
+
+    fn put(self: *FdWriter, bytes: []const u8) std.Io.Writer.Error!void {
+        writeAll(self.fd, bytes) catch return error.WriteFailed;
+    }
+
+    /// 输出失败（比如 fd 是读端已经关了的管道）时悄悄丢掉没写出去的部分。
+    fn print(self: *FdWriter, comptime fmt: []const u8, args: anytype) void {
+        self.writer.print(fmt, args) catch {};
+        self.writer.flush() catch {};
+        self.writer.end = 0;
+    }
 };
 
-/// 先写出缓冲区里攒着的内容，再写 data（缓冲区放不下时才会走到这里），返回写出的 data 字节数。
-fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
-    try writeAll(w.buffered());
-    w.end = 0;
-    var n: usize = 0;
-    for (data[0 .. data.len - 1]) |bytes| {
-        try writeAll(bytes);
-        n += bytes.len;
-    }
-    // 最后一段要重复 splat 次（用于填充对齐等）
-    const pattern = data[data.len - 1];
-    for (0..splat) |_| try writeAll(pattern);
-    return n + pattern.len * splat;
-}
+var stdout_buffer: [256]u8 = undefined;
+var stdout_writer: FdWriter = .init(stdout, &stdout_buffer);
 
-fn writeAll(bytes: []const u8) std.Io.Writer.Error!void {
-    var done: usize = 0;
-    while (done < bytes.len) done += write(bytes[done..]) catch return error.WriteFailed;
-}
-
+/// 格式化输出到标准输出（fd 1）。
 pub fn print(comptime fmt: []const u8, args: anytype) void {
-    writer.print(fmt, args) catch {};
-    writer.flush() catch {};
+    stdout_writer.print(fmt, args);
+}
+
+/// 格式化输出到 fd。
+pub fn fprint(fd: Fd, comptime fmt: []const u8, args: anytype) void {
+    if (fd == stdout) return print(fmt, args);
+    var buffer: [256]u8 = undefined;
+    var w: FdWriter = .init(fd, &buffer);
+    w.print(fmt, args);
 }

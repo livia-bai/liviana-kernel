@@ -48,7 +48,7 @@ python3 tools/qemu_test.py --list      # 列出 QEMU 测试的用例和它们覆
 
 绑在一起、改一边就要同步改另一边的：
 
-- `trap.TrapFrame` 的布局 ↔ `trap.trapEntry`、`trap.trapExit` 的汇编 ↔ `proc.spawn` 构造初始 `TrapFrame` ↔ `syscall.dispatch` 读参数的下标（[docs/trap.md](docs/trap.md#trapframe)）。
+- `trap.TrapFrame` 的布局 ↔ `trap.trapEntry`、`trap.trapExit` 的汇编 ↔ `proc.startFrame` 构造初始 `TrapFrame`（`a0`/`a1`/`sp` 传命令行参数） ↔ `syscall.dispatch` 读参数的下标（[docs/trap.md](docs/trap.md#trapframe)）。
 - `proc.Context` ↔ `proc.contextAsm`（[docs/process.md](docs/process.md#保存的上下文)）。
 - `linker.ld` 里各段的 4 KiB 对齐和 `__text_start`、`__rodata_start`、`__data_start`、`__kernel_end` ↔ `vm.init` 设置的页权限（[docs/boot.md](docs/boot.md#链接脚本)）。
 - `user/linker.ld` 的页对齐、可读的段 ↔ `proc.loadSegment` 的检查。
@@ -63,7 +63,9 @@ python3 tools/qemu_test.py --list      # 列出 QEMU 测试的用例和它们覆
 - 进程切换只在关中断时进行，并且总是调度器 ↔ 进程：`proc.scheduler` 切到进程，进程改掉自己的状态后只通过 `proc.sched`（`yield`/`sleep`/`finish`）切回（[docs/process.md](docs/process.md#切换上下文)）。`startFrame` 构造的 `TrapFrame`（init、`exec`）的 `sstatus` 必须清掉 `SIE`。
 - 进程的 `TrapFrame` 总在它内核栈的最顶端（`proc.frameOf`）：`trapEntry`、`trapExit` 设 `sscratch`、`fork` 复制父进程的 `TrapFrame` 都依赖这一点。
 - 结束的进程只由父进程 `wait` 回收（`proc.reap`），父进程先结束的交给 init；init（pid 1）不能结束，结束内核就 panic（[docs/process.md](docs/process.md#结束进程)）。
-- 等待用 `proc.sleep(chan)` / `proc.wakeup(chan)`，醒来后在循环里重新检查条件；`proc.kill` 只做标记，被杀的进程在回到 U 模式之前（`handleTrap` 末尾、`forkret`）由 `checkKilled` 结束（[docs/process.md](docs/process.md#结束进程)）。
+- 等待用 `proc.sleep(chan, lock)` / `proc.wakeup(chan)`，`lock` 是保护等待条件的锁（没有就传 `null`），醒来后在循环里重新检查条件；`proc.kill` 只做标记，被杀的进程在回到 U 模式之前（`handleTrap` 末尾、`forkret`）由 `checkKilled` 结束（[docs/process.md](docs/process.md#结束进程)）。
+- 自旋锁（`src/spinlock.zig`）只在关中断时拿；不能拿着锁调用 `proc.sched`、回到 U 模式（`sched` 和 `handleTrap` 会检查）；现在没有嵌套加锁，要嵌套先定顺序（[docs/process.md](docs/process.md#锁)）。
+- 进程结束时（`proc.finish`）关掉它所有的 fd，不能留给 `wait`：管道的写端不关，读的进程读不到结尾（[docs/process.md](docs/process.md#结束进程)）。
 - 用户地址空间只能用 Sv39 根页表的第 1 项（`vm.user_base..vm.user_end`），内核映射不能放进这个范围（[docs/paging.md](docs/paging.md#用户地址空间)）。
 - 内核碰用户内存只能通过 `vm.copyFromUser` 这类先查页表的函数，不要打开 `sstatus.SUM` 直接解引用用户指针（[docs/syscalls.md](docs/syscalls.md#访问用户内存)）。
 - 页表叶子必须可读或可执行，可写必须可读；ELF 加载器拒绝不可读的段（[docs/process.md](docs/process.md#elf-加载器)）。
