@@ -76,3 +76,11 @@ pub inline fn wfi() void {
 pub inline fn sfenceVma() void {
     asm volatile ("sfence.vma zero, zero" ::: .{ .memory = true });
 }
+
+/// 只作废虚拟地址 va 所在那一页的 TLB 项（所有地址空间的）。只改了一个页表项时用它，不用把整个 TLB 清空。
+pub inline fn sfenceVmaPage(va: usize) void {
+    asm volatile ("sfence.vma %[va], zero"
+        :
+        : [va] "r" (va),
+        : .{ .memory = true });
+}

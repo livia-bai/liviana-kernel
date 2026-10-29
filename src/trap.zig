@@ -8,6 +8,7 @@ const uart = @import("uart.zig");
 const plic = @import("plic.zig");
 const timer = @import("timer.zig");
 const proc = @import("proc.zig");
+const vm = @import("vm.zig");
 const syscall = @import("syscall.zig");
 const spinlock = @import("spinlock.zig");
 
@@ -182,13 +183,16 @@ fn handleTrap(frame: *TrapFrame) callconv(.c) void {
                 frame.sepc += 4;
                 frame.regs[10] = syscall.dispatch(frame);
             },
-            // 其他异常都是用户程序自己的错：访问了没有映射或没有权限的地址、执行了非法指令等等。
-            // 结束这个进程，内核照常运行。
-            else => proc.killCurrent("{s} at 0x{x}, stval=0x{x}", .{
-                std.enums.tagName(Exception, exception) orelse "unknown exception",
-                frame.sepc,
-                riscv.read(.stval),
-            }),
+            // 写了 fork 之后和别的进程共用的页（写时复制，见 vm.cloneUserSpace）：给它复制一份能写的，
+            // 回到原来的地方重新执行这条写指令。别的写缺页（只读的段、没有映射的地址）照常结束进程
+            .store_page_fault => {
+                const stval = riscv.read(.stval);
+                vm.breakCow(proc.current().?.space, stval) catch |err| switch (err) {
+                    error.NotCow => killForFault(frame, exception),
+                    error.OutOfMemory => proc.killCurrent("out of memory (copy-on-write) at 0x{x}, stval=0x{x}", .{ frame.sepc, stval }),
+                };
+            },
+            else => killForFault(frame, exception),
         }
     } else {
         const exception: Exception = @fromBackingInt(code);
@@ -211,6 +215,16 @@ fn handleTrap(frame: *TrapFrame) callconv(.c) void {
         proc.checkKilled();
         spinlock.assertNoneHeld();
     }
+}
+
+/// 来自 U 模式的异常（系统调用和写时复制以外的）都是用户程序自己的错：访问了没有映射或没有权限的地址、
+/// 执行了非法指令等等。结束这个进程，内核照常运行。
+fn killForFault(frame: *TrapFrame, exception: Exception) noreturn {
+    proc.killCurrent("{s} at 0x{x}, stval=0x{x}", .{
+        std.enums.tagName(Exception, exception) orelse "unknown exception",
+        frame.sepc,
+        riscv.read(.stval),
+    });
 }
 
 fn handleExternal() void {

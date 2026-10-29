@@ -97,7 +97,7 @@ user/start.zig ─┬─ user/sys.zig ─── src/abi.zig（与内核共用的
 
 **中断**（[trap.md](trap.md)、[devices.md](devices.md)）：硬件跳到 `trap.trapEntry` → 压 `TrapFrame`（来自 U 模式时换回内核的 `tp`）→ `handleTrap` 按 `scause` 分发：时钟中断预约这个 hart 的下一次（启动 hart 上还让 `ticks` 加 1、叫醒等时钟的进程），打断的是 U 模式就让出 CPU；外部中断向 PLIC 领取中断号，串口中断把字符搬进环形缓冲区、处理 Ctrl-C、叫醒在 `read` 里等的进程 → 回到 U 模式之前检查 `killed` → `trapExit` 恢复寄存器、`sret`。
 
-**创建进程**（[process.md](process.md#创建进程)）：`fork` 系统调用 → `proc.fork`：逐页复制地址空间、复制 `TrapFrame`（子进程的 `a0` 改成 0）→ 拿着 `wait_lock` 和新槽位的锁一次填好，状态 `runnable`，父进程是调用者。`exec` 系统调用 → 把命令行参数复制进内核 → `proc.exec`：新建地址空间、加载 ELF、映射栈、参数放到栈顶 → 换掉旧的地址空间 → `TrapFrame` 改成从新程序的入口开始（`a0` = argc，`a1` = argv）。
+**创建进程**（[process.md](process.md#创建进程)）：`fork` 系统调用 → `proc.fork`：写时复制地址空间（只建页表，用户页和父进程共用，谁先写谁在写缺页里复制一份）、复制 `TrapFrame`（子进程的 `a0` 改成 0）→ 拿着 `wait_lock` 和新槽位的锁一次填好，状态 `runnable`，父进程是调用者。`exec` 系统调用 → 把命令行参数复制进内核 → `proc.exec`：新建地址空间、加载 ELF、映射栈、参数放到栈顶 → 换掉旧的地址空间 → `TrapFrame` 改成从新程序的入口开始（`a0` = argc，`a1` = argv）。
 
 **系统调用**（[syscalls.md](syscalls.md)）：用户程序 `ecall` → `trapEntry` 通过 `sscratch` 换到内核栈 → `handleTrap` → `syscall.dispatch` → 返回值写进 `TrapFrame` 的 `a0` → `trapExit` 回到 U 模式。
 

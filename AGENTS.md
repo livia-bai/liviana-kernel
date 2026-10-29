@@ -74,6 +74,7 @@ python3 tools/qemu_test.py --list      # 列出 QEMU 测试的用例和它们覆
 - 用户地址空间只能用 Sv39 根页表的第 1 项（`vm.user_base..vm.user_end`），内核映射不能放进这个范围（[docs/paging.md](docs/paging.md#用户地址空间)）。内核页表启动后不再改，所有 hart 共用；一个用户地址空间同一时刻只在一个 hart 上用，改了它只刷当前 hart 的 TLB。
 - 内核碰用户内存只能通过 `vm.copyFromUser` 这类先查页表的函数，不要打开 `sstatus.SUM` 直接解引用用户指针（[docs/syscalls.md](docs/syscalls.md#访问用户内存)）。
 - 页表叶子必须可读或可执行，可写必须可读；ELF 加载器拒绝不可读的段（[docs/process.md](docs/process.md#elf-加载器)）。
+- 用户页可能被几个地址空间共用（`fork` 写时复制，页表项标着 `cow`）：释放用户页只用 `page.free`（放掉一个引用，减到 0 才真正释放），共用页的内容不能直接改，要先 `vm.breakCow` 复制一份；`copyToUser`、检查可写的 `checkUser` 已经替调用方做了。改了正在用的页表要刷当前 hart 的 TLB（[docs/paging.md](docs/paging.md#写时复制)）。
 
 用户程序：`init`（第一个进程）和 `sh`（shell）必须有，shell 的命令写在 `user/sh.zig` 里（[docs/shell.md](docs/shell.md)）。新程序放在 `user/<名字>.zig`，提供 `pub fn main() u8`，用 `@import("sys")`（不是 `"sys.zig"`），再在 `build.zig` 的 `user_programs` 里加一项（[docs/user-programs.md](docs/user-programs.md#写一个新程序)）。回归测试程序放在 `user/tests/`，加到 `test_programs` 里，并在 `tools/qemu_test.py` 里加上检查（[docs/testing.md](docs/testing.md#加一个回归测试)）。
 

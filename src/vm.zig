@@ -10,8 +10,12 @@
 //! 用户地址空间：根页表的第 1 项（0x4000_0000..0x8000_0000，1 GiB）专门留给用户程序。
 //! 内核的映射都不落在这一项里（外设在第 0 项，内存从第 2 项开始），所以每个进程的根页表
 //! 直接复制内核根页表的其他项、共用下面的页表即可，陷入内核时不用切换页表。
+//!
+//! fork 写时复制（copy-on-write）：子进程的地址空间不复制页，而是和父进程映射同一批物理页
+//! （page.zig 记引用数）。可写的页两边都改成只读、标上 cow，谁先写谁触发缺页，由 breakCow 复制一份。
 
 const std = @import("std");
+const builtin = @import("builtin");
 const riscv = @import("riscv.zig");
 const page = @import("page.zig");
 const dtb = @import("dtb.zig");
@@ -33,7 +37,10 @@ pub const Pte = packed struct(u64) {
     g: bool = false,
     a: bool = false,
     d: bool = false,
-    rsw: u2 = 0,
+    /// RSW（留给软件用的两位）的第 0 位：写时复制的页。W 清掉了，写的时候触发缺页，
+    /// 由 breakCow 复制一份（或者发现只剩自己在用）再改回可写。只出现在用户映射里
+    cow: bool = false,
+    rsw: u1 = 0,
     ppn: u44 = 0,
     reserved: u10 = 0,
 
@@ -105,6 +112,13 @@ pub fn activate(root: *PageTable) void {
     riscv.sfenceVma();
     riscv.write(.satp, riscv.satp_sv39 | (@intFromPtr(root) >> 12));
     riscv.sfenceVma();
+}
+
+/// 改了当前 hart 正在用的页表之后刷新 TLB（va 为 null 时整个刷掉，否则只刷这一页）。
+/// 单元测试在主机上运行，没有 TLB 可刷。
+fn flushTlb(va: ?usize) void {
+    if (comptime !builtin.cpu.arch.isRISCV()) return;
+    if (va) |a| riscv.sfenceVmaPage(a) else riscv.sfenceVma();
 }
 
 /// 第 level 级（0、1、2）一个叶子映射的大小：4 KiB、2 MiB、1 GiB。
@@ -187,7 +201,8 @@ fn freeTree(pte: Pte, level: u2) void {
         const table: *PageTable = @ptrFromInt(pte.addr());
         for (table) |child| freeTree(child, level - 1);
     }
-    // 叶子是 allocUserPage 分配的页（用户映射只用 4 KiB 的页），非叶子是页表，都还给页分配器
+    // 叶子是用户的页（用户映射只用 4 KiB 的页），非叶子是页表，都还给页分配器。
+    // 和别的进程共用的页（写时复制）只是放掉一个引用，最后一个用它的进程释放时才真正回到空闲链表
     page.free(@ptrFromInt(pte.addr()));
 }
 
@@ -260,28 +275,68 @@ fn leafOf(root: *PageTable, va: usize) ?*Pte {
     return if (pte.v) pte else null;
 }
 
-/// 复制一个用户地址空间（fork 用）：新建一个地址空间，用户区里每一页都分配一页新的物理内存，
-/// 复制内容，按原来的权限映射到同一个地址。之后两边各改各的，互不影响。
+/// 复制一个用户地址空间（fork 用），写时复制：新建一个地址空间，页表照 src 的结构建一份，
+/// 但用户区里的页一页都不复制，叶子指向和 src 同一个物理页（引用数加 1）。
+/// 可写的页在两边都改成只读、标上 cow：之后谁先写谁触发缺页，由 breakCow 给它复制一份，所以两边仍然各改各的。
+/// 本来就只读的页（代码、只读数据）不会被写，一直共用。需要新分配的只有子进程的页表。
+///
+/// src 是当前 hart 正在用的地址空间（fork 的父进程），改了它的页表项，最后刷新 TLB。
+/// 中途内存不够时 dst 整个释放掉；src 里已经改成 cow 的页留着不改回去：以后写的时候 breakCow
+/// 发现只剩自己在用，直接改回可写，不用复制。
 pub fn cloneUserSpace(src: *PageTable) error{OutOfMemory}!*PageTable {
+    defer flushTlb(null);
     const dst = try createUserSpace();
     errdefer destroyUserSpace(dst);
-    for (vpn(user_base, 2)..vpn(user_end - 1, 2) + 1) |i| try cloneTree(dst, src[i], 2, i * levelSize(2));
+    for (vpn(user_base, 2)..vpn(user_end - 1, 2) + 1) |i| try cloneTree(dst, &src[i], 2, i * levelSize(2));
     return dst;
 }
 
-fn cloneTree(dst: *PageTable, pte: Pte, level: u2, va: usize) error{OutOfMemory}!void {
+fn cloneTree(dst: *PageTable, pte: *Pte, level: u2, va: usize) error{OutOfMemory}!void {
     if (!pte.v) return;
     if (pte.isLeaf()) {
-        std.debug.assert(level == 0); // 用户映射只用 4 KiB 的页（allocUserPage）
-        const p = allocUserPage(dst, va, .{ .r = pte.r, .w = pte.w, .x = pte.x }) catch |err| switch (err) {
+        std.debug.assert(level == 0 and pte.u); // 用户映射只用 4 KiB 的页（allocUserPage）
+        // 先建好 dst 这边的页表（可能失败），再改 src、加引用：失败时这一页还没动过
+        const leaf = walk(dst, va, 0) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.AlreadyMapped => unreachable, // dst 是新的，按 src 的结构逐页映射，不会重复
         };
-        @memcpy(p, @as(*const page.Page, @ptrFromInt(pte.addr())));
+        if (pte.w) {
+            pte.w = false;
+            pte.cow = true;
+        }
+        page.share(@ptrFromInt(pte.addr()));
+        leaf.* = pte.*;
         return;
     }
     const table: *PageTable = @ptrFromInt(pte.addr());
-    for (table, 0..) |child, i| try cloneTree(dst, child, level - 1, va + i * levelSize(level - 1));
+    for (table, 0..) |*child, i| try cloneTree(dst, child, level - 1, va + i * levelSize(level - 1));
+}
+
+pub const CowError = error{ NotCow, OutOfMemory };
+
+/// 写时复制：用户地址 va 所在的页是 cow 页的话，让地址空间 root 能写它。
+/// 还有别的地址空间在用这一页，就复制一份换上、放掉自己对旧页的引用；只剩自己在用了
+/// （别人已经复制走了，或者已经结束了），就不用复制，直接改回可写。
+/// 不是 cow 页（没有映射、本来就只读、本来就可写、不在用户区）返回 NotCow，什么都不改。
+///
+/// 用户程序写 cow 页触发缺页时由陷阱处理程序调用，内核往用户内存里写时由 copyToUser、checkUser 调用。
+/// root 是当前 hart 正在用的地址空间（或者还没用过的新地址空间），最后刷新这一页的 TLB。
+pub fn breakCow(root: *PageTable, va: usize) CowError!void {
+    if (va < user_base or va >= user_end) return error.NotCow;
+    const pte = leafOf(root, va) orelse return error.NotCow;
+    if (!pte.cow) return error.NotCow;
+    const old: *align(page.size) page.Page = @ptrFromInt(pte.addr());
+    // 只有映射着这一页的进程自己 fork 才会给它加引用，所以这里看到“只剩自己”，之后也不会变。
+    // 看到还有别人的话，先复制、再放掉引用：别人这时也可能在复制它，放掉之前内容一定还在
+    if (!page.isExclusive(old)) {
+        const new = try page.alloc();
+        @memcpy(new, old);
+        pte.ppn = @intCast(@intFromPtr(new) >> 12);
+        page.free(old);
+    }
+    pte.w = true;
+    pte.cow = false;
+    flushTlb(va);
 }
 
 /// 按页表把用户地址 va 翻译成物理地址。要求这一页是 U 模式可读的（write 为 true 时还要可写），
@@ -316,14 +371,23 @@ pub fn copyFromUser(root: *PageTable, dst: []u8, src: usize) error{BadAddress}!v
     }
 }
 
+/// translateUser(root, va, true)，遇到 cow 页先 breakCow 再翻译。
+/// 复制 cow 页时内存不够也返回 null（和 Linux 一样，系统调用返回 -EFAULT）。
+fn translateUserWrite(root: *PageTable, va: usize) ?usize {
+    if (translateUser(root, va, true)) |pa| return pa;
+    breakCow(root, va) catch return null;
+    return translateUser(root, va, true);
+}
+
 /// 把内核缓冲区 src 复制到用户地址 dst。每一页都要求 U 模式可读可写：
 /// 用户程序不能借系统调用改写内核的内存，也不能改写自己的只读页（比如代码段）。
+/// 写时复制的页先复制一份（breakCow），和用户程序自己写它一样，不会改到共用这一页的别的进程。
 /// 中途失败时，前面的页已经写进去了；需要“要么全写、要么不写”的调用方先用 checkUser 检查。
 pub fn copyToUser(root: *PageTable, dst: usize, src: []const u8) error{BadAddress}!void {
     var done: usize = 0;
     while (done < src.len) {
         const va = std.math.add(usize, dst, done) catch return error.BadAddress;
-        const pa = translateUser(root, va, true) orelse return error.BadAddress;
+        const pa = translateUserWrite(root, va) orelse return error.BadAddress;
         const n = @min(src.len - done, page.size - va % page.size);
         @memcpy(@as([*]u8, @ptrFromInt(pa))[0..n], src[done..][0..n]);
         done += n;
@@ -331,12 +395,14 @@ pub fn copyToUser(root: *PageTable, dst: usize, src: []const u8) error{BadAddres
 }
 
 /// 检查用户地址 [va, va+len) 是否都是 U 模式可读的（write 为 true 时还要可写）。
+/// write 为 true 时顺便把范围里写时复制的页都复制好，所以检查通过之后，copyToUser 写这个范围一定成功。
+/// 中途失败时，前面已经复制好的 cow 页留着（内容没变，只是不再和别人共用）。
 pub fn checkUser(root: *PageTable, va: usize, len: usize, write: bool) error{BadAddress}!void {
     if (len == 0) return;
     const last = std.math.add(usize, va, len - 1) catch return error.BadAddress;
     var addr = va;
     while (true) {
-        _ = translateUser(root, addr, write) orelse return error.BadAddress;
+        _ = (if (write) translateUserWrite(root, addr) else translateUser(root, addr, false)) orelse return error.BadAddress;
         const next = std.mem.alignBackward(usize, addr, page.size) + page.size;
         if (next > last) return;
         addr = next;
@@ -421,7 +487,7 @@ test "copyToUser 只写得进 U 模式可写的用户页，checkUser 检查整�
     try std.testing.expectError(error.BadAddress, checkUser(space, user_base, std.math.maxInt(usize), false));
 }
 
-test "cloneUserSpace 复制每一页的内容和权限，两边互不影响，释放后不漏页" {
+test "cloneUserSpace 写时复制：只建页表、共用页；谁先写谁复制，两边互不影响，释放后不漏页" {
     testInit();
     kernel_root = @ptrCast(try page.alloc());
     const before = page.free_pages;
@@ -431,23 +497,82 @@ test "cloneUserSpace 复制每一页的内容和权限，两边互不影响，�
     _ = try allocUserPage(src, user_end - page.size, .{ .r = true, .w = true }); // 栈：另一张第 0 级页表
     @memcpy(data[0..5], "hello");
 
+    // 只分配了页表：根页表、第 1 级一张、第 0 级两张
+    const cloned = page.free_pages;
     const dst = try cloneUserSpace(src);
+    try std.testing.expectEqual(cloned - 4, page.free_pages);
+    // 两边的可写页都变成了 cow（只读），代码页不是 cow，仍然只读
+    for ([_]*PageTable{ src, dst }) |root| {
+        try std.testing.expect(leafOf(root, user_base).?.cow and !leafOf(root, user_base).?.w);
+        try std.testing.expect(!leafOf(root, user_base + page.size).?.cow);
+        try std.testing.expectEqual(leafOf(src, user_base).?.ppn, leafOf(root, user_base).?.ppn);
+    }
+
     var buf: [5]u8 = undefined;
     try copyFromUser(dst, &buf, user_base);
     try std.testing.expectEqualStrings("hello", &buf);
-    // 改子进程的那一份，父进程的不变
+    // 子进程先写：复制一份，父进程的不变
     try copyToUser(dst, user_base, "HELLO");
+    try std.testing.expectEqual(cloned - 5, page.free_pages);
     try copyFromUser(src, &buf, user_base);
     try std.testing.expectEqualStrings("hello", &buf);
-    // 权限照搬：代码页可读不可写，栈页可写，没映射的还是没映射
+    try std.testing.expect(!leafOf(dst, user_base).?.cow and leafOf(dst, user_base).?.w);
+    // 父进程再写：这一页只剩它在用了，直接改回可写，不复制，还是原来那一页
+    try copyToUser(src, user_base, "world");
+    try std.testing.expectEqual(cloned - 5, page.free_pages);
+    try std.testing.expectEqual(@intFromPtr(data), leafOf(src, user_base).?.addr());
+    try copyFromUser(dst, &buf, user_base);
+    try std.testing.expectEqualStrings("HELLO", &buf);
+    // 代码页可读不可写（不是 cow，breakCow 不管），没映射的还是没映射
     try copyFromUser(dst, &buf, user_base + page.size);
     try std.testing.expectError(error.BadAddress, copyToUser(dst, user_base + page.size, "a"));
-    try copyToUser(dst, user_end - 5, "stack");
+    try std.testing.expectError(error.NotCow, breakCow(dst, user_base + page.size));
+    try std.testing.expectError(error.NotCow, breakCow(dst, user_base + 2 * page.size));
+    try std.testing.expectError(error.NotCow, breakCow(dst, user_base)); // 已经复制过了
     try std.testing.expectError(error.BadAddress, copyFromUser(dst, &buf, user_base + 2 * page.size));
+    // checkUser 检查可写时把 cow 页复制好
+    try checkUser(dst, user_end - page.size, page.size, true);
+    try std.testing.expect(leafOf(dst, user_end - page.size).?.w);
+    try std.testing.expect(leafOf(src, user_end - page.size).?.cow);
 
+    // 先释放父进程：共用的代码页、栈页还在被子进程用着，不能回到空闲链表
+    destroyUserSpace(src);
+    try copyFromUser(dst, &buf, user_base + page.size);
+    // 子进程再 fork 一次，三方共用之后依次释放
+    const grandchild = try cloneUserSpace(dst);
+    destroyUserSpace(dst);
+    try copyToUser(grandchild, user_base, "again"); // 只剩它在用：不复制
+    destroyUserSpace(grandchild);
+    try std.testing.expectEqual(before, page.free_pages);
+}
+
+test "cloneUserSpace、写时复制内存不够时不漏页，什么都不坏" {
+    testInit();
+    kernel_root = @ptrCast(try page.alloc());
+    const src = try createUserSpace();
+    for (0..8) |i| _ = try allocUserPage(src, user_base + i * page.size, .{ .r = true, .w = true });
+    _ = try allocUserPage(src, user_end - page.size, .{ .r = true, .w = true });
+    // 只剩 3 页：根页表、第 1 级、第 0 级各一张之后，栈那一张第 0 级页表分配不到
+    var hoard: std.SinglyLinkedList = .{};
+    while (page.free_pages > 3) hoard.prepend(@ptrCast(try page.alloc()));
+    try std.testing.expectError(error.OutOfMemory, cloneUserSpace(src));
+    try std.testing.expectEqual(3, page.free_pages);
+    // 父进程已经改成 cow 的页只剩自己在用，写的时候直接改回可写，不用内存
+    while (page.free_pages > 0) hoard.prepend(@ptrCast(try page.alloc()));
+    try copyToUser(src, user_base, "ok");
+    try copyToUser(src, user_end - 2, "ok");
+
+    // 真正共用的页：没有内存复制时返回 OutOfMemory / BadAddress，两边都不变
+    for (0..4) |_| page.free(@ptrCast(@alignCast(hoard.popFirst().?)));
+    const dst = try cloneUserSpace(src);
+    try std.testing.expectEqual(0, page.free_pages);
+    try std.testing.expectError(error.OutOfMemory, breakCow(dst, user_base + page.size));
+    try std.testing.expectError(error.BadAddress, copyToUser(dst, user_base + page.size, "x"));
+    try std.testing.expectError(error.BadAddress, checkUser(dst, user_base, 2 * page.size, true));
+    try std.testing.expect(leafOf(dst, user_base + page.size).?.cow);
+    try std.testing.expectEqual(leafOf(src, user_base + page.size).?.ppn, leafOf(dst, user_base + page.size).?.ppn);
     destroyUserSpace(dst);
     destroyUserSpace(src);
-    try std.testing.expectEqual(before, page.free_pages);
 }
 
 test "growUser、shrinkUser 按页映射和释放，内存不够时不留下半截" {
@@ -492,18 +617,4 @@ test "growUser、shrinkUser 按页映射和释放，内存不够时不留下半�
     try std.testing.expectEqual(left, page.free_pages);
     try std.testing.expectError(error.BadAddress, copyToUser(space, heap, "z"));
     destroyUserSpace(space);
-}
-
-test "cloneUserSpace 内存不够时不漏页" {
-    testInit();
-    kernel_root = @ptrCast(try page.alloc());
-    const src = try createUserSpace();
-    for (0..8) |i| _ = try allocUserPage(src, user_base + i * page.size, .{ .r = true, .w = true });
-    // 把剩下的页拿到只剩几页，复制到一半就会失败
-    var hoard: std.SinglyLinkedList = .{};
-    while (page.free_pages > 5) hoard.prepend(@ptrCast(try page.alloc()));
-    const before = page.free_pages;
-    try std.testing.expectError(error.OutOfMemory, cloneUserSpace(src));
-    try std.testing.expectEqual(before, page.free_pages);
-    destroyUserSpace(src);
 }

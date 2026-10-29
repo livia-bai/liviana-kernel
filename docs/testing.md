@@ -19,8 +19,8 @@ zig build test --summary all   # 显示通过了几个
 | 文件 | 测什么 |
 | --- | --- |
 | `src/dtb.zig` | 用测试里的 `TestFdt` 按 FDT 格式拼一份设备树，检查解析出的内存、时钟频率、保留区、hart 列表（`reg` 写在 `device_type` 前面的也算，被禁用的 cpu 节点和 `cpu-map` 不算）；截断、魔数不对、缺少时钟频率时返回错误 |
-| `src/page.zig` | 先分配低地址、分配时清零、跳过保留区、内存用完时报 `OutOfMemory` |
-| `src/vm.zig` | 能用大页时用大页（比较用掉的页表数）；`copyFromUser` 只读得到 U 模式可读的用户页，`copyToUser` 只写得进 U 模式可写的页，`checkUser` 检查整个范围（跨页、溢出、长度 0）；`cloneUserSpace` 复制内容和权限、两边互不影响；`growUser`/`shrinkUser` 按页映射和释放、跨 2 MiB 时页表也释放、内存不够时不留下半截；释放用户空间后不漏页 |
+| `src/page.zig` | 引用数数组占掉开头的页；先分配低地址、分配时清零、跳过保留区、内存用完时报 `OutOfMemory`；共用的页最后一个引用放掉才回到空闲链表，再分配时引用数从 1 开始 |
+| `src/vm.zig` | 能用大页时用大页（比较用掉的页表数）；`copyFromUser` 只读得到 U 模式可读的用户页，`copyToUser` 只写得进 U 模式可写的页，`checkUser` 检查整个范围（跨页、溢出、长度 0）；`cloneUserSpace` 写时复制：只建页表、可写页两边都变成 `cow`，谁先写谁复制、只剩一个人用时不复制，内核写（`copyToUser`、`checkUser`）也一样，三方共用依次释放不漏页，内存不够时不漏页、什么都不坏（`breakCow` 返回 `OutOfMemory`，`copyToUser` 返回 `BadAddress`）；`growUser`/`shrinkUser` 按页映射和释放、跨 2 MiB 时页表也释放、内存不够时不留下半截；释放用户空间后不漏页 |
 | `src/proc.zig` | 加载真正的用户程序 `hello`（`build.zig` 把用户程序的 ELF 也交给了单元测试）；拒绝截断、魔数不对、不是 RISC-V、程序头越界、没有权限的段；命令行参数在栈顶的布局（16 字节对齐、指向正确的字节、没有参数时 `sp` 是栈顶）和堆的起点；`wakeup` 只叫醒睡在同一个通道上的进程；`kill` 只做标记、叫醒在睡的进程、只记第一次的原因、拒绝 init 和不存在的 pid；`wait` 只找自己的子进程、按 pid 挑，找到的 zombie 拿着锁返回；`reparent` 把子进程交给 init 并叫醒它；测完所有进程锁都放开了；`setfg` 检查 pid，Ctrl-C 找的是前台进程和它的子孙；`fill` 换掉除了锁以外的所有字段 |
 | `src/abi.zig` | 系统调用返回值和错误码的互相转换 |
 | `src/spinlock.zig` | 拿锁、放锁、`holding`、记录拿着几把锁 |
@@ -56,6 +56,7 @@ python3 tools/qemu_test.py --list         # 列出用例和它们覆盖的文件
 | `args` | shell 按空格拆参数（多个空格算一个），`t_args` 看到的 argc、argv、退出码；`echo` 带参数、不带参数；超过 16 个参数时 shell 报错；`t_args check`（自己检查 11 项） | `user/echo.zig`、`user/tests/t_args.zig` |
 | `pipe` | `t_pipe`（自己检查 31 项）；shell 的管道：`echo \| wc`、`echo \| cat \| cat \| wc`、`t_args \| wc` 的结果，找不到的程序、空的一段、超过 4 个程序时报错；后台管道；对 `cat \| wc` 按 Ctrl-C 杀掉三个进程（组长、cat、wc），之后 `ps` 里没有剩下的；对 `cat \| wc` 输入 `abc` 再按 Ctrl-D，wc 打印 `0 1 3` | `src/pipe.zig`、`user/echo.zig`、`user/cat.zig`、`user/wc.zig`、`user/tests/t_pipe.zig`、`user/tests/t_args.zig` |
 | `sbrk` | `t_sbrk`（自己检查 25 项） | `user/tests/t_sbrk.zig` |
+| `cow` | `t_cow`（自己检查 15 项，见下文）；它打印的 `fork` 用掉的页数少于 16；最后一项里子进程被 `killed: out of memory (copy-on-write)` | `user/tests/t_cow.zig` |
 | `smp` | `t_smp`（自己检查 17 项，见下文）；至少 3 个 hart 时，两个后台 `spin` 0.5 秒里加起来拿到的 tick 要多于 65 个（一个 hart 最多给 50 个，所以它们一定是同时在两个 hart 上跑的。实测 4 核时约 100 个） | `src/timer.zig`、`src/plic.zig`、`src/pipe.zig`、`user/spin.zig`、`user/tests/t_smp.zig` |
 
 `build.zig`、链接脚本、`src/` 下的 `main.zig`、`riscv.zig`、`trap.zig`、`vm.zig`、`page.zig`、`dtb.zig`、`uart.zig`、`proc.zig`、`syscall.zig`、`abi.zig`、`spinlock.zig`、`hart.zig`、`file.zig`，以及 `user/` 下的 `start.zig`、`sys.zig`、`init.zig`、`sh.zig` 是核心文件：所有用例都要经过 init、shell 和系统调用，改了它们就跑全部用例；没登记过的内核文件也一样。只改了文档时，`--changed` 什么都不跑。
@@ -94,6 +95,7 @@ FAIL  safe   smp4   sched       61 checks
 | `t_args` | 不带 `check` 时打印 argc、每个参数、总字节数，退出码是 argc。`t_args check`：`argv` 在栈顶那一页、16 字节对齐；17 个参数、1026 字节的参数返回 `ArgsTooLong`；`argv` 指针、参数指针指向内核时 `EFAULT`；长度为 0 的参数不检查指针；正好 16 个参数、1024 字节；没有参数。要看子进程收到的参数时，把它的 stdout 接到管道上读回来比较 | 每项失败打印 `FAIL: ...`；最后 `N checks, 0 failed`，退出码 0 |
 | `t_pipe` | 基本读写、fd 编号最小；往读端写、从写端读是 `BadFd`；写端关了读到结尾；子进程写 5000 字节（比缓冲区大，要等）、父进程读完一字不差且读了至少 3 次；读的一方先睡下；读端关了写返回 `BrokenPipe`；写满之后读端才关，睡着的写者被叫醒、只写出一部分；睡在管道读、写里时被 kill；坏的 fd、坏指针；`dup` 到 fd 表满、`pipe` 在只剩一个空位时失败且不漏；`fork` 继承 fd、子进程关 stdout 不影响父进程 | 同上 |
 | `t_smp` | 6 个工作进程同时（多核时在不同的 hart 上）各做 30 次 `fork`/`exit`/`wait`、各往同一个管道写 30 × 64 字节（父进程读完，按字节数对账）、各做 30 次 `sbrk` 长 3 页再缩回去，最后各留下一个交给 init 的孤儿；然后杀掉 3 个在 U 模式死循环的子进程（多核时它们正在别的 hart 上跑），`wait` 拿到的都是被杀的状态 | 每项失败打印 `FAIL: ...`；最后 `N checks, 0 failed`，退出码 0；前后 `mem` 一样 |
+| `t_cow` | 写时复制的 `fork`：带着 64 页堆的进程 `fork` 只多用了几页；父子进程各改各的（堆、全局变量，先写的、后写的都看不到对方的）；内核替子进程往共用的页里写（`read`、`pipe`、`meminfo`、`wait` 的输出参数）不改到父进程；父进程复制走之后子进程再写不再复制；最后父进程把内存全部用完（堆和管道），子进程让内核往共用的页里写得到 `EFAULT`，自己写被结束 | `fork of a process with a 64-page heap used N pages`，N < 16；`killed: out of memory (copy-on-write)`；最后 `N checks, 0 failed`，退出码 0；前后 `mem` 一样 |
 | `t_sbrk` | 堆一开始是空的；长 3 页多：返回原来的末尾、清零、按页映射（最后一页的页尾能写，下一页缺页）；内核通过管道读写堆里的内存；`fork` 复制堆；缩到页中间：这一页还在，后面的页缺页；再长回来是清零的；缩到起点下面、`minInt`、长进栈、`maxInt`、超过物理内存都失败，失败时不漏页、`brk` 不变；一个字节一个字节地长过页边界；全部还回去 | 同上；中间有几行 `killed: store_page_fault`，是故意去碰没映射的页的子进程 |
 
 ### 加一个回归测试
@@ -186,6 +188,7 @@ dtc -I dtb -O dts virt.dtb
 | 症状 | 可能的原因 | 怎么查 |
 | --- | --- | --- |
 | `run` 一个程序就 `killed: instruction_page_fault at 0x0, stval=0x0` | 用户 ELF 的入口是 0：`_start` 没有导出（release 模式下尤其要注意） | `llvm-readelf -h` 看 `Entry point`；`_start` 必须在根文件 `user/start.zig` 里 |
+| `KERNEL PANIC: page.free: 0x.. is already free` | 同一页释放了两次（引用数已经是 0）：多半是共用的页（写时复制）在某条路径上多放了一次引用，或者一页被两个地方当成自己的释放 | 对照 `page.share` 和 `page.free` 的调用，看是哪条路径（`destroyUserSpace`、`shrinkUser`、`breakCow`）多放了 |
 | 进程结束后 `KERNEL PANIC: page.free: 0x.. was not handed out by the page allocator` | 切回调度器之后状态不对：典型的是调用 `switchContext` 之后的代码被优化掉了（单进程版本出过一次） | 只在 release 模式出现时，怀疑 `noreturn`、clobber、`volatile`；对照 `llvm-objdump -d` 看 `proc.scheduler` |
 | 内核 `store_page_fault`，`stval` 在内核的代码或只读数据里 | 往只读段写了数据（W^X 生效了） | 用 `llvm-nm` 查 `stval` 落在哪个符号 |
 | 内核 `load_page_fault`，`stval` 很小或是 0 | 空指针解引用 | `sepc` 对应的源码行：GDB 里 `info line *0x...` |

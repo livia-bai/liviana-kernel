@@ -15,8 +15,8 @@ liviana-kernel 的详细文档，按功能组织，讲这个用 Zig 写的 RISC-
 | [trap.md](trap.md) | 陷阱处理：异常委托、`TrapFrame`、`sscratch` 和 `tp` 约定、入口/出口汇编、分发 |
 | [devices.md](devices.md) | 串口（含输入缓冲区和 Ctrl-C）、PLIC、定时器 |
 | [devicetree.md](devicetree.md) | 设备树：格式、解析器、QEMU 给的内容、错误和限制 |
-| [page-allocator.md](page-allocator.md) | 物理页分配器 |
-| [paging.md](paging.md) | Sv39 分页：页表格式、建立映射、内核页表、用户地址空间 |
+| [page-allocator.md](page-allocator.md) | 物理页分配器、每一页的引用数 |
+| [paging.md](paging.md) | Sv39 分页：页表格式、建立映射、内核页表、用户地址空间、`fork` 的写时复制 |
 | [user-programs.md](user-programs.md) | 用户程序：运行时（`start.zig`、`sys.zig`）、示例程序、怎么写新程序 |
 | [process.md](process.md) | 进程：进程表、ELF 加载器、`userinit`/`fork`/`exec`、命令行参数、`sbrk`、xv6 式调度（每个 hart 的 `scheduler`、`sched`/`sleep`/`wakeup`）、切换上下文、`exit`/`wait`/`kill`、Ctrl-C、锁和加锁顺序 |
 | [files.md](files.md) | 文件：fd 表、文件表、串口和管道的读写 |

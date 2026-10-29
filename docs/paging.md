@@ -51,7 +51,7 @@ Sv39 是 RV64 上最常用的分页模式：虚拟地址有效位 39 位（512 G
 | U | U 模式可以访问。S 模式默认**不能**访问 U 页（除非 `sstatus.SUM = 1`），也永远不能执行 U 页里的代码 |
 | G | 全局映射：在所有地址空间里都存在，切换地址空间时不需要作废 TLB 里的这一项 |
 | A / D | 访问过 / 写过。规范允许硬件在它们为 0 时直接产生缺页异常，而不是自动置位 |
-| RSW | 留给软件用，这里没用 |
+| RSW | 留给软件用。这里用第 8 位标记写时复制的页（`cow`，见[写时复制](#写时复制)），第 9 位没用 |
 | PPN | 物理页号 = 物理地址 >> 12，44 位 |
 
 ## 数据类型
@@ -60,7 +60,7 @@ Sv39 是 RV64 上最常用的分页模式：虚拟地址有效位 39 位（512 G
 pub const Pte = packed struct(u64) {
     v: bool = false, r: bool = false, w: bool = false, x: bool = false,
     u: bool = false, g: bool = false, a: bool = false, d: bool = false,
-    rsw: u2 = 0,
+    cow: bool = false, rsw: u1 = 0,   // RSW 的两位：第 8 位标记写时复制的页
     ppn: u44 = 0,
     reserved: u10 = 0,
 };
@@ -159,7 +159,7 @@ pub fn activate(root: *PageTable) void {
 - 规范规定写 `satp` 本身不保证之前对页表的修改已经生效，也不会作废 TLB。所以写之前和之后各执行一次 `sfence.vma`：之前的那次保证页表的写入对页表遍历可见，之后的那次作废旧地址空间留在 TLB 里的翻译。
 - 没有使用 ASID，所有地址空间都是 ASID 0，所以每次切换都要作废整个 TLB。内核映射带 G 位，规范允许实现保留它们，但不带参数的 `sfence.vma` 会连全局项一起作废，这里也没有依赖这个优化。
 - `satp` 和 TLB 都是每个 hart 自己的，`activate` 和 `sfence.vma` 只影响当前 hart。
-- `vm.init` 最后调用 `activate(kernel_root)` 打开分页；`proc.scheduler` 每次切到用户进程前切到它的地址空间，进程让出 CPU 后切回 `kernel_root`（父进程可能在别的 hart 上回收它的页表，之前这个 hart 必须先切走，见 [process.md](process.md#调度器)）；`proc.exec` 换地址空间时先切到新的，再释放旧的。一个用户地址空间同一时刻只在一个 hart 上使用，所以改用户页表（`sbrk` 缩小）后只刷当前 hart 的 TLB 就够了（[process.md](process.md#锁)）。
+- `vm.init` 最后调用 `activate(kernel_root)` 打开分页；`proc.scheduler` 每次切到用户进程前切到它的地址空间，进程让出 CPU 后切回 `kernel_root`（父进程可能在别的 hart 上回收它的页表，之前这个 hart 必须先切走，见 [process.md](process.md#调度器)）；`proc.exec` 换地址空间时先切到新的，再释放旧的。一个用户地址空间同一时刻只在一个 hart 上使用，所以改用户页表（`sbrk` 缩小、`fork` 把父进程的页改成写时复制、`breakCow`）后只刷当前 hart 的 TLB 就够了（[process.md](process.md#锁)）。写时复制让几个地址空间共用同一个物理页，但页表项是各自的：一个进程复制走自己那一份，只改它自己的页表项，别的进程的 TLB 里留着的还是它们自己的、仍然正确的翻译。
 
 ## 用户地址空间
 
@@ -196,7 +196,7 @@ pub fn allocUserPage(root: *PageTable, va: usize, perm: Perm) MapError!*align(pa
 pub fn destroyUserSpace(root: *PageTable) void
 ```
 
-释放用户区（根页表第 1 项）下面的所有东西：`freeTree` 递归地释放每个有效的叶子指向的物理页、每一张中间级页表，最后释放根页表本身。**调用前必须已经切换到别的地址空间**，否则正在使用的页表会被释放。`freeTree` 把叶子都当作 4 KiB 的页释放，这依赖于“用户映射只用 4 KiB 的页”。
+释放用户区（根页表第 1 项）下面的所有东西：`freeTree` 递归地释放每个有效的叶子指向的物理页、每一张中间级页表，最后释放根页表本身。叶子指向的页可能还被别的进程共用（写时复制），`page.free` 只是放掉一个引用，最后一个用它的进程释放时它才回到空闲链表（[page-allocator.md](page-allocator.md#引用数)）。**调用前必须已经切换到别的地址空间**，否则正在使用的页表会被释放。`freeTree` 把叶子都当作 4 KiB 的页释放，这依赖于“用户映射只用 4 KiB 的页”。
 
 ```zig
 fn translateUser(root: *PageTable, va: usize, write: bool) ?usize
@@ -205,7 +205,7 @@ pub fn copyToUser(root: *PageTable, dst: usize, src: []const u8) error{BadAddres
 pub fn checkUser(root: *PageTable, va: usize, len: usize, write: bool) error{BadAddress}!void
 ```
 
-`translateUser` 用软件走一遍页表，把用户虚拟地址翻译成物理地址；要求地址在用户区里，叶子有效、带 U 位、可读（`write` 为 true 时还要可写），否则返回 null。`copyFromUser` / `copyToUser` 在此基础上逐页翻译、逐页复制，是系统调用读写用户内存的唯一途径；`checkUser` 只检查整个范围、不复制。详见 [syscalls.md](syscalls.md#访问用户内存)。
+`translateUser` 用软件走一遍页表，把用户虚拟地址翻译成物理地址；要求地址在用户区里，叶子有效、带 U 位、可读（`write` 为 true 时还要可写），否则返回 null。`copyFromUser` / `copyToUser` 在此基础上逐页翻译、逐页复制，是系统调用读写用户内存的唯一途径；`checkUser` 只检查整个范围、不复制。写的时候（`copyToUser`、`write` 为 true 的 `checkUser`）遇到写时复制的页，先 `breakCow` 复制一份再写，和用户程序自己写它一样。详见 [syscalls.md](syscalls.md#访问用户内存)。
 
 ### 堆的增长和缩小
 
@@ -219,7 +219,8 @@ fn leafOf(root: *PageTable, va: usize) ?*Pte
 
 - `growUser`：把 `[alignForward(old_end), alignForward(new_end))` 的每一页 `allocUserPage`。中途内存不够时，`errdefer` 调用 `shrinkUser` 把这次映射上的页都释放掉，地址空间保持原样。调用方保证 `old_end` 之后没有映射，所以 `AlreadyMapped` 写成 `unreachable`。
 - `shrinkUser`：把 `[alignForward(new_end), alignForward(old_end))` 的每一页找到页表项（`leafOf`，只查不分配）、还给页分配器、清掉页表项。然后检查这段范围涉及的每个 2 MiB 区域，**第 0 级页表整张都空了就也释放**，清掉指向它的第 1 级页表项。不这样做的话，堆长到 100 多 MiB 再缩回来，每 2 MiB 留下一张空页表，`t_sbrk` 里实测留下了 62 页。第 1 级页表整个用户区只有一张，栈总在里面，不会空，不用管。
-- 改的是正在用的页表，调用方（`proc.sbrk`）要 `sfence.vma`；`vm.zig` 本身不执行特权指令，单元测试才能在主机上运行。
+- 改的是正在用的页表，调用方（`proc.sbrk`）要 `sfence.vma`。
+- 缩小时释放的页可能和子进程共用（`fork` 之后还没写过的堆页），`page.free` 只放掉自己的引用。
 
 单元测试检查：长 1 字节也映射一整页、再长到页中间不用新的页；跨页；缩到页中间时这一页还在；跨过 2 MiB 边界再缩回来，页和页表都还回去；内存不够时一页不留。
 
@@ -227,20 +228,53 @@ fn leafOf(root: *PageTable, va: usize) ?*Pte
 
 ```zig
 pub fn cloneUserSpace(src: *PageTable) error{OutOfMemory}!*PageTable
-fn cloneTree(dst: *PageTable, pte: Pte, level: u2, va: usize) error{OutOfMemory}!void
+fn cloneTree(dst: *PageTable, pte: *Pte, level: u2, va: usize) error{OutOfMemory}!void
 ```
 
-`fork` 用它给子进程复制一份地址空间（[process.md](process.md#fork)）：
+`fork` 用它给子进程一份地址空间（[process.md](process.md#fork)），**写时复制**（copy-on-write）：页表照 `src` 的结构建一份，用户页一页都不复制。
 
 1. `createUserSpace()` 新建一个根页表（内核部分照常共用）。
-2. 遍历 `src` 根页表的用户区（第 1 项），`cloneTree` 递归地往下走：遇到无效项跳过；遇到中间级页表就继续往下，同时算出这一项覆盖的虚拟地址；遇到叶子就用 `allocUserPage(dst, va, 原来的 R/W/X)` 分配一页新的物理内存映射到**同一个地址**，再把原来那一页的内容整页复制过去。
-3. 中途内存不够时，`errdefer destroyUserSpace(dst)` 把已经复制的部分全部释放。
+2. 遍历 `src` 根页表的用户区（第 1 项），`cloneTree` 递归地往下走：遇到无效项跳过；遇到中间级页表就继续往下，同时算出这一项覆盖的虚拟地址；遇到叶子，先 `walk(dst, va, 0)` 在 `dst` 里建好到第 0 级的页表（缺的现场分配），再：
+   - 叶子可写的话，在 `src` 里清掉 W、置上 `cow`；
+   - `page.share` 给这个物理页加一个引用；
+   - 把（改过的）叶子原样抄进 `dst`：同一个物理页、同样的权限。
+3. 中途内存不够时，`errdefer destroyUserSpace(dst)` 把 `dst` 整个释放掉（已经抄过去的叶子各放掉一个引用，正好抵消 `share`）。
+4. 最后刷新当前 hart 的 TLB（成功、失败都刷）：`src` 是正在用的地址空间，它的可写页刚变成只读。
 
+之后父子进程读到的都是同一批物理页。谁先写一个 `cow` 页，谁就触发写缺页（W 是 0），由 `breakCow` 给它复制一份；本来就只读的页（代码、只读数据）不标 `cow`，一直共用，写它照常是用户程序的错。
+
+- 要新分配的只有子进程的页表：一个用户程序通常是根页表 + 第 1 级一张 + 第 0 级两张（段和堆一张、栈一张）= 4 页。`t_cow` 实测：带着 64 页堆的进程 `fork` 之后，子进程刚开始运行时整个系统只多用了 5 页（4 张页表，加上父子两边已经写过的 1 页栈）；改成写时复制之前是 78 页。
+- `fork` 之后马上 `exec`（shell 运行程序就是这样）的话，子进程的旧地址空间里一页都没复制过，`exec` 换掉它时只是放掉引用。
+- 先建好 `dst` 的页表、再改 `src`：`walk` 失败时这个叶子还没动过。`walk` 返回 `AlreadyMapped` 不可能发生（`dst` 是新的，按 `src` 的结构一页一页地映射），写成 `unreachable`。
+- 失败时 `src` 里已经改成 `cow` 的页不改回去：以后写的时候 `breakCow` 发现只剩自己在用，直接改回可写，不用复制，也不用内存。
 - 断言叶子都在第 0 级：用户映射只用 4 KiB 的页（`allocUserPage`），所以不会遇到大页。
-- `allocUserPage` 返回 `AlreadyMapped` 不可能发生（`dst` 是新的，按 `src` 的结构一页一页地映射），写成 `unreachable`。
-- 复制之后两边的物理页完全独立，各改各的。没有写时复制：`fork` 之后马上 `exec` 的话，复制的页马上就被释放了。现在的程序都只有几十 KiB，代价可以接受。
 
-单元测试（`vm.zig` 末尾）检查：内容复制过来了；改子进程那一份，父进程的不变；代码页仍然只读、栈页可写、没映射的仍然没映射；两边都释放后不漏页。
+### 写时复制
+
+```zig
+pub const CowError = error{ NotCow, OutOfMemory };
+pub fn breakCow(root: *PageTable, va: usize) CowError!void
+```
+
+让地址空间 `root` 能写用户地址 `va` 所在的 `cow` 页：
+
+1. `leafOf` 找到第 0 级的叶子（只查不分配）。不在用户区、没有映射、不是 `cow`（本来就只读，或者已经可写）都返回 `NotCow`，什么都不改。
+2. `page.isExclusive(旧页)`：还有别的地址空间在用，就分配一页、整页复制、把叶子指向新页，再 `page.free(旧页)` 放掉自己的引用；只剩自己在用（别人已经复制走了，或者已经结束了），就不用复制。
+3. 清掉 `cow`、置上 W，用 `sfence.vma va, zero` 只作废这一页的 TLB 项（`riscv.sfenceVmaPage`）。
+
+谁调用它：
+
+- 用户程序写 `cow` 页触发 `store_page_fault`，陷阱处理程序调用它，成功就回到原来那条写指令重新执行；内存不够时结束这个进程（`out of memory (copy-on-write)`）；`NotCow` 的写缺页照常是用户程序的错（[trap.md](trap.md#分发)）。
+- 内核往用户内存里写：`copyToUser`、`write` 为 true 的 `checkUser` 遇到 `cow` 页先调用它。内存不够时返回 `BadAddress`，系统调用返回 `-EFAULT`（Linux 的 `copy_to_user` 在这种情况下也是返回 `-EFAULT`）。
+
+几点说明：
+
+- **“只剩自己在用”看到了就不会再变**：只有映射着这一页的进程自己 `fork` 才会给它加引用，而这个进程正在这里处理缺页。所以“看到引用数是 1 → 直接改回可写”不需要一直拿着页分配器的锁。
+- **两个进程同时在不同的 hart 上复制同一页**：两边都看到引用数是 2，各自分配、复制，然后各放掉一个引用，旧页减到 0 被释放。每一边都是先复制、再放掉引用，所以复制的时候旧页一定还在；放掉之后谁也不再映射它。结果正确，只是多复制了一次。
+- 用户栈和全局变量在 `fork` 之后也是共用的：父子进程从系统调用一返回就会写栈，各自复制一两页。
+- `vm.zig` 只有这里和 `cloneUserSpace` 执行 `sfence.vma`（`flushTlb`），单元测试在主机上运行时跳过；其他函数都不执行特权指令。
+
+单元测试（`vm.zig` 末尾）检查：`fork` 只分配了 4 张页表；两边的可写页都变成 `cow`，代码页不是；子进程先写时复制一份，父进程的不变；父进程再写时这一页只剩它在用，不复制、还是原来那一页；代码页、没映射的页、已经复制过的页 `breakCow` 返回 `NotCow`；`checkUser` 检查可写时把 `cow` 页复制好；三方共用之后依次释放不漏页；`cloneUserSpace` 内存不够时不漏页；没有内存复制时 `breakCow` 返回 `OutOfMemory`、`copyToUser`/`checkUser` 返回 `BadAddress`，两边的页表项都不变。
 
 ## 调试技巧
 

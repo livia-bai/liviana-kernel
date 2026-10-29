@@ -244,13 +244,13 @@ pub fn fork() ForkError!usize {
 }
 ```
 
-- **先复制地址空间，再拿锁**：复制可能要很久（逐页分配、复制），这时什么锁都不拿。然后拿着 `wait_lock`（要写子进程的 `parent`）和子进程的锁（`allocSlot` 拿着锁返回）一次填好所有字段，最后才放开。所以子进程在别的 hart 看来，要么还是 `unused`，要么已经是完整的 `runnable`，别的 hart 的调度器不会运行一个半填好的进程。进程表满了的话 `errdefer` 释放刚复制的地址空间（在放开 `wait_lock` 之后：`defer` 和 `errdefer` 按相反的顺序执行）。
+- **先复制地址空间，再拿锁**：复制要分配页表，这时什么锁都不拿。然后拿着 `wait_lock`（要写子进程的 `parent`）和子进程的锁（`allocSlot` 拿着锁返回）一次填好所有字段，最后才放开。所以子进程在别的 hart 看来，要么还是 `unused`，要么已经是完整的 `runnable`，别的 hart 的调度器不会运行一个半填好的进程。进程表满了的话 `errdefer` 释放刚复制的地址空间（在放开 `wait_lock` 之后：`defer` 和 `errdefer` 按相反的顺序执行）。
 - **`fill(p, new)` 换掉除了锁以外的所有字段**：直接 `child.* = .{...}` 会连锁一起覆盖成“没人拿着”，而这时锁在自己手里，别的 hart 可能正在等它。`fill` 在编译期遍历 `Process` 的字段名（`std.meta.fieldNames`），跳过 `lock`，以后加字段也不会漏。回收时用 `fill(c, .{})` 清空。
-- **地址空间逐页复制**（`vm.cloneUserSpace`，[paging.md](paging.md#复制用户地址空间)）：子进程的每一页都是新分配的，内容和权限和父进程一样，之后各改各的。没有写时复制（copy-on-write）。
+- **地址空间写时复制**（`vm.cloneUserSpace`，[paging.md](paging.md#复制用户地址空间)）：子进程只新分配页表，用户页和父进程共用（引用数加 1）；可写的页两边都改成只读、标上 `cow`，谁先写哪一页，谁在写缺页里复制一份（`vm.breakCow`，[paging.md](paging.md#写时复制)），所以之后仍然各改各的。shell 运行程序是 `fork` 之后马上 `exec`，子进程的旧地址空间一页都不用复制。
 - **`TrapFrame` 原样复制**，只把 `a0` 改成 0。`fork` 是在系统调用里调用的，这时 `handleTrap` 已经把父进程 `TrapFrame` 的 `sepc` 加过 4 了，所以子进程第一次被调度时，经 `forkret` → `trapExit` 回到 U 模式，正好从 `ecall` 的下一条指令继续，看到 `fork` 返回了 0。父进程照常从系统调用返回，`a0` 是子进程的 pid。
 - **打开的文件和父进程共用**：fd 表逐项复制，每个 `File` 的引用数加 1（`file.dup`），所以父子进程的 fd 指向同一个串口、同一个管道的同一端。shell 运行管道就靠这个（[shell.md](shell.md#管道)）。`dup` 只加引用数，不会失败。
-- 堆（`heap_start`、`brk`）也照抄，堆里的页随地址空间一起复制了。
-- 进程表满了是 `TooManyProcesses`，`fork` 系统调用返回 `-EAGAIN`；内存不够是 `OutOfMemory`（`-ENOMEM`），`cloneUserSpace` 自己释放已经复制的部分。
+- 堆（`heap_start`、`brk`）也照抄，堆里的页随地址空间一起共用（写时复制）。
+- 进程表满了是 `TooManyProcesses`，`fork` 系统调用返回 `-EAGAIN`；内存不够（页表都分配不出来）是 `OutOfMemory`（`-ENOMEM`），`cloneUserSpace` 自己释放已经建好的部分。
 - pid 用原子变量 `next_pid.fetchAdd` 分配：几个 hart 同时 `fork` 也不会拿到同一个 pid。
 
 ### exec
@@ -650,7 +650,7 @@ Ctrl-C 结束的是**前台进程和它的所有子孙**：shell 用 `fork` 启�
 - 没有核间中断（IPI）：叫醒了进程、杀了别的 hart 上正在运行的进程，都要等那个 hart 自己的下一个时钟中断（最多 10 ms）才生效。
 - 进程之间没有优先级，也不考虑在哪个 hart 上运行过（没有亲和性）。
 - 进程表固定 16 项，内核栈和启动栈是静态的，两侧没有保护页：溢出时会悄悄踩坏相邻的数据，所以栈的大小按实测用量留了余量。
-- `fork` 逐页复制整个地址空间，没有写时复制；紧接着 `exec` 的话，复制的内容马上就扔掉了。
+- `fork` 写时复制，但页表还是整个复制的；内存用完时写共用的页只能结束进程（没有换页、没有 OOM killer 挑别的进程）。
 - 没有文件系统，`exec` 只能运行嵌在内核里的程序，打开的文件只有串口和管道。
 - 只有一个前台进程，没有进程组和信号：Ctrl-C 杀前台进程和它的子孙；前台进程的子孙被交给 init 之后（父进程先结束了）就不算了。
 - 只有 `sbrk`，没有 `mmap`；用户栈固定 16 KiB，不能增长。
@@ -664,7 +664,7 @@ Ctrl-C 结束的是**前台进程和它的所有子孙**：shell 用 `fork` 启�
 | `Process.lock`（每个进程一把） | 这个进程的 `state`、`pid`、`name`、`chan`、`killed`、`xstatus`、`ticks`；调度器拿着它切到进程，进程拿着它切回调度器 | 本文 |
 | `proc.wait_lock` | 所有进程的 `parent`；`wait` 拿着它睡在自己身上 | 本文 |
 | `timer.lock` | `timer.ticks`；`sleep` 系统调用拿着它睡在 `&ticks` 上 | [devices.md](devices.md#定时器timerzig) |
-| `page.lock` | 空闲页链表、`free_pages` | [page-allocator.md](page-allocator.md) |
+| `page.lock` | 空闲页链表、`free_pages`、每一页的引用数（写时复制） | [page-allocator.md](page-allocator.md) |
 | `file.lock` | 文件表（每个 `File` 的引用数） | [files.md](files.md#文件表) |
 | `Pipe.lock` | 一个管道的缓冲区和两端的状态；读写的进程拿着它睡在管道上 | [files.md](files.md#管道) |
 | `uart.rx_lock` | 串口的输入缓冲区；`read` 拿着它睡在 `uart.rx_chan` 上，串口中断也要拿它 | [devices.md](devices.md#输入环形缓冲区) |

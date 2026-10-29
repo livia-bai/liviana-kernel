@@ -57,6 +57,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "t_pipe", .dir = "user/tests" },
         .{ .name = "t_sbrk", .dir = "user/tests" },
         .{ .name = "t_smp", .dir = "user/tests" },
+        .{ .name = "t_cow", .dir = "user/tests" },
         // 数据段没有任何权限，用来验证 ELF 加载器会拒绝它
         .{ .name = "t_noperm", .dir = "user/tests", .linker_script = "user/tests/noperm.ld" },
     };

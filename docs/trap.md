@@ -178,7 +178,8 @@ const from_user = frame.sstatus & riscv.sstatus_spp == 0;
 | 中断 9（外部） | `handleExternal()`：PLIC claim → 串口（收字符；按过 Ctrl-C 就 `proc.interruptForeground()`；`proc.wakeup(uart.rx_chan)` 叫醒在 `read` 里等输入的进程）→ complete（[devices.md](devices.md#claim--complete)）。串口中断发给所有 hart，claim 到 0 的 hart 什么也不做 |
 | 其他中断 | `std.debug.panic("unexpected interrupt N")` |
 | 来自 U 模式的异常 8（`ecall`） | `frame.sepc += 4`，`frame.regs[10] = syscall.dispatch(frame)`（[syscalls.md](syscalls.md)） |
-| 来自 U 模式的其他异常 | `proc.killCurrent("<异常名> at <sepc>, stval=<stval>")`：结束进程，内核照常运行 |
+| 来自 U 模式的异常 15（`store_page_fault`） | `vm.breakCow(当前进程的地址空间, stval)`：写的是 `fork` 之后共用的写时复制页，就给这个进程复制一份能写的，不调整 `sepc`，回去重新执行这条写指令（[paging.md](paging.md#写时复制)）；复制时内存不够，`proc.killCurrent("out of memory (copy-on-write) at <sepc>, stval=<stval>")`；不是写时复制的页（只读的段、栈下面的保护页、没有映射的地址）和下一行一样处理 |
+| 来自 U 模式的其他异常 | `proc.killCurrent("<异常名> at <sepc>, stval=<stval>")`（`killForFault`）：结束进程，内核照常运行 |
 | 来自 S 模式的异常 3（`ebreak`） | 打印 `[trap] breakpoint at ...`，`frame.sepc += instructionLength(frame.sepc)` 跳过它 |
 | 来自 S 模式的其他异常 | `std.debug.panic("unhandled exception: ...")`：内核自己的错，停机 |
 | 最后，`from_user` 时 | `proc.checkKilled()`：被 kill 了就在这里结束，不再回到 U 模式（[process.md](process.md#结束进程)）；`spinlock.assertNoneHeld()` |
@@ -187,7 +188,7 @@ const from_user = frame.sstatus & riscv.sstatus_spp == 0;
 
 几个细节：
 
-- **`sepc` 要手动前进。** 异常时 `sepc` 指向出错的指令本身，原样返回会再执行一遍。`ecall` 固定 4 字节（没有压缩形式），直接加 4；`ebreak` 有 4 字节的标准形式和 2 字节的压缩形式 `c.ebreak`，由 `instructionLength` 判断：指令的低 2 位为 `0b11` 是 4 字节，否则是 2 字节。中断不需要调整 `sepc`。
+- **`sepc` 要手动前进。** 异常时 `sepc` 指向出错的指令本身，原样返回会再执行一遍（写时复制的缺页正是要这样：复制好之后让那条写指令再执行一遍）。`ecall` 固定 4 字节（没有压缩形式），直接加 4；`ebreak` 有 4 字节的标准形式和 2 字节的压缩形式 `c.ebreak`，由 `instructionLength` 判断：指令的低 2 位为 `0b11` 是 4 字节，否则是 2 字节。中断不需要调整 `sepc`。
 - **`syscall.dispatch` 在 `sepc += 4` 之后调用**，这样即使系统调用是 `exit`（不返回），状态也是一致的。
 - **`proc.killCurrent`、`proc.exit` 和结束了进程的 `checkKilled` 不返回**：它们切回调度器，当前的 `TrapFrame` 和进程内核栈上的其他内容一起被丢弃（[process.md](process.md#结束进程)）。
 - **`proc.yieldTimeslice` 可能很久以后才返回**，而且可能是在另一个 hart 上返回：别的进程会先运行。时钟中断不经过 PLIC，`timer.onInterrupt` 已经预约了下一次中断，所以在这里让出没问题。`syscall.dispatch` 里的 `yield`、`sleep` 也一样，返回之后照常把返回值写进 `a0`：`frame` 在这个进程自己的内核栈上，切走期间没人动它。
@@ -207,5 +208,5 @@ const from_user = frame.sstatus & riscv.sstatus_spp == 0;
 ## 扩展
 
 - **处理新的中断源**：在 PLIC 里使能它（`plic.init`），在 `handleExternal` 的 `switch` 里加一个分支。
-- **处理新的异常**：来自 U 模式的，加到 `from_user` 分支的 `switch` 里（比如以后实现按需分页，可以在这里处理缺页，而不是直接杀进程）；来自内核的，加到最后一个分支里。
+- **处理新的异常**：来自 U 模式的，加到 `from_user` 分支的 `switch` 里（写时复制就是这样处理写缺页的；以后实现按需分页，也可以在这里处理读缺页，而不是直接杀进程）；来自内核的，加到最后一个分支里。
 - **改 `TrapFrame`**：同时检查 `trapEntry`、`trapExit`、`proc.startFrame`（构造初始 `TrapFrame`，`a0`/`a1`/`sp` 传命令行参数）和 `syscall.dispatch` 读参数的下标。

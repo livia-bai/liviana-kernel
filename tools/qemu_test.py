@@ -445,6 +445,17 @@ def case_sbrk(q, c, mode):
     check_counts(c, q.command("run t_sbrk"), "t_sbrk")
 
 
+def case_cow(q, c, mode):
+    # 写时复制的 fork：t_cow 自己检查内容、页数；最后一项把内存用完，子进程写共用的页时被结束
+    out = q.command("run t_cow")
+    m = c.contains(out, r"fork of a process with a 64-page heap used (\d+) pages\n", "run t_cow")
+    if m:
+        c.expect(int(m.group(1)) < 16, f"run t_cow: fork used {m.group(1)} pages")
+    c.contains(out, r"\[proc\] pid \d+ \(t_cow\) killed: out of memory \(copy-on-write\) at 0x[0-9a-f]+, stval=0x[0-9a-f]+\n",
+               "run t_cow: writing a shared page without memory")
+    check_counts(c, out, "t_cow")
+
+
 def case_smp(q, c, mode):
     # 几个进程同时 fork/exit/wait、写同一个管道、sbrk、留下孤儿，再杀掉在别的 hart 上死循环的进程
     check_counts(c, q.command("run t_smp"), "t_smp")
@@ -489,6 +500,7 @@ CASES = {
     "pipe": (case_pipe, ["src/pipe.zig", "user/echo.zig", "user/cat.zig", "user/wc.zig", "user/tests/t_pipe.zig",
                          "user/tests/t_args.zig"]),
     "sbrk": (case_sbrk, ["user/tests/t_sbrk.zig"]),
+    "cow": (case_cow, ["user/tests/t_cow.zig"]),
     "smp": (case_smp, ["src/timer.zig", "src/plic.zig", "src/pipe.zig", "user/spin.zig", "user/tests/t_smp.zig"]),
 }
 

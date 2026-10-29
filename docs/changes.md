@@ -2,6 +2,14 @@
 
 每次改了内核（`src/`、`user/`、`build.zig`、链接脚本），在最上面加几行：新增了什么功能，修了什么 bug。最新的在前面。
 
+## 2026-10-29 写时复制的 fork
+
+- 新增：`fork` 写时复制。`vm.cloneUserSpace` 只给子进程建页表，用户页和父进程共用；可写的页两边都改成只读、在页表项的 RSW 位上标 `cow`（`Pte.cow`）。谁先写哪一页，谁在 `store_page_fault` 里由新增的 `vm.breakCow` 复制一份，只剩自己在用时直接改回可写、不复制。内核往用户内存写（`copyToUser`、检查可写的 `checkUser`）遇到 `cow` 页也先复制。带着 64 页堆的进程 `fork` 一次，从多用 78 页降到多用 5 页；`fork` 之后马上 `exec` 的话一页都不复制。
+- 新增：页分配器给每一页记引用数（数组放在管理范围开头，128 MiB 内存占 8 页）。新增 `page.share`、`page.isExclusive`；`page.free` 改成放掉一个引用，减到 0 才回到空闲链表；重复释放、共用一个空闲页现在会 panic。启动时的空闲页数相应少了 8 页左右。
+- 新增：写 `cow` 页时内存不够，进程被结束（`killed: out of memory (copy-on-write) at ...`）；内核往 `cow` 页里写时内存不够，系统调用返回 `-EFAULT`（和 Linux 一样）。
+- 新增：`riscv.sfenceVmaPage` 只刷一页的 TLB。
+- 新增：回归测试 `t_cow`、QEMU 测试用例 `cow`（包括把内存用完之后写共用的页）；页分配器引用数、写时复制的单元测试。
+
 ## 2026-10-29 多核；照 xv6 给进程加锁
 
 - 新增：多核。OpenSBI 只把一个 hart 交给内核，`kmain` 做完全局的初始化后，从设备树 `/cpus` 里找出其他 hart（新增 `dtb.Info.harts`），用 SBI HSM 扩展的 `hart_start`（新增 `sbi.hartStart`）逐个启动，等每个报到了再启动下一个；它们从 `secondaryEntry` → `kmainSecondary` 做自己那份初始化（`trap.init`、`vm.initHart`、`plic.initHart`、`timer.initHart`），然后各自运行调度器。启动日志多了一行 `[ok] N harts running, booted on hart M`。最多用 8 个 hart（`hart.max`）。`zig build run` 默认 `-smp 4`。

@@ -225,12 +225,13 @@ pub fn userinit() SpawnError!void {
 
 pub const ForkError = error{ TooManyProcesses, OutOfMemory };
 
-/// 复制当前进程（对应 xv6 的 fork），返回子进程的 pid。子进程有一份内容相同的地址空间（逐页复制），
+/// 复制当前进程（对应 xv6 的 fork），返回子进程的 pid。子进程有一份内容相同的地址空间
+/// （写时复制：先和父进程共用所有的页，谁先写哪一页，谁就复制一份，见 vm.cloneUserSpace），
 /// TrapFrame 也是复制的，所以它被调度后从同一个 ecall 之后继续执行，只是 a0（fork 的返回值）是 0。
 /// 打开的文件和父进程共用（引用数加 1）。
 /// 由系统调用处理程序调用：这时 handleTrap 已经把父进程 TrapFrame 里的 sepc 加过 4 了。
 ///
-/// 先复制地址空间（不拿锁，可能要很久），再拿着 wait_lock 和子进程的锁一次填好所有字段：
+/// 先复制地址空间（不拿锁：要分配页表），再拿着 wait_lock 和子进程的锁一次填好所有字段：
 /// 子进程从别的 hart 看来要么还不存在，要么已经完整地 runnable 了。
 pub fn fork() ForkError!usize {
     const parent = current().?;
