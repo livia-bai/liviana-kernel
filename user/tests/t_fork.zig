@@ -1,4 +1,4 @@
-//! 回归测试：fork、exec、wait、kill、getppid、setfg、procinfo、meminfo、listprog 的正常情况和边界情况。
+//! 回归测试：fork、exec、wait、kill、getppid、setfg、procinfo、meminfo 的正常情况和边界情况。
 //! 每项检查失败时打印 "FAIL: ..."，最后打印通过的项数，退出码是失败的项数。
 //! 由 shell 前台运行（父进程是 sh）。期望的输出见 tools/qemu_test.py。
 
@@ -115,9 +115,16 @@ pub fn main() u8 {
 
     // exec：失败时原来的程序照常运行；成功时 pid 不变
     check(sys.exec("nope", &.{}) == error.NoSuchProgram, "exec a missing program", .{});
+    check(sys.exec("", &.{}) == error.NoSuchProgram, "exec an empty name", .{});
+    check(sys.exec("/bin/nope", &.{}) == error.NoSuchProgram, "exec a missing path", .{});
     const long_name: [40]u8 = @splat('x');
-    check(sys.exec(&long_name, &.{}) == error.NoSuchProgram, "exec a too-long name", .{});
+    check(sys.exec(&long_name, &.{}) == error.NoSuchProgram, "exec a long name", .{});
+    const too_long: [abi.max_path + 1]u8 = @splat('x');
+    check(sys.exec(&too_long, &.{}) == error.NameTooLong, "exec a {d}-byte name", .{too_long.len});
+    check(sys.exec(too_long[0 .. abi.max_path - 4], &.{}) == error.NameTooLong, "exec a name too long for /bin/", .{});
     check(sys.exec("t_noperm", &.{}) == error.BadElf, "exec a bad ELF", .{});
+    check(sys.exec("/bin", &.{}) == error.BadElf, "exec a directory", .{});
+    check(sys.exec("/bin/hello/x", &.{}) == error.NotDir, "exec under a file", .{});
     check(errno(sys.syscall(.exec, 0x8020_0000, 5, 0)) == .fault, "exec with a bad name pointer", .{});
     {
         const pid = spawn(execHello);
@@ -166,15 +173,10 @@ pub fn main() u8 {
         check(found, "procinfo did not list this process", .{});
     }
 
-    // meminfo、listprog、read 的坏参数
+    // meminfo、read 的坏参数；去掉了的 listprog（15）
     check(errno(sys.syscall(.meminfo, 0x8020_0000, 0, 0)) == .fault, "meminfo with a bad pointer", .{});
     check(sys.meminfo().page_size == 4096, "meminfo page size", .{});
-    {
-        var buf: [2]u8 = undefined;
-        check(std.mem.eql(u8, sys.listprog(0, &buf).?, "in"), "listprog truncates to the buffer", .{});
-        check(sys.syscall(.listprog, 0, @intFromPtr(&buf), 2) == "init".len, "listprog returns the full length", .{});
-        check(sys.listprog(1000, &buf) == null, "listprog out of range", .{});
-    }
+    check(errno(sys.syscall(@fromBackingInt(15), 0, 0, 0)) == .nosys, "syscall 15 (was listprog)", .{});
     check(errno(sys.syscall(.read, sys.stdin, 0x8020_0000, 4)) == .fault, "read into kernel memory", .{});
     check(sys.syscall(.read, sys.stdin, 0, 0) == 0, "read of length 0", .{});
 

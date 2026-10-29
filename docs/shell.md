@@ -11,7 +11,8 @@
 | 管道 | `pipe`、`close`、`dup` |
 | 重定向 `<`、`>`、`cd` | `open`、`close`、`dup`、`chdir` |
 | 前台程序和 Ctrl-C | `setfg` |
-| `ps`、`mem`、`uptime`、`run` 列出程序 | `procinfo`、`meminfo`、`uptime`、`listprog` |
+| `ps`、`mem`、`uptime` | `procinfo`、`meminfo`、`uptime` |
+| `run` 检查程序在不在、列出 `/bin` | `open`、`fstat`、`readdir` |
 | `kill`、`shutdown` | `kill`、`shutdown` |
 
 主循环：
@@ -65,7 +66,7 @@ fn run(input: []const u8) void {
 }
 ```
 
-- 先用 `listprog` 确认每个程序都有，没有就打印 `no such program: NAME` 和程序列表，不 `fork`。
+- 先确认每个程序都有（`programExists`：和内核的 `exec` 一样，名字里没有 `/` 的看 `/bin/名字`，有的按路径看，要能打开、是文件），没有就打印 `no such program: NAME` 和程序列表，不 `fork`。
 - `fork` 出子进程，子进程 `exec` 成要运行的程序，命令行参数就是拆出来的那些词（第一个是程序名，[命令解析](#命令解析)）。`exec` 失败（比如 ELF 不合法）时，子进程打印原因并以 127 结束；这时它还是 shell 的副本，内核打印的名字是 `sh`。
 - **前台**（`run NAME`）：`setfg(pid)` 告诉内核按 Ctrl-C 时杀掉它（和它的子孙），然后 `wait(pid)` 睡着等它结束、回收它，再 `setfg(null)`。子进程在 `exec` 之前也先 `setfg(自己的 pid)`：`fork` 之后先运行父进程还是子进程不一定，只靠父进程登记的话，子进程可能已经开始运行、等着输入了，父进程还没来得及 `setfg`，这时按的 Ctrl-C 没人管。QEMU 测试在 Debug 模式下碰到过一次：`t_read` 打印了 `reading`，测试马上按 Ctrl-C，结果没有任何反应。所以输出顺序是：程序的输出、`[proc] ... exited ...`，然后才是 `> `。
 - **后台**（`run NAME &`）：打印 `[proc] pid N (NAME) started in the background`（管道是 `(pipeline)`）后马上回到提示符。它的输出和 shell 的输出会交错在一起，没有作业控制，只能用 `kill` 结束它。后台进程和 shell 谁先运行取决于调度（多核时它们同时运行），所以程序的第一行输出可能出现在 `started in the background` 前面；紧接着 `ps` 的话，还可能看到它还没 `exec`，名字仍然是 `sh`。每次 `print` 是一次 `write`，内核整段输出，所以两边的输出只会按行交错，不会插进一行的中间。
@@ -170,8 +171,8 @@ const cmd = std.meta.stringToEnum(Command, name) orelse { ... "unknown command" 
 | `mem` | 物理页的使用情况（`meminfo`，[page-allocator.md](page-allocator.md)） | `31600 of 31676 pages free (126400 KiB), 4 KiB each` |
 | `disk` | 磁盘的原始区域（文件系统之后的块）有多大（`blockcount`，[disk.md](disk.md#系统调用)）；没有磁盘时打印 `no disk` | `1024 blocks of 4 KiB (4 MiB)` |
 | `cd [DIR]` | 换 shell 的当前目录（`chdir`），之后启动的程序继承它；不给 `DIR` 时回到 `/`。出错时打印 `cd: DIR: NotFound`（或 `NotDir`） | |
-| `run` | 列出所有用户程序（`listprog`） | `programs: init sh hello fault spin ticker echo cat wc` |
-| `run NAME [ARGS...]` | 在前台运行用户程序 `NAME`，带上参数，等它结束；Ctrl-C 结束它 | 程序自己的输出 + `[proc] pid 3 (hello) exited with code 0` |
+| `run` | 列出 `/bin` 里的程序（`readdir`），按名字排序 | `programs: cat echo fault hello init ls mkdir rm sh spin ticker wc` |
+| `run NAME [ARGS...]` | 在前台运行用户程序 `NAME`（`/bin/NAME`；带 `/` 的按路径找，比如 `run /h`），带上参数，等它结束；Ctrl-C 结束它 | 程序自己的输出 + `[proc] pid 3 (hello) exited with code 0` |
 | `run A \| B \| ...` | 管道（[管道](#管道)） | `run echo one two three \| wc` 打印 `1 3 14` |
 | `run ... > F`、`run ... < F` | 标准输出写进文件 `F`、标准输入从 `F` 读（[重定向](#重定向)） | |
 | `run ... &` | 在后台运行，马上回到提示符 | `[proc] pid 4 (spin) started in the background` |
@@ -194,6 +195,7 @@ const cmd = std.meta.stringToEnum(Command, name) orelse { ... "unknown command" 
 
   `ps` 是 shell 执行的，所以 shell 自己总是 `running`；init 总在 `wait` 里睡着。单核时 shell 占着唯一的 hart，`spin` 只能是 `runnable`；多核时它在别的 hart 上跑，显示 `running`。`TICKS` 是进程在 U 模式运行期间来过的时钟中断数，大致等于它用掉的 CPU 时间（单位 10 ms）。按槽位顺序列出，不一定按 pid 排序。结束了还没被回收的进程显示为 `zombie`。
 - `kill PID`：`PID` 不是数字时打印 `usage: kill PID`，没有这个进程时打印 `kill: no such process: PID`，杀 init 打印 `kill: cannot kill pid 1: permission denied`。`kill` 系统调用只做标记（[process.md](process.md#kill只做标记)），所以 shell 接着 `wait(pid)`：是自己的子进程的话，等它真的结束、回收它，`killed: kill()` 那一行就在下一个提示符之前；不是自己的子进程时 `wait` 立刻返回 `NoChildren`。
+- **列程序**（`listPrograms`）：`readdir` 给的是名字的散列的顺序，shell 把名字收进全局的数组再排序。用的是插入排序：`std.mem.sort` 是块排序，栈上有一个 512 项的缓存（512 个切片，8 KiB），Debug 模式下把 shell 16 KiB 的用户栈撑爆过（`store_page_fault`，`stval` 在保护页里，init 重启了 shell）。
 - 文件操作是普通的用户程序：`run ls [PATH...]`、`run cat [FILE...]`、`run mkdir DIR...`、`run rm PATH...`（[user-programs.md](user-programs.md)）。`cd` 必须是 shell 自己的命令：子进程 `chdir` 改不了父进程的当前目录。
 - `kill` shell 自己（它的 pid）也可以：shell 结束，init 打印 `init: sh exited, restarting it` 并启动一个新的 shell。
 

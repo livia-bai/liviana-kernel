@@ -78,7 +78,7 @@ pub fn errno(err: anyerror) abi.Errno // 文件系统的错误 → 系统调用�
 **挂载**：第一个进程（init）第一次回到 U 模式之前，在 `forkretC` 里调用 `fsys.init()`（xv6 的 `forkret` 里调用 `fsinit` 也是这个原因）：挂载要读盘，读盘要睡着等中断，只有进程能做，`kmain` 不行。之后创建的进程都在这之后运行。成功时打印
 
 ```
-[ok] file system: 6841 of 7168 blocks free, generation 27
+[ok] file system: 6840 of 7168 blocks free, generation 27
 ```
 
 磁盘上没有文件系统时打印 `[warn] no file system on the disk: NotFormatted`（接一块全 0 的 4 MiB 镜像实测；超级块坏了是别的错误名），照常启动：文件系统的系统调用返回 `-ENODEV`（`ls /` 打印 `ls: /: NoDevice`），整个磁盘都是原始区域。
@@ -103,10 +103,11 @@ pub fn errno(err: anyerror) abi.Errno // 文件系统的错误 → 系统调用�
 | `fstat(fd)` | inode 号、长度、种类；串口和管道也能查（种类是 `console`、`pipe`） |
 | `readdir(fd)` | 目录的下一项：`File.off` 就是 `fs.readdir` 的 cookie，结果写进用户内存成功了才往后挪 |
 | `read`、`write` | 从 `off` 开始读写；读写目录是 `EISDIR` |
+| `exec` | 在 `/bin`（或给的路径）里找程序，拿着 `fsys.lock` 把 ELF 直接读进新的用户页（[process.md](process.md#程序从哪来)） |
 
 路径先复制进内核栈上的缓冲区（最长 `abi.max_path` = 256 字节，长了是 `ENAMETOOLONG`）。错误码：`NotFound` → `ENOENT`，`Exists` → `EEXIST`，`NotDir` → `ENOTDIR`，`IsDir` → `EISDIR`，`NotEmpty` → `ENOTEMPTY`，`NameTooLong` → `ENAMETOOLONG`，`InvalidName` → `EINVAL`，`NoSpace` → `ENOSPC`，`FileTooBig` → `EFBIG`，`BadAddress` → `EFAULT`，`Corrupt` 等磁盘上的东西不对 → `EIO`。
 
-**内核栈**：系统调用在 16 KiB 的进程内核栈上运行，B 树的操作走得很深。开发时内核栈被撑爆过一次（Debug 模式用到 54 KiB）：`std.bit_set` 的 `isSet`、`count` 按值接收整个位图，每调用一次在栈上复制 8 KiB；`x.* = y.*` 复制 4 KiB 的块也会先放在栈上。改成自己写的 `Bitmap`（方法接收指针）和 `@memcpy` 之后，实测跑完全部 QEMU 测试（包括 `t_fs`、掉电后重新启动），最深 Debug 9944 字节、safe 5312 字节、small 5144 字节（测法见 [process.md](process.md#进程表)）。
+**内核栈**：系统调用在 16 KiB 的进程内核栈上运行，B 树的操作走得很深。开发时内核栈被撑爆过一次（Debug 模式用到 54 KiB）：`std.bit_set` 的 `isSet`、`count` 按值接收整个位图，每调用一次在栈上复制 8 KiB；`x.* = y.*` 复制 4 KiB 的块也会先放在栈上。改成自己写的 `Bitmap`（方法接收指针）和 `@memcpy` 之后，实测跑完全部 QEMU 测试（包括 `t_fs`、掉电后重新启动、从文件系统 `exec`），最深 Debug 9944 字节、safe 5840 字节、small 5096 字节（测法见 [process.md](process.md#进程表)）。
 
 ## 生成磁盘镜像（`mkfs.zig`）
 

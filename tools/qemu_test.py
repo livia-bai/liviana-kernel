@@ -177,7 +177,9 @@ def case_shell(q, c, mode):
     c.contains(q.command("help"), r"run NAME", "help")
     c.contains(q.command("uptime"), r"up \d+\.\d\ds\n", "uptime")
     c.contains(q.command("nope"), r"unknown command: nope", "unknown command")
-    c.contains(q.command("run"), r"programs: init sh hello", "run without a name")
+    # /bin 里的程序按名字排序（测试程序 t_* 也在里面）
+    c.contains(q.command("run"), r"programs: cat echo fault hello init ls mkdir rm sh spin( t_\w+)+ ticker wc\n",
+               "run without a name")
     c.contains(q.command("run nope"), r"no such program: nope\nprograms: ", "run nope")
 
 
@@ -609,6 +611,15 @@ def case_fs(q, c, mode):
     c.contains(q.command("run echo x > /bin"), r"run: /bin: IsDir\n", "run echo x > /bin")
     c.contains(q.command("run echo x >"), r"run: missing file name after < or >\n", "run echo x >")
     c.contains(q.command("run mkdir /bin"), r"mkdir: /bin: Exists\n", "run mkdir /bin")
+    # 程序从文件系统加载：复制一个程序、按路径运行它（进程名是文件名）；不是 ELF 的文件、目录不能运行
+    q.command("run cat /bin/hello > /h")
+    out = q.command("run /h")
+    c.contains(out, r"Hello from U-mode!", "run /h (a copy of hello)")
+    exited(c, out, "h", 0)
+    q.command("run echo not an ELF > /bad")
+    c.contains(q.command("run /bad"), r"run: cannot load /bad: BadElf\n", "run /bad")
+    c.contains(q.command("run /bin"), r"no such program: /bin\n", "run /bin")
+    exited(c, q.command("run rm /h /bad"), "rm", 0)
     # 系统调用的边界情况、并发
     check_counts(c, q.command("run t_fs"), "t_fs")
     # 关机之后：重新启动看文件还在，再测掉电

@@ -33,7 +33,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const elf = std.elf;
-const build_options = @import("build_options");
 const riscv = @import("riscv.zig");
 const uart = @import("uart.zig");
 const page = @import("page.zig");
@@ -44,27 +43,29 @@ const file = @import("file.zig");
 const hart = @import("hart.zig");
 const ipi = @import("ipi.zig");
 const spinlock = @import("spinlock.zig");
+const fs = @import("fs.zig");
+const fsys = @import("fsys.zig");
 const Spinlock = spinlock.Spinlock;
 
-pub const Program = struct {
-    name: []const u8,
-    image: []const u8,
-};
+/// 内核里只嵌着 init（见 build.zig）：第一个进程要在挂载文件系统之前加载。别的程序都从文件系统的 /bin 加载（exec）。
+const init_image = @embedFile("init");
 
-/// 编译时嵌进内核的用户程序（见 build.zig），image 是 ELF 文件的内容。
-pub const programs = blk: {
-    var list: [build_options.user_programs.len]Program = undefined;
-    for (&list, build_options.user_programs) |*p, name| p.* = .{ .name = name, .image = @embedFile(name) };
-    const final = list;
-    break :blk final;
-};
+/// 进程名：exec 的程序的文件名（路径的最后一段），最多 16 字节（和 abi.ProcInfo 一样），长了截断。
+/// 存在进程自己的结构体里：fork 复制、exec 换掉，不指向别处。
+pub const Name = struct {
+    buf: [16]u8 = @splat(0),
+    len: u8 = 0,
 
-pub fn find(name: []const u8) ?*const Program {
-    for (&programs) |*p| {
-        if (std.mem.eql(u8, p.name, name)) return p;
+    pub fn init(s: []const u8) Name {
+        var n: Name = .{ .len = @intCast(@min(s.len, 16)) };
+        @memcpy(n.buf[0..n.len], s[0..n.len]);
+        return n;
     }
-    return null;
-}
+
+    pub fn slice(n: *const Name) []const u8 {
+        return n.buf[0..n.len];
+    }
+};
 
 const stack_size = 16 * 1024;
 const stack_top = vm.user_end;
@@ -87,7 +88,7 @@ pub const Process = struct {
     /// lock
     pid: usize = 0,
     /// lock（exec 会改，procinfo 要读）
-    name: []const u8 = "",
+    name: Name = .{},
     /// 这个进程的根页表
     space: *vm.PageTable = undefined,
     /// wait_lock。父进程。init 没有父进程；父进程先结束时，子进程交给 init（见 finish）
@@ -110,7 +111,7 @@ pub const Process = struct {
     /// 拿着几把睡眠锁（sleeplock.zig）。只有自己改；回到 U 模式时必须是 0
     sleeplocks: u32 = 0,
     /// 当前目录的 inode 号，相对路径从这里开始找。fork 继承，exec 不变；只有自己读写
-    cwd: u64 = @import("fs.zig").root_ino,
+    cwd: u64 = fs.root_ino,
 };
 
 /// 进程表。槽位 i 的进程用 kernel_stacks[i] 作内核栈。
@@ -201,14 +202,13 @@ fn firstContext(p: *Process) Context {
     return .{ .ra = @intFromPtr(&forkret), .sp = @intFromPtr(frameOf(p)), .s = @splat(0) };
 }
 
-pub const SpawnError = error{ TooManyProcesses, OutOfMemory, BadElf, TooManyFiles };
+pub const SpawnError = error{ TooManyProcesses, OutOfMemory, BadElf, IoError, TooManyFiles };
 
 /// 创建第一个进程 init（对应 xv6 的 userinit）：加载嵌在内核里的 init 程序，命令行参数是 "init"，
 /// 打开串口作为 0、1、2 号 fd，状态为 runnable。kmain 在启动调度器之前调用。
 /// 这时别的 hart 已经在调度器里了，放开 init 的锁之后它可能立刻在别的 hart 上运行。
 pub fn userinit() SpawnError!void {
-    const program = find("init") orelse @panic("no init program (see build.zig)");
-    const image = try loadImage(program, &.{"init"});
+    const image = try loadImage(.{ .bytes = init_image }, &.{"init"});
     errdefer vm.destroyUserSpace(image.space);
     const console = try file.openConsole();
     const p = try allocSlot();
@@ -221,7 +221,7 @@ pub fn userinit() SpawnError!void {
     fill(p, .{
         .state = .runnable,
         .pid = next_pid.fetchAdd(1, .monotonic),
-        .name = program.name,
+        .name = .init("init"),
         .space = image.space,
         .context = firstContext(p),
         .files = files,
@@ -273,22 +273,27 @@ pub fn fork() ForkError!usize {
     return pid;
 }
 
-pub const ExecError = error{ NoSuchProgram, OutOfMemory, BadElf };
+pub const ExecError = error{ NoSuchProgram, OutOfMemory, BadElf, IoError, NoDevice, NotDir, NameTooLong };
 
-/// 用程序 name 替换当前进程的地址空间（对应 xv6 的 exec），args 是命令行参数（在内核内存里，
-/// 个数和总长度由调用方检查过）。成功时 TrapFrame 已经改成从新程序的入口开始，系统调用返回后就进入新程序；
-/// 失败时原来的地址空间和 TrapFrame 都不变，系统调用照常返回错误。pid、父进程、ticks、打开的文件不变。
-pub fn exec(name: []const u8, args: []const []const u8) ExecError!void {
+/// 用文件系统里的程序 path 替换当前进程的地址空间（对应 xv6 的 exec），args 是命令行参数（在内核内存里，
+/// 个数和总长度由调用方检查过）。path 里没有 '/' 时在 /bin 里找，有的话按路径找（相对路径从当前目录开始）。
+/// 成功时 TrapFrame 已经改成从新程序的入口开始，系统调用返回后就进入新程序；
+/// 失败时原来的地址空间和 TrapFrame 都不变，系统调用照常返回错误。pid、父进程、ticks、打开的文件、当前目录不变。
+pub fn exec(path: []const u8, args: []const []const u8) ExecError!void {
     const p = current().?;
-    const program = find(name) orelse return error.NoSuchProgram;
-    const image = try loadImage(program, args);
+    // 加载期间一直拿着文件系统的锁：程序文件读到一半不会被别人改掉、删掉
+    const root = fsys.get() catch return error.NoDevice;
+    const image = blk: {
+        defer fsys.unlock();
+        break :blk try loadImage(try openProgram(root, p.cwd, path), args);
+    };
     // 先切到新的地址空间，才能释放正在用的旧页表
     const old = p.space;
     p.space = image.space;
     vm.activate(image.space);
     vm.destroyUserSpace(old);
     p.lock.acquire();
-    p.name = program.name;
+    p.name = .init(std.fs.path.basenamePosix(path));
     p.lock.release();
     p.heap_start = image.brk;
     p.brk = image.brk;
@@ -304,11 +309,64 @@ const Image = struct {
     brk: usize,
 };
 
+/// 找到 exec 要运行的程序文件。调用方拿着文件系统的锁。
+fn openProgram(root: *fs.Fs, cwd: u64, path: []const u8) ExecError!Source {
+    if (path.len == 0) return error.NoSuchProgram;
+    var buf: [abi.max_path]u8 = undefined;
+    const full = if (std.mem.indexOfScalar(u8, path, '/') != null)
+        path
+    else
+        std.fmt.bufPrint(&buf, "/bin/{s}", .{path}) catch return error.NameTooLong;
+    const ino = root.resolve(cwd, full) catch |err| return switch (err) {
+        error.NotFound => error.NoSuchProgram,
+        error.NotDir => error.NotDir,
+        error.NameTooLong => error.NameTooLong,
+        else => error.IoError,
+    };
+    const st = root.stat(ino) catch return error.IoError;
+    if (st.kind != .file) return error.BadElf; // 目录不能运行
+    return .{ .file = .{ .fs = root, .ino = ino, .size = st.size } };
+}
+
+/// ELF 文件从哪来：嵌在内核里的字节（init、单元测试），或者文件系统里的一个文件（exec，调用方拿着 fsys.lock）。
+const Source = union(enum) {
+    bytes: []const u8,
+    file: struct { fs: *fs.Fs, ino: u64, size: u64 },
+
+    fn size(src: Source) u64 {
+        return switch (src) {
+            .bytes => |b| b.len,
+            .file => |f| f.size,
+        };
+    }
+
+    /// 读 [off, off + dst.len)。偏移和长度来自 ELF 文件本身，可能是坏的：超出文件是 BadElf。
+    fn read(src: Source, off: u64, dst: []u8) LoadError!void {
+        if (off > src.size() or src.size() - off < dst.len) return error.BadElf;
+        switch (src) {
+            .bytes => |b| @memcpy(dst, b[off..][0..dst.len]),
+            .file => |f| {
+                // 文件的内容直接读进 dst（exec 时就是新分配的用户页），不经过别的缓冲区
+                const n = f.fs.read(f.ino, off, dst.len, KernelOut{ .buf = dst }) catch return error.IoError;
+                if (n != dst.len) return error.IoError; // 文件在 stat 之后变短了：拿着锁，不应该发生
+            },
+        }
+    }
+};
+
+/// fs.read 的 out：写进内核内存。
+const KernelOut = struct {
+    buf: []u8,
+    pub fn put(o: KernelOut, at: usize, bytes: []const u8) error{}!void {
+        @memcpy(o.buf[at..][0..bytes.len], bytes);
+    }
+};
+
 /// 新建地址空间，加载程序，把命令行参数复制到栈顶。失败时不留下任何东西。
-fn loadImage(program: *const Program, args: []const []const u8) LoadError!Image {
+fn loadImage(src: Source, args: []const []const u8) LoadError!Image {
     const space = try vm.createUserSpace();
     errdefer vm.destroyUserSpace(space);
-    const loaded = try load(space, program.image);
+    const loaded = try load(space, src);
     return .{ .space = space, .entry = loaded.entry, .sp = pushArgs(space, args), .argc = args.len, .brk = loaded.brk };
 }
 
@@ -376,7 +434,7 @@ fn forkretC() callconv(.c) void {
     const p = current().?;
     p.lock.release();
     // 第一个进程第一次运行：挂载文件系统（要读盘、睡着等，kmain 做不了）。之后创建的进程都在这之后
-    if (p == init_proc) @import("fsys.zig").init();
+    if (p == init_proc) fsys.init();
     checkKilled();
     assertNoLocksHeld();
 }
@@ -509,14 +567,14 @@ pub fn wakeup(chan: *const anyopaque) void {
 /// 当前进程调用了 exit。由系统调用处理程序调用，不返回。
 pub fn exit(code: u8) noreturn {
     const p = current().?;
-    uart.print("[proc] pid {d} ({s}) exited with code {d}\n", .{ p.pid, p.name, code });
+    uart.print("[proc] pid {d} ({s}) exited with code {d}\n", .{ p.pid, p.name.slice(), code });
     finish(p, code);
 }
 
 /// 强行结束当前进程。由陷阱处理程序调用，不返回。
 pub fn killCurrent(comptime reason: []const u8, args: anytype) noreturn {
     const p = current().?;
-    uart.print("[proc] pid {d} ({s}) killed: " ++ reason ++ "\n", .{ p.pid, p.name } ++ args);
+    uart.print("[proc] pid {d} ({s}) killed: " ++ reason ++ "\n", .{ p.pid, p.name.slice() } ++ args);
     finish(p, abi.killed_status);
 }
 
@@ -726,16 +784,14 @@ pub fn info(i: usize) ?abi.ProcInfo {
     p.lock.acquire();
     defer p.lock.release();
     if (p.state == .unused) return null;
-    var result: abi.ProcInfo = .{
+    return .{
         .pid = p.pid,
         .ppid = if (p.parent) |q| q.pid else 0,
         .ticks = p.ticks,
         .state = p.state,
-        .name_len = @intCast(@min(p.name.len, 16)),
-        .name = @splat(0),
+        .name_len = p.name.len,
+        .name = p.name.buf,
     };
-    @memcpy(result.name[0..result.name_len], p.name[0..result.name_len]);
-    return result;
 }
 
 /// 把当前的内核上下文保存到 from，再恢复 to 里保存的上下文：恢复出来的 ra、sp 是别处
@@ -795,15 +851,17 @@ fn contextAsm(comptime op: []const u8, comptime base: []const u8) []const u8 {
     return s;
 }
 
-const LoadError = error{ BadElf, OutOfMemory };
+const LoadError = error{ BadElf, OutOfMemory, IoError };
 
-/// 把 ELF 镜像的各个 PT_LOAD 段装进地址空间、映射用户栈，返回入口地址和堆的起点
+/// 把 ELF 文件的各个 PT_LOAD 段装进地址空间、映射用户栈，返回入口地址和堆的起点
 /// （最后一个段之后的页边界：段的最后一页已经映射了，堆从下一页开始，权限不会和段混在一起）。
-fn load(space: *vm.PageTable, image: []const u8) LoadError!struct { entry: usize, brk: usize } {
+/// 文件头和程序头每次读一个到栈上（几十字节），段的内容直接读进用户页。
+fn load(space: *vm.PageTable, src: Source) LoadError!struct { entry: usize, brk: usize } {
     const Ehdr = elf.Elf64.Ehdr;
     const Phdr = elf.Elf64.Phdr;
-    if (image.len < @sizeOf(Ehdr)) return error.BadElf;
-    const ehdr = std.mem.bytesToValue(Ehdr, image[0..@sizeOf(Ehdr)]);
+    var ehdr_bytes: [@sizeOf(Ehdr)]u8 = undefined;
+    try src.read(0, &ehdr_bytes); // 比文件头还短是 BadElf
+    const ehdr = std.mem.bytesToValue(Ehdr, &ehdr_bytes);
     if (!std.mem.eql(u8, &ehdr.ident.magic, elf.MAGIC) or ehdr.ident.class != .@"64" or
         ehdr.ident.data != .@"2LSB" or ehdr.type != .EXEC or ehdr.machine != .RISCV or
         ehdr.phentsize != @sizeOf(Phdr))
@@ -814,10 +872,11 @@ fn load(space: *vm.PageTable, image: []const u8) LoadError!struct { entry: usize
     var brk: usize = vm.user_base;
     for (0..ehdr.phnum) |i| {
         const offset = std.math.add(usize, ehdr.phoff, i * @sizeOf(Phdr)) catch return error.BadElf;
-        if (offset > image.len or image.len - offset < @sizeOf(Phdr)) return error.BadElf;
-        const phdr = std.mem.bytesToValue(Phdr, image[offset..][0..@sizeOf(Phdr)]);
+        var phdr_bytes: [@sizeOf(Phdr)]u8 = undefined;
+        try src.read(offset, &phdr_bytes);
+        const phdr = std.mem.bytesToValue(Phdr, &phdr_bytes);
         if (phdr.type != .LOAD or phdr.memsz == 0) continue;
-        try loadSegment(space, image, phdr);
+        try loadSegment(space, src, phdr);
         brk = @max(brk, std.mem.alignForward(usize, phdr.vaddr + phdr.memsz, page.size));
     }
 
@@ -831,18 +890,17 @@ fn load(space: *vm.PageTable, image: []const u8) LoadError!struct { entry: usize
     return .{ .entry = ehdr.entry, .brk = brk };
 }
 
-fn loadSegment(space: *vm.PageTable, image: []const u8, phdr: elf.Elf64.Phdr) LoadError!void {
+fn loadSegment(space: *vm.PageTable, src: Source, phdr: elf.Elf64.Phdr) LoadError!void {
     // 段要从页边界开始（user/linker.ld 保证），整段落在用户区里、在栈下面的保护页之下，
     // 文件内容不能超出镜像。段必须可读：R/W/X 全为 0 的页表项会被 CPU 当成指向下一级页表的指针，
     // 而只写不读的组合在 RISC-V 里是保留的。
     const end = std.math.add(usize, phdr.vaddr, phdr.memsz) catch return error.BadElf;
     if (phdr.vaddr % page.size != 0 or phdr.vaddr < vm.user_base or end > stack_bottom - page.size or
-        phdr.filesz > phdr.memsz or phdr.offset > image.len or image.len - phdr.offset < phdr.filesz or
+        phdr.filesz > phdr.memsz or phdr.offset > src.size() or src.size() - phdr.offset < phdr.filesz or
         !phdr.flags.R)
     {
         return error.BadElf;
     }
-    const data = image[phdr.offset..][0..phdr.filesz];
     const perm: vm.Perm = .{ .r = phdr.flags.R, .w = phdr.flags.W, .x = phdr.flags.X };
 
     var offset: usize = 0;
@@ -852,9 +910,9 @@ fn loadSegment(space: *vm.PageTable, image: []const u8, phdr: elf.Elf64.Phdr) Lo
             error.AlreadyMapped => return error.BadElf, // 两个段重叠了
         };
         // 文件里有的部分复制进来，剩下的（.bss）保持分配时清的零
-        if (offset < data.len) {
-            const n = @min(page.size, data.len - offset);
-            @memcpy(p[0..n], data[offset..][0..n]);
+        if (offset < phdr.filesz) {
+            const n = @min(page.size, phdr.filesz - offset);
+            try src.read(phdr.offset + offset, p[0..n]);
         }
     }
 }
@@ -873,7 +931,7 @@ fn testLoad(image: []const u8) !usize {
         vm.destroyUserSpace(space);
         std.testing.expectEqual(before, page.free_pages) catch @panic("leaked pages");
     }
-    const entry = (try load(space, image)).entry;
+    const entry = (try load(space, .{ .bytes = image })).entry;
     // 入口可读，栈的两端可读，栈下面的保护页没有映射
     var buf: [2]u8 = undefined;
     try std.testing.expect(entry >= vm.user_base and entry < stack_bottom);
@@ -892,8 +950,8 @@ test "命令行参数复制到栈顶，Arg 数组 16 字节对齐，指向栈上
     const base = @intFromPtr(&test_memory);
     page.init(base, base + test_memory.len, &.{});
     vm.kernel_root = @ptrCast(try page.alloc());
-    const hello: Program = .{ .name = "hello", .image = @embedFile("hello") };
-    const image = try loadImage(&hello, &.{ "hello", "", "world!" });
+    const hello: Source = .{ .bytes = @embedFile("hello") };
+    const image = try loadImage(hello, &.{ "hello", "", "world!" });
     defer vm.destroyUserSpace(image.space);
     try std.testing.expectEqual(3, image.argc);
     try std.testing.expectEqual(0, image.sp % 16);
@@ -910,7 +968,7 @@ test "命令行参数复制到栈顶，Arg 数组 16 字节对齐，指向栈上
     }
 
     // 没有参数：sp 就是栈顶
-    const empty = try loadImage(&hello, &.{});
+    const empty = try loadImage(hello, &.{});
     defer vm.destroyUserSpace(empty.space);
     try std.testing.expectEqual(stack_top, empty.sp);
     // 堆从最后一个段之后的页边界开始
@@ -1047,7 +1105,7 @@ test "wait 只找自己的子进程，按 pid 挑；子进程结束时交给 ini
 }
 
 test "fill 换掉除了锁以外的所有字段" {
-    var p: Process = .{ .state = .zombie, .pid = 7, .name = "x", .ticks = 3, .heap_start = 1, .brk = 2 };
+    var p: Process = .{ .state = .zombie, .pid = 7, .name = .init("x"), .ticks = 3, .heap_start = 1, .brk = 2 };
     p.lock.acquire();
     fill(&p, .{});
     try std.testing.expect(p.lock.holding());

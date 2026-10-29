@@ -39,7 +39,6 @@ pub fn dispatch(frame: *TrapFrame) usize {
         .setfg => setfg(args[0]),
         .procinfo => procinfo(args[0], args[1]),
         .meminfo => meminfo(args[0]),
-        .listprog => listprog(args[0], args[1], args[2]),
         .shutdown => shutdown(),
         .close => close(args[0]),
         .dup => dup(args[0]),
@@ -310,17 +309,12 @@ fn fork() usize {
     });
 }
 
-/// 程序名最长多少字节。嵌在内核里的程序名都很短，更长的一定找不到。
-const max_name = 32;
-
-/// 把程序名和命令行参数都复制进内核（参数放在栈上的 buf 里），再交给 proc.exec：
+/// 把程序的路径和命令行参数都复制进内核（参数放在栈上的 buf 里），再交给 proc.exec：
 /// 参数在旧的地址空间里，换掉地址空间之前就要取出来。
 /// 成功时返回 argc：handleTrap 把返回值写进 a0，正好是新程序看到的 argc（a1 由 proc.exec 设好）。
-fn exec(name_ptr: usize, name_len: usize, argv_ptr: usize, argc: usize) usize {
-    if (name_len > max_name) return abi.fail(.noent);
-    var name_buf: [max_name]u8 = undefined;
-    const name = name_buf[0..name_len];
-    vm.copyFromUser(space(), name, name_ptr) catch return abi.fail(.fault);
+fn exec(path_ptr: usize, path_len: usize, argv_ptr: usize, argc: usize) usize {
+    var path_buf: [abi.max_path]u8 = undefined;
+    const path = userPath(path_ptr, path_len, &path_buf) catch |err| return abi.fail(fsys.errno(err));
 
     if (argc > abi.max_args) return abi.fail(.toobig);
     var argv: [abi.max_args]abi.Arg = undefined;
@@ -336,10 +330,14 @@ fn exec(name_ptr: usize, name_len: usize, argv_ptr: usize, argc: usize) usize {
         used += a.len;
     }
 
-    proc.exec(name, args[0..argc]) catch |err| return abi.fail(switch (err) {
+    proc.exec(path, args[0..argc]) catch |err| return abi.fail(switch (err) {
         error.NoSuchProgram => .noent,
         error.OutOfMemory => .nomem,
         error.BadElf => .noexec,
+        error.IoError => .io,
+        error.NoDevice => .nodev,
+        error.NotDir => .notdir,
+        error.NameTooLong => .nametoolong,
     });
     return argc;
 }
@@ -387,14 +385,6 @@ fn meminfo(ptr: usize) usize {
     const info: abi.MemInfo = .{ .free_pages = page.free_pages, .total_pages = page.total_pages, .page_size = page.size };
     vm.copyToUser(space(), ptr, std.mem.asBytes(&info)) catch return abi.fail(.fault);
     return 0;
-}
-
-/// 把第 index 个程序名的前 len 个字节写进用户内存，返回名字的完整长度。
-fn listprog(index: usize, ptr: usize, len: usize) usize {
-    if (index >= proc.programs.len) return abi.fail(.noent);
-    const name = proc.programs[index].name;
-    vm.copyToUser(space(), ptr, name[0..@min(len, name.len)]) catch return abi.fail(.fault);
-    return name.len;
 }
 
 fn shutdown() noreturn {

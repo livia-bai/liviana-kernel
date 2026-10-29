@@ -92,4 +92,4 @@ error: ld.lld: undefined symbol: a0
 - 元组可以在运行时拼接：`.{ p.pid, p.name } ++ args`（`proc.killCurrent` 用它把固定参数和调用者的参数合在一起交给 `print`）。
 - 数组重复运算符 `**` 已经没有了：`[_]T{x} ** n` 会报 `binary operator '*' has whitespace on one side, but not the other`（`**` 不再是一个运算符，被拆成了两个 `*`）。把同一个值铺满数组用 `@splat`：`var table: [8]Process = @splat(.{});`（`proc.table`）。
 - 编译期构造数组后要复制成 `const` 才能从块里返回：`const final = list; break :blk final;`（`proc.programs`）。
-- Debug 模式默认不做段回收（gc-sections），会把整个 compiler_rt 链接进来；需要小体积的产物（这里是要嵌进内核的用户程序）要显式设置 `link_gc_sections = true`。
+- Debug 模式默认不做段回收（gc-sections），会把整个 compiler_rt 链接进来；需要小体积的产物（这里是装进磁盘镜像的用户程序）要显式设置 `link_gc_sections = true`。

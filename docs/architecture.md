@@ -75,7 +75,7 @@ main.zig ─┬─ uart.zig ──────────── 串口输出（
           ├─ vm.zig ────────────── 页表（用 page.zig 分配页表）
           ├─ plic.zig、timer.zig
           └─ proc.zig ──────────── userinit、scheduler（每个 hart 最后都调用它，永不返回）
-                                   vm.zig、trap.zig（进入 U 模式）、file.zig（fd 表）、abi.zig、build_options + 嵌入的用户程序
+                                   vm.zig、trap.zig（进入 U 模式）、file.zig（fd 表）、abi.zig、嵌入的 init、fsys.zig（exec 从 /bin 加载程序）
 
 file.zig ─┬─ uart.zig（串口作为文件）
           ├─ pipe.zig ─── page.zig（每个管道一页）、vm.zig（复制用户内存）、proc.zig（sleep/wakeup）

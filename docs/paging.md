@@ -116,10 +116,10 @@ pub fn init(memory: dtb.Region) MapError!void
 
 | 范围 | 来自 | 权限 | Debug 模式实测 | 页大小 |
 | --- | --- | --- | --- | --- |
-| `[__text_start, __rodata_start)` | 代码 | R-X | `0x80200000..0x80255000` | 4 KiB |
-| `[__rodata_start, __data_start)` | 只读数据（含 `.eh_frame`、嵌入的用户程序 ELF） | R-- | `0x80255000..0x80354000` | 4 KiB |
-| `[__data_start, __kernel_end)` | `.data`、`.bss`、每个 hart 的启动栈、进程内核栈 | RW- | `0x80354000..0x803d7000` | 4 KiB |
-| `[__kernel_end, 内存末尾)` | 页分配器管理的内存、设备树 | RW- | `0x803d7000..0x88000000` | 到 `0x80400000` 为止用 4 KiB，之后 62 个 2 MiB |
+| `[__text_start, __rodata_start)` | 代码 | R-X | `0x80200000..0x8026e000` | 4 KiB |
+| `[__rodata_start, __data_start)` | 只读数据（含 `.eh_frame`、嵌入的 init 的 ELF） | R-- | `0x8026e000..0x802ac000` | 4 KiB |
+| `[__data_start, __kernel_end)` | `.data`、`.bss`、每个 hart 的启动栈、进程内核栈 | RW- | `0x802ac000..0x80359000` | 4 KiB |
+| `[__kernel_end, 内存末尾)` | 页分配器管理的内存、设备树 | RW- | `0x80359000..0x88000000` | 到 `0x80400000` 为止用 4 KiB，之后 62 个 2 MiB |
 | 串口 | `uart.base`、`uart.mmio_size` 向上取整到页 | RW- | `0x10000000..0x10001000` | 4 KiB |
 | PLIC | `plic.base`、`plic.mmio_size` | RW- | `0x0c000000..0x0c600000` | 3 个 2 MiB |
 | virtio-mmio | `virtio_disk.mmio_base`、`virtio_disk.mmio_size`（8 个槽位） | RW- | `0x10001000..0x10009000` | 4 KiB |

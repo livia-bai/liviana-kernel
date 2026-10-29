@@ -294,21 +294,50 @@ fn runPipeline(stages: []Stage) u8 {
     return code;
 }
 
+/// 程序文件在不在。和内核的 exec 一样：名字里没有 '/' 的在 /bin 里找，有的按路径找。
 fn programExists(name: []const u8) bool {
-    var buf: [32]u8 = undefined;
-    var i: usize = 0;
-    while (sys.listprog(i, &buf)) |p| : (i += 1) {
-        if (std.mem.eql(u8, p, name)) return true;
-    }
-    return false;
+    var buf: [abi.max_path]u8 = undefined;
+    const path = if (std.mem.indexOfScalar(u8, name, '/') != null)
+        name
+    else
+        std.fmt.bufPrint(&buf, "/bin/{s}", .{name}) catch return false;
+    const fd = sys.open(path, .{}) catch return false;
+    defer sys.close(fd) catch {};
+    const st = sys.fstat(fd) catch return false;
+    return st.kind == .file;
 }
 
+var name_bytes: [4096]u8 = undefined;
+var names: [128][]const u8 = undefined;
+
+/// 列出 /bin 里的程序，按名字排序（readdir 给的是名字的散列的顺序）。
 fn listPrograms() void {
-    var buf: [32]u8 = undefined;
+    const fd = sys.open("/bin", .{}) catch |err| {
+        sys.print("run: /bin: {s}\n", .{@errorName(err)});
+        return;
+    };
+    defer sys.close(fd) catch {};
+    var n: usize = 0;
+    var used: usize = 0;
+    var ent: abi.Dirent = undefined;
+    while (n < names.len and (sys.readdir(fd, &ent) catch false)) {
+        const name = ent.name[0..ent.name_len];
+        if (name.len > name_bytes.len - used) break;
+        names[n] = name_bytes[used..][0..name.len];
+        @memcpy(name_bytes[used..][0..name.len], name);
+        used += name.len;
+        n += 1;
+    }
+    // 插入排序：std.mem.sort 是块排序，栈上有一个 512 项的缓存（这里是 8 KiB 的切片），
+    // Debug 模式下把 16 KiB 的用户栈撑爆过。几十个名字用插入排序就够了
+    std.sort.insertion([]const u8, names[0..n], {}, lessThan);
     sys.print("programs:", .{});
-    var i: usize = 0;
-    while (sys.listprog(i, &buf)) |p| : (i += 1) sys.print(" {s}", .{p});
+    for (names[0..n]) |name| sys.print(" {s}", .{name});
     sys.print("\n", .{});
+}
+
+fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.order(u8, a, b) == .lt;
 }
 
 fn ps() void {

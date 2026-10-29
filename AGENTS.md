@@ -83,7 +83,7 @@ python3 tools/qemu_test.py --list      # 列出 QEMU 测试的用例和它们覆
 - 写时复制 B 树（`src/ctree.zig`）：已提交的树的块从来不改（要改先 `cow`）；释放已提交的树的块只进 `pending`，提交（写超级块）之后才能再分配；超级块是每个事务最后写的一块；修改前先 `reserve` 最坏情况的块数，做到一半出错就 `abort`。`Volume` 的位图每个 8 KiB，只在原地改，不要在栈上复制（[docs/btree.md](docs/btree.md#事务和提交)）。掉电测试（`ctree.zig` 末尾）必须一直能通过。
 - 用户页可能被几个地址空间共用（`fork` 写时复制，页表项标着 `cow`）：释放用户页只用 `page.free`（放掉一个引用，减到 0 才真正释放），共用页的内容不能直接改，要先 `vm.breakCow` 复制一份；`copyToUser`、检查可写的 `checkUser` 已经替调用方做了。改了正在用的页表要刷当前 hart 的 TLB（[docs/paging.md](docs/paging.md#写时复制)）。
 
-用户程序：`init`（第一个进程）和 `sh`（shell）必须有，shell 的命令写在 `user/sh.zig` 里（[docs/shell.md](docs/shell.md)）。新程序放在 `user/<名字>.zig`，提供 `pub fn main() u8`，用 `@import("sys")`（不是 `"sys.zig"`），再在 `build.zig` 的 `user_programs` 里加一项（[docs/user-programs.md](docs/user-programs.md#写一个新程序)）。回归测试程序放在 `user/tests/`，加到 `test_programs` 里，并在 `tools/qemu_test.py` 里加上检查（[docs/testing.md](docs/testing.md#加一个回归测试)）。
+用户程序：`init`（第一个进程）和 `sh`（shell）必须有，shell 的命令写在 `user/sh.zig` 里（[docs/shell.md](docs/shell.md)）。新程序放在 `user/<名字>.zig`，提供 `pub fn main() u8`，用 `@import("sys")`（不是 `"sys.zig"`），再在 `build.zig` 的 `user_programs` 里加一项，它就会被 `mkfs` 装进 `/bin`，`exec` 从那里加载；只有 `init` 嵌在内核里（[docs/user-programs.md](docs/user-programs.md#写一个新程序)、[docs/process.md](docs/process.md#程序从哪来)）。回归测试程序放在 `user/tests/`，加到 `test_programs` 里，并在 `tools/qemu_test.py` 里加上检查（[docs/testing.md](docs/testing.md#加一个回归测试)）。
 
 ## 文档
 

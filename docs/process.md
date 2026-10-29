@@ -13,27 +13,22 @@
 - **结束的进程变成 zombie，由父进程 `wait` 回收**。父进程先结束的，子进程交给 init。
 - **`kill` 只做标记**，被杀的进程回到 U 模式之前自己结束。
 
-## 程序表
+## 程序从哪来
 
 ```zig
-pub const Program = struct {
-    name: []const u8,
-    image: []const u8,   // ELF 文件的全部字节
-};
+const init_image = @embedFile("init");   // 内核里只嵌着 init
 
-pub const programs = blk: {
-    var list: [build_options.user_programs.len]Program = undefined;
-    for (&list, build_options.user_programs) |*p, name| p.* = .{ .name = name, .image = @embedFile(name) };
-    const final = list;
-    break :blk final;
+const Source = union(enum) {
+    bytes: []const u8,                                   // 嵌在内核里的（init、单元测试）
+    file: struct { fs: *fs.Fs, ino: u64, size: u64 },    // 文件系统里的一个文件（exec）
+    fn size(src: Source) u64
+    fn read(src: Source, off: u64, dst: []u8) LoadError!void   // 读不全是 BadElf
 };
-
-pub fn find(name: []const u8) ?*const Program
 ```
 
-- 在编译期遍历 `build_options.user_programs`（程序名列表），对每个名字 `@embedFile(name)`，得到构建系统作为匿名模块交进来的 ELF（[build.md](build.md#用户程序)）。ELF 的字节放在内核的 `.rodata` 里，只读。
-- `const final = list;` 是 Zig 编译期代码的固定写法：`list` 是编译期的 `var`，不能直接从块里“泄漏”出去，要先复制成 `const`。
-- `find` 按名字线性查找，`userinit` 和 `exec` 用它。用户程序通过 `listprog` 系统调用按下标读出程序名（shell 的 `run` 不带参数时列出它们）。
+- **init 嵌在内核里**：构建系统只把 init 的 ELF 作为匿名模块交给内核（[build.md](build.md#用户程序)），`@embedFile("init")` 拿到它的字节，放在内核的 `.rodata` 里。第一个进程要在挂载文件系统之前加载：挂载要读盘，读盘要睡着等，只有进程能做（[fs.md](fs.md#接进内核fsyszig)）。xv6 也是这样，只是它嵌的是一小段汇编（`initcode`），由它去 `exec("/init")`。
+- **别的程序都在文件系统的 `/bin` 里**：构建时 `mkfs` 把它们装进去（init 也在，可以 `run init`），`exec` 从那里加载。程序是普通的文件，可以复制、删除，也可以运行别的路径上的文件（`run /h`）。
+- 加载器（[ELF 加载器](#elf-加载器)）只通过 `Source` 读 ELF，不关心它在哪：嵌着的直接复制，文件系统里的用 `fs.read` 读，段的内容直接读进新分配的用户页，不经过别的缓冲区。
 
 ## 进程表
 
@@ -48,7 +43,7 @@ pub const Process = struct {
     state: State = .unused,            // lock
     hart: usize = 0,                   // lock。running 时在哪个 hart 上运行（kill 发核间中断用）
     pid: usize = 0,                    // lock
-    name: []const u8 = "",             // lock。程序名，exec 时换掉；fork 出来的子进程沿用父进程的
+    name: Name = .{},                  // lock。程序名（最多 16 字节，存在这里），exec 时换掉；fork 出来的子进程沿用父进程的
     space: *vm.PageTable = undefined,  // 根页表
     parent: ?*Process = null,          // wait_lock。父进程；init 没有
     context: Context = undefined,      // 不在运行时保存的内核上下文
@@ -93,7 +88,7 @@ pub fn current() ?*Process              // cpus[hart.id()].proc
 
 所有的状态变化都拿着这个进程的锁。
 
-- **每个进程一块 16 KiB 的内核栈**，静态分配在 `.bss` 里（16 块共 256 KiB）。不从页分配器要：它一次只给一页，给不出连续的 16 KiB。实测 Debug 模式下跑完全部 QEMU 测试（单核和 4 核，包括文件系统的 `t_fs` 和掉电后重新启动），最深用了 9944 字节，safe 模式下 5312 字节，small 模式下 5144 字节，最深的是文件系统的系统调用（B 树的操作，[fs.md](fs.md#接进内核fsyszig)）。测法：`.bss` 启动时清零，`shutdown` 时从每块栈的底部找第一个不为 0 的字节，取最大值（临时加的代码，没有留在仓库里）。内核栈两侧没有保护页：内核内存是用大页恒等映射的，要在中间挖出不映射的页得拆大页，现在没做。
+- **每个进程一块 16 KiB 的内核栈**，静态分配在 `.bss` 里（16 块共 256 KiB）。不从页分配器要：它一次只给一页，给不出连续的 16 KiB。实测 Debug 模式下跑完全部 QEMU 测试（单核和 4 核，包括文件系统的 `t_fs` 和掉电后重新启动），最深用了 9944 字节，safe 模式下 5840 字节，small 模式下 5096 字节，最深的是文件系统的系统调用（B 树的操作，[fs.md](fs.md#接进内核fsyszig)）。测法：`.bss` 启动时清零，`shutdown` 时从每块栈的底部找第一个不为 0 的字节，取最大值（临时加的代码，没有留在仓库里）。内核栈两侧没有保护页：内核内存是用大页恒等映射的，要在中间挖出不映射的页得拆大页，现在没做。
 - init 和 shell 一直占着两个槽位，所以同时最多运行 14 个别的程序。
 - `current()` 返回当前 hart 上正在运行的进程：`cpus[hart.id()].proc`，只在 `scheduler` 切到进程前设置、切回来后清回 `null`。系统调用和陷阱处理程序用 `current().?` 取当前进程，Debug/safe 模式下没有进程时会 panic。它不用加锁：只有这个 hart 自己读写自己那一项，而且内核关着中断运行，读到之后到开中断之前，这个 hart 不会换进程（xv6 的 `myproc` 为此要 `push_off`）。
 - 哪些字段由谁保护见[锁](#锁)。`space`、`context`、`files`、`heap_start`、`brk`、`cwd` 不用加锁：只有进程自己会读写它们（`close`/`dup`/`pipe`/`sbrk` 系统调用、`fork` 时复制给子进程、结束时关掉文件），没有线程，别的进程碰不到；父进程回收 zombie 时它已经不会再运行了。
@@ -133,18 +128,18 @@ vaddr            paddr            size             attr
 ## ELF 加载器
 
 ```zig
-fn load(space: *vm.PageTable, image: []const u8) LoadError!struct { entry: usize, brk: usize }  // 入口地址、堆的起点
-fn loadSegment(space: *vm.PageTable, image: []const u8, phdr: elf.Elf64.Phdr) LoadError!void
-const LoadError = error{ BadElf, OutOfMemory };
+fn load(space: *vm.PageTable, src: Source) LoadError!struct { entry: usize, brk: usize }  // 入口地址、堆的起点
+fn loadSegment(space: *vm.PageTable, src: Source, phdr: elf.Elf64.Phdr) LoadError!void
+const LoadError = error{ BadElf, OutOfMemory, IoError };
 ```
 
-ELF 是构建时嵌进来的，按理是可信的；但加载器按“输入可能是坏的”来写，每个字段都检查，坏的 ELF 只会得到 `BadElf`，不会让内核读写到不该碰的地方。头部结构用 `std.elf.Elf64.Ehdr` / `Elf64.Phdr`（0.17 里字段是带类型的枚举和 packed struct，旧的 `Elf64_Ehdr` 已弃用），用 `std.mem.bytesToValue` 从字节复制出来，所以不要求 `image` 对齐。
+ELF 来自文件系统，任何人都能往里写一个文件再去运行它，所以加载器按“输入可能是坏的”来写，每个字段都检查，坏的 ELF 只会得到 `BadElf`，不会让内核读写到不该碰的地方（读文件本身出错是 `IoError`）。头部结构用 `std.elf.Elf64.Ehdr` / `Elf64.Phdr`（0.17 里字段是带类型的枚举和 packed struct，旧的 `Elf64_Ehdr` 已弃用）：文件头和每个程序头各读一次到栈上（64、56 字节），用 `std.mem.bytesToValue` 从字节复制出来。
 
 **ELF 头的检查**（任何一条不满足都是 `BadElf`）：
 
 | 检查 | 原因 |
 | --- | --- |
-| 长度至少是一个 ELF 头 | 防止越界读 |
+| 长度至少是一个 ELF 头（`Source.read` 读不全就是 `BadElf`） | 防止越界读 |
 | 魔数 `\x7fELF`、64 位、小端 | 必须是 RV64 的 ELF |
 | `e_type == EXEC` | 只支持静态链接的可执行文件，不处理重定位 |
 | `e_machine == RISCV` | |
@@ -164,7 +159,7 @@ ELF 是构建时嵌进来的，按理是可信的；但加载器按“输入可�
 | 段必须可读（`p_flags.R`） | R/W/X 全为 0 的页表项会被 CPU 当成指向下一级页表的指针；W 无 R 是保留组合。见下面的说明 |
 | 和已经映射的页重叠 → `BadElf` | `allocUserPage` 返回 `AlreadyMapped` 时转换过来 |
 
-然后逐页 `vm.allocUserPage(space, p_vaddr + offset, {R, W, X})`：分配一页清零的物理内存、映射上，把文件里对应的内容复制进去；`p_filesz` 之后的部分（`.bss`）保持清零。
+然后逐页 `vm.allocUserPage(space, p_vaddr + offset, {R, W, X})`：分配一页清零的物理内存、映射上，把文件里对应的内容读进去（`Source.read` 直接读进这一页）；`p_filesz` 之后的部分（`.bss`）保持清零。
 
 **为什么一定要拒绝不可读的段**：如果一个段的 R/W/X 全为 0，`map` 写出的页表项只有 V = 1，硬件会把它当成“指向下一级页表”的项，而它指向的是一页用户数据。只要用户程序（或者构造 ELF 的人）往那一页里写入精心构造的页表项，就能把任意物理内存映射进自己的地址空间。这个漏洞是写完加载器后复查代码时发现的，现在加载器拒绝这样的段，`vm.map` 也断言了叶子权限合法。回归测试 `t_noperm`（[testing.md](testing.md#回归测试程序)）一直在检查这一点：故意去掉这条检查时，Debug 模式下 `vm.map` 的断言让内核 panic，small 模式下断言被编译掉，那一页真的被当成了页表。
 
@@ -217,7 +212,7 @@ scheduler → switchContext ─ret→ forkret → forkretC（放开进程锁、c
 
 ### userinit
 
-和 xv6 的 `userinit` 一样，只在启动时调用一次（这时别的 hart 已经在各自的调度器里空转了）：`loadImage` 新建地址空间（`vm.createUserSpace()`，复制内核的根页表）、加载嵌在内核里的 `init` 程序（[ELF 加载器](#elf-加载器)）、把命令行参数 `"init"` 放到栈顶（[命令行参数](#命令行参数)）；**打开串口作为 0、1、2 号 fd**（一个 `File`，引用数 3，[files.md](files.md)），之后所有进程都从 init `fork` 继承它们；拿着空槽位的锁（`allocSlot`），用 `startFrame(frame, image)` 构造从入口开始运行的 `TrapFrame`，填好字段，状态设为 `runnable`，pid 是 1，记进 `init_proc`，最后才放开锁。`init_proc` 在放开锁之前设置：别的 hart 要先拿到这把锁才能运行 init，那时一定看得到它。没有 `init` 程序是构建配置错了，直接 `@panic`；其他错误 `kmain` 会 panic。
+和 xv6 的 `userinit` 一样，只在启动时调用一次（这时别的 hart 已经在各自的调度器里空转了）：`loadImage` 新建地址空间（`vm.createUserSpace()`，复制内核的根页表）、加载嵌在内核里的 `init` 程序（`Source.bytes`，[程序从哪来](#程序从哪来)）、把命令行参数 `"init"` 放到栈顶（[命令行参数](#命令行参数)）；**打开串口作为 0、1、2 号 fd**（一个 `File`，引用数 3，[files.md](files.md)），之后所有进程都从 init `fork` 继承它们；拿着空槽位的锁（`allocSlot`），用 `startFrame(frame, image)` 构造从入口开始运行的 `TrapFrame`，填好字段，状态设为 `runnable`，pid 是 1，记进 `init_proc`，最后才放开锁。`init_proc` 在放开锁之前设置：别的 hart 要先拿到这把锁才能运行 init，那时一定看得到它。没有 `init` 程序是构建配置错了，直接 `@panic`；其他错误 `kmain` 会 panic。
 
 `startFrame` 构造的 `TrapFrame`：`sepc` = 入口地址，`sp`（`regs[2]`）和 `a1`（`regs[11]`）= 栈上 `Arg` 数组的地址，`a0`（`regs[10]`）= `argc`，其他寄存器为 0，`sstatus = (当前 sstatus & ~(SPP | SIE)) | SPIE`：
 
@@ -261,16 +256,19 @@ pub fn fork() ForkError!usize {
 ### exec
 
 ```zig
-pub fn exec(name: []const u8, args: []const []const u8) ExecError!void {
+pub fn exec(path: []const u8, args: []const []const u8) ExecError!void {
     const p = current().?;
-    const program = find(name) orelse return error.NoSuchProgram;
-    const image = try loadImage(program, args);   // 新地址空间 + 加载 + 参数放到栈顶
+    const root = fsys.get() catch return error.NoDevice;   // 拿着文件系统的锁加载
+    const image = blk: {
+        defer fsys.unlock();
+        break :blk try loadImage(try openProgram(root, p.cwd, path), args);   // 新地址空间 + 加载 + 参数放到栈顶
+    };
     const old = p.space;
     p.space = image.space;
     vm.activate(image.space);
     vm.destroyUserSpace(old);
     p.lock.acquire();
-    p.name = program.name;                        // procinfo 在别的 hart 上读它
+    p.name = .init(std.fs.path.basenamePosix(path));   // procinfo 在别的 hart 上读它
     p.lock.release();
     p.heap_start = image.brk;
     p.brk = image.brk;
@@ -278,11 +276,13 @@ pub fn exec(name: []const u8, args: []const []const u8) ExecError!void {
 }
 ```
 
+- **找程序**（`openProgram`）：`path` 里没有 `/` 的在 `/bin` 里找（`run hello` 就是 `/bin/hello`，相当于 `PATH` 只有 `/bin`），有的按路径找，相对路径从当前目录开始。找不到是 `NoSuchProgram`（`ENOENT`），是目录是 `BadElf`（`ENOEXEC`），路径中间不是目录是 `NotDir`，`/bin/` 加上名字超过 256 字节是 `NameTooLong`，没挂上文件系统是 `NoDevice`。
+- **加载期间拿着 `fsys.lock`**：程序文件读到一半不会被别的进程改掉、删掉。拿着这把睡眠锁再去分配页（`page.lock`，自旋锁）是允许的方向。
 - 先把新程序完整加载进**新的**地址空间，全部成功之后才换掉旧的。失败时旧的地址空间和 `TrapFrame` 都没动，系统调用返回错误，原来的程序接着运行（xv6 也是这样）。
 - `args` 已经在**内核内存**里了：参数在旧的地址空间里，换掉之前 `exec` 系统调用就把它们复制到了内核栈上（[syscalls.md](syscalls.md#exec)）。
 - **释放旧的页表之前必须先切走**：这时 `satp` 还指着旧的根页表。
 - 改写 `TrapFrame`：从新程序的入口开始，`a1`、`sp` 指向参数，其他寄存器为 0。系统调用返回值会写进 `a0`，所以 `exec` 系统调用成功时返回 `argc`，新程序看到 `a0 = argc`，和 init 第一次运行时一样。
-- pid、父进程、`ticks`、`killed`、**打开的文件**都不变；名字换成新程序的；堆重新从新程序的段之后开始（空的）。
+- pid、父进程、`ticks`、`killed`、**打开的文件**、当前目录都不变；名字换成程序文件的名字（路径的最后一段，`Name` 存在进程里，最多 16 字节，`run /h` 之后叫 `h`）；堆重新从新程序的段之后开始（空的）。
 
 ### 命令行参数
 
@@ -697,7 +697,7 @@ Ctrl-C 结束的是**前台进程和它的所有子孙**：shell 用 `fork` 启�
 - 进程之间没有优先级，也不考虑在哪个 hart 上运行过（没有亲和性）。
 - 进程表固定 16 项，内核栈和启动栈是静态的，两侧没有保护页：溢出时会悄悄踩坏相邻的数据，所以栈的大小按实测用量留了余量。
 - `fork` 写时复制，但页表还是整个复制的；内存用完时写共用的页只能结束进程（没有换页、没有 OOM killer 挑别的进程）。
-- `exec` 只能运行嵌在内核里的程序，还不能从文件系统加载（`/bin` 里已经有它们了）。
+- `exec` 没有 `PATH`、没有 `#!` 脚本，也不检查执行权限（文件系统没有权限位）：`/bin` 之外的程序要写路径，任何文件都可以拿去试着运行，不是 ELF 的得到 `ENOEXEC`。
 - 只有一个前台进程，没有进程组和信号：Ctrl-C 杀前台进程和它的子孙；前台进程的子孙被交给 init 之后（父进程先结束了）就不算了。
 - 只有 `sbrk`，没有 `mmap`；用户栈固定 16 KiB，不能增长。
 

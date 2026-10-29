@@ -57,11 +57,11 @@ Debug 模式下实测的符号值（代码改动后会变）：
 | 符号 | 地址 |
 | --- | --- |
 | `__text_start` | `0x80200000` |
-| `__rodata_start` | `0x80255000` |
-| `__data_start` | `0x80354000` |
-| `__bss_start` / `__bss_end` | `0x80355800` / `0x803d6fc0` |
-| `boot_stacks`（8 × 32 KiB） | `0x80395fb0` |
-| `__kernel_end` | `0x803d7000` |
+| `__rodata_start` | `0x8026e000` |
+| `__data_start` | `0x802ac000` |
+| `__bss_start` / `__bss_end` | `0x802ae000` / `0x80358100` |
+| `boot_stacks`（8 × 32 KiB） | `0x803170e0` |
+| `__kernel_end` | `0x80359000` |
 
 查看方法：`llvm-nm zig-out/bin/kernel | grep -E ' (__(text|rodata|data|bss|kernel)_|boot_stacks$)'`（release 模式的 ELF 不带符号表，要在 Debug 下看）。
 

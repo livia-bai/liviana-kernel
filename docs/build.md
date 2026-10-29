@@ -2,7 +2,7 @@
 
 涉及文件：`build.zig`、`linker.ld`、`user/linker.ld`
 
-整个项目用 `zig build` 构建：一次构建会产出内核 ELF（`zig-out/bin/kernel`），以及若干个用户程序 ELF。用户程序不单独安装，而是作为数据嵌进内核。
+整个项目用 `zig build` 构建：一次构建会产出内核 ELF（`zig-out/bin/kernel`）、若干个用户程序 ELF，以及装着它们的磁盘镜像（`zig-out/disk.img`）。内核从磁盘上的文件系统加载用户程序，只有第一个程序 init 作为数据嵌进内核。
 
 ```sh
 zig build                          # Debug 模式
@@ -100,7 +100,7 @@ const all_programs = user_programs ++ test_programs;
 const programs: []const UserProgram = if (with_tests) &all_programs else &user_programs;
 ```
 
-`-Dtest-programs=true` 时，`user/tests/` 里的回归测试程序也编进内核，`tools/qemu_test.py` 会自动加上这个选项（[testing.md](testing.md#回归测试程序)）；平时不加，`run` 列表里只有四个演示程序。
+`-Dtest-programs=true` 时，`user/tests/` 里的回归测试程序也编进内核，`tools/qemu_test.py` 会自动加上这个选项（[testing.md](testing.md#回归测试程序)）；平时不加，`/bin` 里没有测试程序。
 
 对每个程序的构建代码：
 
@@ -133,7 +133,7 @@ for (all_programs, 0..) |p, i| {
     program.link_gc_sections = true;
     unit_tests.root_module.addAnonymousImport(p.name, .{ .root_source_file = program.getEmittedBin() });
     if (i >= programs.len) continue; // 没被选中的测试程序只给单元测试用
-    kernel.root_module.addAnonymousImport(p.name, .{ .root_source_file = program.getEmittedBin() });
+    if (std.mem.eql(u8, p.name, "init")) kernel.root_module.addAnonymousImport(p.name, .{ .root_source_file = program.getEmittedBin() });
     program_bins.append(b.allocator, program.getEmittedBin()) catch @panic("OOM");   // 交给 mkfs，装进 /bin
     const install = b.addInstallArtifact(program, .{ .dest_dir = .{ .override = .{ .custom = "user" } } });
     b.getInstallStep().dependOn(&install.step);
@@ -148,40 +148,13 @@ for (all_programs, 0..) |p, i| {
 - **`.strip = true`**：去掉调试信息。内核加载用户程序时只看程序头，用不到符号和 DWARF。
 - **`.unwind_tables = .none`**：不生成 `.eh_frame`。用户程序没有栈回溯，unwind 表只是占地方。
 - **`link_gc_sections = true`**：Debug 模式默认不回收没被引用的段，会把整个 compiler_rt（`sin`、`log10` 等软件浮点函数）和 ubsan 运行时都链接进来。实测 Debug 版 `hello` 的可加载内容：默认 351 KB → 打开 GC 后 125 KB → 再去掉 unwind 表 91 KB。release 模式默认就会回收。
-- **`addAnonymousImport(name, .{ .root_source_file = program.getEmittedBin() })`**：把用户程序的 ELF 作为一个名叫 `name` 的匿名模块交给内核。内核里 `@embedFile("hello")` 拿到的就是这个 ELF 文件的全部字节（`*const [N:0]u8`）。构建系统据此知道内核依赖这些用户程序，用户程序改了会自动重新编译内核。
-- **`addInstallArtifact(..., .{ .dest_dir = .{ .override = .{ .custom = "user" } } })`**：另外把每个用户程序安装到 `zig-out/user/<名字>`，只是为了方便用 `llvm-readelf` 等工具查看，内核用的是嵌进去的那份。两者是同一个构建产物，字节完全相同（在内核 ELF 里能原样找到 `zig-out/user/hello` 的全部字节）。
+- **`program_bins`**：选中的每个程序的 ELF 交给 `mkfs`，装进磁盘镜像的 `/bin/<名字>`（[磁盘镜像](#磁盘镜像)），内核 `exec` 时从那里加载（[process.md](process.md#程序从哪来)）。
+- **只有 init 用 `addAnonymousImport`**：把它的 ELF 作为一个名叫 `init` 的匿名模块交给内核，内核里 `@embedFile("init")` 拿到的就是这个 ELF 文件的全部字节（`*const [N:0]u8`）。第一个进程要在挂载文件系统之前加载，所以只能嵌着。构建系统据此知道内核依赖 init，init 改了会重新编译内核；别的程序改了只重新生成磁盘镜像。
+- **`addInstallArtifact(..., .{ .dest_dir = .{ .override = .{ .custom = "user" } } })`**：另外把每个用户程序安装到 `zig-out/user/<名字>`，只是为了方便用 `llvm-readelf` 等工具查看，内核用的是磁盘镜像里的那份（同一个构建产物，字节完全相同）。
 
 - **所有程序都交给单元测试**：单元测试用真正的用户程序 ELF 来测 ELF 加载器（见下面的“单元测试”）。构建系统只编译被用到的产物，所以 `zig build` 不会编译没选中的测试程序，`zig build test` 才会。
 
-### 程序名列表 build_options
-
-内核需要知道一共有哪些程序，名字列表通过 `build_options` 传进去：
-
-```zig
-const names = b.allocator.alloc([]const u8, programs.len) catch @panic("OOM");
-for (programs, names) |p, *name| name.* = p.name;
-const options = b.addOptions();
-options.addOption([]const []const u8, "user_programs", names);
-kernel.root_module.addOptions("build_options", options);
-```
-
-构建时会在缓存目录里生成一个 `options.zig`，普通构建时内容是：
-
-```zig
-pub const user_programs: []const []const u8 = &[_][]const u8{
-    "init",
-    "sh",
-    "hello",
-    "fault",
-    "spin",
-    "ticker",
-    "echo",
-    "cat",
-    "wc",
-};
-```
-
-内核 `@import("build_options")` 后在编译期遍历它，对每个名字调用 `@embedFile`（见 [process.md](process.md#程序表)）。所以**新增用户程序只需要两步**：写 `user/<名字>.zig`，在 `user_programs` 数组里加一项 `.{ .name = "<名字>" }`。
+所以**新增用户程序只需要两步**：写 `user/<名字>.zig`，在 `user_programs` 数组里加一项 `.{ .name = "<名字>" }`，它就会出现在 `/bin` 里。
 
 ### 用户程序的链接脚本
 

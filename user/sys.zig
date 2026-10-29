@@ -288,9 +288,10 @@ pub fn fork() ForkError!usize {
     return ret;
 }
 
-pub const ExecError = error{ NoSuchProgram, OutOfMemory, BadElf, BadAddress, ArgsTooLong, Unexpected };
+pub const ExecError = error{ NoSuchProgram, OutOfMemory, BadElf, BadAddress, ArgsTooLong, NameTooLong, NotDir, IoError, NoDevice, Unexpected };
 
-/// 换成嵌在内核里的程序 name 运行，命令行参数是 args（按惯例第一个是程序名）。成功时不返回。
+/// 换成文件系统里的程序 name 运行（name 里没有 '/' 时在 /bin 里找），命令行参数是 args（按惯例第一个是程序名）。
+/// 成功时不返回。
 /// 最多 abi.max_args 个参数，加起来最多 abi.max_arg_bytes 字节。
 pub fn exec(name: []const u8, args: []const []const u8) ExecError!noreturn {
     if (args.len > abi.max_args) return error.ArgsTooLong;
@@ -308,6 +309,10 @@ pub fn execRaw(name: []const u8, args: []const abi.Arg) ExecError!noreturn {
         .noexec => error.BadElf,
         .fault => error.BadAddress,
         .toobig => error.ArgsTooLong,
+        .nametoolong => error.NameTooLong,
+        .notdir => error.NotDir,
+        .io => error.IoError,
+        .nodev => error.NoDevice,
         else => error.Unexpected,
     };
 }
@@ -363,13 +368,6 @@ pub fn meminfo() abi.MemInfo {
     var info: abi.MemInfo = undefined;
     _ = syscall(.meminfo, @intFromPtr(&info), 0, 0);
     return info;
-}
-
-/// 第 index 个嵌在内核里的程序名，写进 buf；index 超出范围时返回 null。名字比 buf 长时截断。
-pub fn listprog(index: usize, buf: []u8) ?[]u8 {
-    const ret = syscall(.listprog, index, @intFromPtr(buf.ptr), buf.len);
-    if (abi.errnoOf(ret) != null) return null;
-    return buf[0..@min(ret, buf.len)];
 }
 
 pub fn shutdown() noreturn {

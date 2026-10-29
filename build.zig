@@ -28,8 +28,9 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(kernel);
 
     // 用户程序：每个程序以 user/start.zig 为根文件、<目录>/<名字>.zig 作为 program 模块，
-    // 各自编译成一个 ELF，链接到用户地址空间（默认用 user/linker.ld）。ELF 再作为匿名模块交给内核，
-    // 内核用 @embedFile(名字) 拿到它的字节，运行时自己加载。程序名列表通过 build_options 传给内核。
+    // 各自编译成一个 ELF，链接到用户地址空间（默认用 user/linker.ld）。选中的程序由 mkfs 装进磁盘镜像的 /bin，
+    // 内核运行时从那里加载（exec）；只有 init 作为匿名模块嵌进内核（@embedFile("init")）：
+    // 第一个进程要在挂载文件系统之前加载。
     // -Dtest-programs=true 时再加上 user/tests/ 里的回归测试程序（tools/qemu_test.py 用）。
     const UserProgram = struct {
         name: []const u8,
@@ -89,11 +90,6 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("user/sys.zig"),
         .imports = &.{.{ .name = "abi", .module = abi }},
     });
-    const names = b.allocator.alloc([]const u8, programs.len) catch @panic("OOM");
-    for (programs, names) |p, *name| name.* = p.name;
-    const options = b.addOptions();
-    options.addOption([]const []const u8, "user_programs", names);
-    kernel.root_module.addOptions("build_options", options);
     // 选中的程序的 ELF，mkfs 把它们装进磁盘镜像的 /bin
     var program_bins: std.ArrayListUnmanaged(std.Build.LazyPath) = .empty;
     for (all_programs, 0..) |p, i| {
@@ -121,9 +117,9 @@ pub fn build(b: *std.Build) void {
         program.link_gc_sections = true;
         unit_tests.root_module.addAnonymousImport(p.name, .{ .root_source_file = program.getEmittedBin() });
         if (i >= programs.len) continue; // 没被选中的测试程序只给单元测试用
-        kernel.root_module.addAnonymousImport(p.name, .{ .root_source_file = program.getEmittedBin() });
+        if (std.mem.eql(u8, p.name, "init")) kernel.root_module.addAnonymousImport(p.name, .{ .root_source_file = program.getEmittedBin() });
         program_bins.append(b.allocator, program.getEmittedBin()) catch @panic("OOM");
-        // 另外安装一份到 zig-out/user/，方便用 llvm-readelf 等工具查看（内核用的是上面嵌进去的那份）
+        // 另外安装一份到 zig-out/user/，方便用 llvm-readelf 等工具查看（内核用的是磁盘镜像里的那份）
         const install = b.addInstallArtifact(program, .{ .dest_dir = .{ .override = .{ .custom = "user" } } });
         b.getInstallStep().dependOn(&install.step);
     }

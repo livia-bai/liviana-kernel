@@ -66,9 +66,9 @@ page.init(vm.kernelEnd(), info.memory.end(), info.reserved());
 实测（Debug 模式，128 MiB，不带测试程序的 `zig build`）：
 
 ```
-[0x803da000, 0x88000000)       = 31782 页
-减去引用数数组的 8 页          = 31774 页
-减去设备树占的 2 页            = 31772 页   ← 启动日志 [ok] page allocator: 31772 free pages
+[0x80359000, 0x88000000)       = 31911 页   ← 0x80359000 是 __kernel_end（llvm-readelf -s）
+减去引用数数组的 8 页          = 31903 页
+减去设备树占的 2 页            = 31901 页   ← 启动日志 [ok] page allocator: 31901 free pages
 ```
 
 之后建内核页表、创建 init 和 shell 还会用掉一些页，进 shell 后 `mem` 显示的空闲页数更少。

@@ -22,8 +22,8 @@ pub const Syscall = enum(usize) {
     read = 6,
     /// fork() 复制当前进程。父进程得到子进程的 pid，子进程得到 0
     fork = 7,
-    /// exec(name_ptr, name_len, argv_ptr, argc) 用嵌在内核里的程序 name 替换当前进程的地址空间，
-    /// 从它的入口开始执行。argv_ptr 指向 argc 个 Arg（命令行参数，按惯例第一个是程序名），
+    /// exec(path_ptr, path_len, argv_ptr, argc) 用文件系统里的程序 path 替换当前进程的地址空间，
+    /// 从它的入口开始执行。path 里没有 '/' 时在 /bin 里找，有的话按路径找。argv_ptr 指向 argc 个 Arg（命令行参数，按惯例第一个是程序名），
     /// 内核把它们复制到新程序的栈顶。成功时不返回到原来的程序：新程序看到 a0 = argc、
     /// a1 = 栈上 Arg 数组的地址、sp 在这个数组下面，其他寄存器都是 0。打开的文件保持不变
     exec = 8,
@@ -41,9 +41,7 @@ pub const Syscall = enum(usize) {
     procinfo = 13,
     /// meminfo(ptr) 把 MemInfo 写进用户内存，返回 0
     meminfo = 14,
-    /// listprog(index, ptr, len) 把第 index 个嵌在内核里的程序名写进用户内存（最多 len 字节），
-    /// 返回名字的完整长度；index 超出范围时返回 -ENOENT
-    listprog = 15,
+    // 15 原来是 listprog（列出嵌在内核里的程序），程序搬进文件系统的 /bin 之后去掉了，用 readdir 列 /bin
     /// shutdown() 关机，不返回
     shutdown = 16,
     /// close(fd) 关闭文件 fd，返回 0
@@ -123,7 +121,7 @@ pub const block_size = 4096;
 pub const Errno = enum(usize) {
     /// 没有权限（kill init）
     perm = 1,
-    /// 没有这个程序（exec、listprog），没有这个文件或目录
+    /// 没有这个程序（exec），没有这个文件或目录
     noent = 2,
     /// 没有这个进程（kill、setfg）
     srch = 3,

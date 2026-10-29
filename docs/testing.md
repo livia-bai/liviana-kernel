@@ -53,19 +53,19 @@ python3 tools/qemu_test.py --list         # 列出用例和它们覆盖的文件
 
 | 用例 | 做什么 | 覆盖的文件 |
 | --- | --- | --- |
-| `shell` | `help`、`uptime`、不认识的命令、`run` 不带参数和找不到的程序 | 只由核心文件触发 |
+| `shell` | `help`、`uptime`、不认识的命令、`run` 不带参数（`/bin` 里的程序按名字排序）和找不到的程序 | 只由核心文件触发 |
 | `interrupts` | `spin` 在前台死循环 0.5 秒，时钟中断至少来 10 次（`uptime` 的差），Ctrl-C 能结束它；在 shell 里按的 Ctrl-C 不会误杀下一个程序 | `src/timer.zig`、`src/sbi.zig`、`src/plic.zig`、`user/spin.zig` |
 | `user` | `hello`（系统调用、拒绝内核指针）、`fault`（读内核内存被杀）、`t_panic`、`t_time` | `user/linker.ld` 和这几个程序 |
 | `sched` | 两个后台 `spin` 死循环时，前台的 `hello`、`t_sleep` 照样跑完；0.5 秒里两个 `spin` 各自至少拿到 5 个 tick（`ps` 的 `TICKS`），状态是 `runnable` 或 `running`；`ps` 里 init 是 pid 1、在睡，sh 是它的子进程、在运行；Ctrl-C 只结束前台进程，也能结束睡在 `sleep` 里的前台进程；后台的 `ticker` 在 `ps` 里是 `sleeping`；`kill` 正常的、不存在的、缺参数的 pid 和 init；开满进程表后再 `run` 报 `too many processes` | `src/timer.zig`、`user/spin.zig`、`user/ticker.zig`、`user/hello.zig`、`user/tests/t_sleep.zig` |
 | `syscall` | `t_sys`：`write` 的各种边界情况、不存在的调用号 | `user/tests/t_sys.zig` |
-| `fork` | `t_fork`（自己检查 37 项，见下文）；`t_read` 分几次读完一行，睡在 `read` 里时按 Ctrl-C 能结束它；杀掉 shell 后 init 重新启动一个 | `user/hello.zig`、`user/tests/t_fork.zig`、`user/tests/t_read.zig` |
+| `fork` | `t_fork`（自己检查 49 项，见下文）；`t_read` 分几次读完一行，睡在 `read` 里时按 Ctrl-C 能结束它；杀掉 shell 后 init 重新启动一个 | `user/hello.zig`、`user/tests/t_fork.zig`、`user/tests/t_read.zig` |
 | `protection` | `t_wx`、`t_stack`、`t_priv`、`t_fp`、`t_noperm`：硬件和加载器的各种保护 | `user/linker.ld`、对应的测试程序 |
 | `args` | shell 按空格拆参数（多个空格算一个），`t_args` 看到的 argc、argv、退出码；`echo` 带参数、不带参数；超过 16 个参数时 shell 报错；`t_args check`（自己检查 11 项） | `user/echo.zig`、`user/tests/t_args.zig` |
 | `pipe` | `t_pipe`（自己检查 31 项）；shell 的管道：`echo \| wc`、`echo \| cat \| cat \| wc`、`t_args \| wc` 的结果，找不到的程序、空的一段、超过 4 个程序时报错；后台管道；对 `cat \| wc` 按 Ctrl-C 杀掉三个进程（组长、cat、wc），之后 `ps` 里没有剩下的；对 `cat \| wc` 输入 `abc` 再按 Ctrl-D，wc 打印 `0 1 3` | `src/pipe.zig`、`user/echo.zig`、`user/cat.zig`、`user/wc.zig`、`user/tests/t_pipe.zig`、`user/tests/t_args.zig` |
 | `sbrk` | `t_sbrk`（自己检查 25 项） | `user/tests/t_sbrk.zig` |
 | `cow` | `t_cow`（自己检查 15 项，见下文）；它打印的 `fork` 用掉的页数少于 16；最后一项里子进程被 `killed: out of memory (copy-on-write)` | `user/tests/t_cow.zig` |
 | `disk` | `disk` 命令打印 `1024 blocks of 4 KiB (4 MiB)`（原始区域）；`t_disk`（自己检查 19 项，见下文）；QEMU 退出之后读这次启动用的磁盘镜像，原始区域的每一块都要是 `t_disk` 写进去的或者原来的内容 | `src/sleeplock.zig`、`src/bio.zig`、`src/virtio_disk.zig`、`src/fsys.zig`、`src/mkfs.zig`、`user/tests/t_disk.zig` |
-| `fs` | shell 里的文件操作：`ls /`、`ls /bin`、`echo ... > F` 再 `cat F`、`wc < F`、`echo \| cat >F`、`mkdir` 两层、`cd` 进去用相对路径写和列、`cd ..`、`rm` 非空目录报 `NotEmpty`、删干净之后 `ls /` 只剩 `bin`；`cd`、`cat`、`<`、`>`、`mkdir` 的出错信息；`t_fs`（自己检查 84 项，见下文）。QEMU 正常关机之后在同一个镜像上**再启动两次**：第二次 `cat` 上一次写的文件还在，然后后台运行 `t_fs churn`，0.2～1 秒（随机）之后直接杀掉 QEMU；第三次启动时文件系统要能挂上，`t_fs verify` 检查 churn 写的东西（实测留下几十到一百多条记录）。两次启动的串口日志在 `disk-smpN-boot2.log`、`-boot3.log` | `src/btree.zig`、`src/ctree.zig`、`src/fs.zig`、`src/fsys.zig`、`src/mkfs.zig`、`src/sleeplock.zig`、`src/bio.zig`、`src/virtio_disk.zig`、`user/ls.zig`、`user/mkdir.zig`、`user/rm.zig`、`user/cat.zig`、`user/echo.zig`、`user/wc.zig`、`user/tests/t_fs.zig` |
+| `fs` | shell 里的文件操作：`ls /`、`ls /bin`、`echo ... > F` 再 `cat F`、`wc < F`、`echo \| cat >F`、`mkdir` 两层、`cd` 进去用相对路径写和列、`cd ..`、`rm` 非空目录报 `NotEmpty`、删干净之后 `ls /` 只剩 `bin`；`cd`、`cat`、`<`、`>`、`mkdir` 的出错信息；`cat /bin/hello > /h` 复制一个程序再 `run /h`（进程名是 `h`），不是 ELF 的文件是 `BadElf`，`run /bin` 是找不到程序；`t_fs`（自己检查 84 项，见下文）。QEMU 正常关机之后在同一个镜像上**再启动两次**：第二次 `cat` 上一次写的文件还在，然后后台运行 `t_fs churn`，0.2～1 秒（随机）之后直接杀掉 QEMU；第三次启动时文件系统要能挂上，`t_fs verify` 检查 churn 写的东西（实测留下几十到一百多条记录）。两次启动的串口日志在 `disk-smpN-boot2.log`、`-boot3.log` | `src/btree.zig`、`src/ctree.zig`、`src/fs.zig`、`src/fsys.zig`、`src/mkfs.zig`、`src/sleeplock.zig`、`src/bio.zig`、`src/virtio_disk.zig`、`user/ls.zig`、`user/mkdir.zig`、`user/rm.zig`、`user/cat.zig`、`user/echo.zig`、`user/wc.zig`、`user/tests/t_fs.zig` |
 | `ipi` | `t_ipi`：打印 kill、wakeup 两个延迟的中位数；多核时要求 kill < 2000 µs、wakeup < 1000 µs（没有核间中断时实测 kill ≥ 4000 µs、wakeup ≥ 1100 µs，有了之后约 300～560 µs 和 200 µs） | `src/sbi.zig`、`user/tests/t_ipi.zig` |
 | `smp` | `t_smp`（自己检查 17 项，见下文）；至少 3 个 hart 时，两个后台 `spin` 0.5 秒里加起来拿到的 tick 要多于 65 个（一个 hart 最多给 50 个，所以它们一定是同时在两个 hart 上跑的。实测 4 核时约 100 个） | `src/timer.zig`、`src/plic.zig`、`src/pipe.zig`、`user/spin.zig`、`user/tests/t_smp.zig` |
 
@@ -100,7 +100,7 @@ FAIL  safe   smp4   sched       61 checks
 | `t_sleep` | `sleep(200)` 前后的 `uptime()`；`sleep(0)`、`yield()` | 睡了 200..1000 ms（按 tick 算至少 200）；之后打印 `yield ok`，退出码 0 |
 | `t_time` | U 模式执行 `rdtime` | 正常返回（`scounteren` 允许，见 [user-programs.md](user-programs.md#写一个新程序)） |
 | `t_noperm` | 数据段 `FLAGS(0)` 的 ELF（用 `user/tests/noperm.ld` 链接） | `run: cannot load t_noperm: BadElf` |
-| `t_fork` | `fork` 的返回值和地址空间复制；`wait` 的退出码、nohang、没有子进程、别人的子进程、坏的 options、写不进状态时不回收；`kill` 睡着的子进程、init、不存在的 pid；`setfg` 不存在的 pid；`exec` 不存在的程序、太长的名字、坏 ELF、坏指针，成功后 pid 不变；孤儿交给 init（孙进程的 `getppid()` 变成 1）；`fork` 到进程表满（`EAGAIN`）再全部回收；`procinfo`、`meminfo`、`listprog`、`read` 的坏参数和边界 | 每项失败打印 `FAIL: ...`；最后 `N checks, 0 failed`，退出码 0 |
+| `t_fork` | `fork` 的返回值和地址空间复制；`wait` 的退出码、nohang、没有子进程、别人的子进程、坏的 options、写不进状态时不回收；`kill` 睡着的子进程、init、不存在的 pid；`setfg` 不存在的 pid；`exec` 不存在的程序和路径、空名字、257 字节的路径和加上 `/bin/` 超长的名字（`NameTooLong`）、坏 ELF、目录、路径中间是文件（`NotDir`）、坏指针，成功后 pid 不变；孤儿交给 init（孙进程的 `getppid()` 变成 1）；`fork` 到进程表满（`EAGAIN`）再全部回收；`procinfo`、`meminfo`、`read` 的坏参数和边界，去掉了的 15 号调用（原来的 `listprog`）是 `ENOSYS` | 每项失败打印 `FAIL: ...`；最后 `N checks, 0 failed`，退出码 0 |
 | `t_read` | 每次最多 `read` 3 个字节，读到回车为止 | 输入 `hello world` 回车：`got "hello world" in N reads`，N ≥ 4 |
 | `t_args` | 不带 `check` 时打印 argc、每个参数、总字节数，退出码是 argc。`t_args check`：`argv` 在栈顶那一页、16 字节对齐；17 个参数、1026 字节的参数返回 `ArgsTooLong`；`argv` 指针、参数指针指向内核时 `EFAULT`；长度为 0 的参数不检查指针；正好 16 个参数、1024 字节；没有参数。要看子进程收到的参数时，把它的 stdout 接到管道上读回来比较 | 每项失败打印 `FAIL: ...`；最后 `N checks, 0 failed`，退出码 0 |
 | `t_pipe` | 基本读写、fd 编号最小；往读端写、从写端读是 `BadFd`；写端关了读到结尾；子进程写 5000 字节（比缓冲区大，要等）、父进程读完一字不差且读了至少 3 次；读的一方先睡下；读端关了写返回 `BrokenPipe`；写满之后读端才关，睡着的写者被叫醒、只写出一部分；睡在管道读、写里时被 kill；坏的 fd、坏指针；`dup` 到 fd 表满、`pipe` 在只剩一个空位时失败且不漏；`fork` 继承 fd、子进程关 stdout 不影响父进程 | 同上 |

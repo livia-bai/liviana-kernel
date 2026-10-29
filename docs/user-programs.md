@@ -1,8 +1,8 @@
 # 用户程序
 
-涉及文件：`user/start.zig`、`user/sys.zig`、`user/linker.ld`、`user/init.zig`、`user/sh.zig`、`user/hello.zig`、`user/fault.zig`、`user/spin.zig`、`user/ticker.zig`、`user/echo.zig`、`user/cat.zig`、`user/wc.zig`
+涉及文件：`user/start.zig`、`user/sys.zig`、`user/linker.ld`、`user/init.zig`、`user/sh.zig`、`user/hello.zig`、`user/fault.zig`、`user/spin.zig`、`user/ticker.zig`、`user/echo.zig`、`user/cat.zig`、`user/wc.zig`、`user/ls.zig`、`user/mkdir.zig`、`user/rm.zig`
 
-用户程序运行在 U 模式，只能访问自己地址空间里的页，要输出文字、读键盘、用管道、创建进程、退出都要通过系统调用（[syscalls.md](syscalls.md)）。它们在构建时编译成独立的 ELF 并嵌进内核（[build.md](build.md#用户程序)）。内核启动时只加载 `init`，其他程序都是由已有的进程 `fork` 再 `exec` 出来的（[process.md](process.md#创建进程)）：init 启动 shell（`sh`），shell 的 `run` 命令再启动别的程序。
+用户程序运行在 U 模式，只能访问自己地址空间里的页，要输出文字、读键盘、用管道、创建进程、退出都要通过系统调用（[syscalls.md](syscalls.md)）。它们在构建时编译成独立的 ELF，由 `mkfs` 装进磁盘镜像的 `/bin`；只有 `init` 嵌在内核里（[build.md](build.md#用户程序)、[process.md](process.md#程序从哪来)）。内核启动时只加载 `init`，其他程序都是由已有的进程 `fork` 再 `exec` 出来的（[process.md](process.md#创建进程)）：init 启动 shell（`sh`），shell 的 `run` 命令再启动别的程序。
 
 ## 目录结构
 
@@ -78,7 +78,6 @@ pub fn kill(pid: usize) KillError!void
 pub fn setfg(pid: ?usize) error{ NoSuchProcess, Unexpected }!void
 pub fn procinfo(buf: []abi.ProcInfo) usize
 pub fn meminfo() abi.MemInfo
-pub fn listprog(index: usize, buf: []u8) ?[]u8
 pub fn shutdown() noreturn
 pub fn print(comptime fmt: []const u8, args: anytype) void              // 输出到 stdout
 pub fn fprint(fd: Fd, comptime fmt: []const u8, args: anytype) void
@@ -300,7 +299,7 @@ dir         0 e
 不能用或要注意的：
 
 - 堆要自己用 `sbrk` 要：`std.heap.page_allocator` 等依赖操作系统的分配器不可用，`sys.zig` 也还没有提供分配器。可以用 `sbrk` 要一块内存，再用 `std.heap.FixedBufferAllocator` 包起来；小的也可以直接用全局数组或者栈。
-- 系统调用见 [syscalls.md](syscalls.md#调用列表)：可以读写 fd（串口、管道、文件）、用文件系统（`open`、`mkdir`、`readdir` 等）、`fork`/`exec`/`wait`、读命令行参数，没有线程。`exec` 只能运行嵌在内核里的程序。
+- 系统调用见 [syscalls.md](syscalls.md#调用列表)：可以读写 fd（串口、管道、文件）、用文件系统（`open`、`mkdir`、`readdir` 等）、`fork`/`exec`/`wait`、读命令行参数，没有线程。`exec` 运行文件系统里的程序：名字里没有 `/` 的在 `/bin` 里找。
 - 不能用浮点指令：浮点运算由 compiler_rt 软件实现，慢而且让程序变大。浮点单元被内核关掉了（`sstatus.FS = Off`），手写的浮点指令会触发 `illegal_instruction` 被结束（回归测试 `t_fp`）。
 - 栈只有 16 KiB，下面是不映射的保护页：栈溢出时触发 `store_page_fault`（`stval` 落在 `0x7fffb000..0x7fffc000`），进程被结束。
 - 不能执行特权指令、不能访问 S 模式的 CSR（比如 `csrr sstatus`），否则触发 `illegal_instruction` 被结束。例外是 `cycle`、`time`、`instret` 三个计数器：OpenSBI 启动时把 `scounteren` 设成了 7（内核进入时实测，内核没有改它），所以用户程序可以直接用 `rdtime` 等指令读，实测 `rdtime` 在 U 模式下正常返回。
