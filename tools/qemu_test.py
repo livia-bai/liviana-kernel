@@ -683,6 +683,8 @@ def case_fs(q, c, mode):
     exited(c, q.command("run rm /h /bad"), "rm", 0)
     # 系统调用的边界情况、并发；之后整个文件系统检查一遍
     check_counts(c, q.command("run t_fs"), "t_fs")
+    # 多核下同时读写：读者在快照上读，每次读到的都是某个完整的版本
+    check_counts(c, q.command("run t_fsmp"), "t_fsmp")
     scrub_ok(c, q.command("run scrub"), "run scrub")
     # 关机之后：重新启动看文件还在，再测掉电
     q.command("run echo persist across reboots > /keep.txt")
@@ -740,7 +742,8 @@ CASES = {
                          "user/tests/t_disk.zig"]),
     "fs": (case_fs, ["src/sleeplock.zig", "src/bio.zig", "src/virtio_disk.zig", "src/btree.zig", "src/ctree.zig",
                      "src/fs.zig", "src/fsys.zig", "src/mkfs.zig", "user/ls.zig", "user/mkdir.zig", "user/rm.zig",
-                     "user/cat.zig", "user/echo.zig", "user/wc.zig", "user/scrub.zig", "user/mv.zig", "user/tests/t_fs.zig"]),
+                     "user/cat.zig", "user/echo.zig", "user/wc.zig", "user/scrub.zig", "user/mv.zig", "user/tests/t_fs.zig",
+                     "user/tests/t_fsmp.zig"]),
     "smp": (case_smp, ["src/timer.zig", "src/plic.zig", "src/pipe.zig", "user/spin.zig", "user/tests/t_smp.zig"]),
 }
 

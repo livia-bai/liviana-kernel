@@ -2,6 +2,15 @@
 
 每次改了内核（`src/`、`user/`、`build.zig`、链接脚本），在最上面加几行：新增了什么功能，修了什么 bug。最新的在前面。
 
+## 2026-10-30 细粒度的锁
+
+- 改动：页分配器每个 hart 一条空闲链表、一把锁（照 xv6 lock lab 的 kalloc），自己的空了从别的 hart 那里一次拿 32 页；每一页的引用数改成原子操作，不拿锁。`page.free_pages` 变量换成 `page.freePages()`。
+- 改动：缓冲区缓存按块号分进 13 个桶，每个桶一把锁（照 xv6 lock lab 的 bcache）；LRU 改用时间戳，换块时拿 `evict_lock` 从所有桶里找最久没用的。原来的 `bio.lock` 去掉了。
+- 改动：文件表没有整张表的锁了，每个 `File` 一把自旋锁保护引用数；读写位置 `off` 由每个 `File` 的睡眠锁 `pos_lock` 保护（原来靠文件系统的锁）。
+- 改动：文件系统的读（`read`、`fstat`、`readdir`、`lseek`、`chdir`、只打开已有文件的 `open`、`exec` 加载程序）不再拿锁，在最近一次提交的 B 树的快照上读，和别的读、和修改同时进行；修改（`write`、`mkdir`、`unlink`、`rename`、建文件或截断的 `open`、`scrub`）拿 `fsys.write_lock`，之间仍然排队。原来的 `fsys.lock`、`fsys.get` 换成 `fsys.reader`、`fsys.writer`。
+- 新增：`ctree` 的快照（`beginRead`、`endRead`、`lookupAt`、`nextAt`）。提交时还有读者在旧树上读的话，旧树释放的块先进 `limbo`，读者都读完才再分配；空闲块不够时修改的一方睡着等读者读完。
+- 新增：回归测试 `t_fsmp`（读者和写者同时进行，读到的总是完整的某个版本）；`page`、`ctree` 的单元测试。
+
 ## 2026-10-30 lseek、O_APPEND、rename、shell 直接运行程序
 
 - 新增：系统调用 `lseek`（32，`seek_set`/`seek_cur`/`seek_end`，可以挪到末尾之后；串口、管道是新错误码 `ESPIPE`；目录只能挪回 0 重新列）和 `open` 的 `open_append`（0x800：查文件长度和写在同一次拿锁里，几个进程各自打开同一个文件追加也不会互相覆盖）。

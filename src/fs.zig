@@ -125,8 +125,11 @@ fn dataRefs(key: Key, data: []const u8) ?ctree.DataRef {
 
 pub const Fs = struct {
     vol: *Volume,
-    /// 下一个新 inode 的号
+    /// 下一个新 inode 的号（只有修改的一方用）
     next_ino: u64,
+    /// 读者的快照：不为 null 时只读，所有查找都在这棵已提交的树上做（ctree 的 beginRead）；
+    /// 为 null 时是修改的一方，在当前事务的树上做
+    view: ?ctree.Root = null,
 
     /// 在磁盘上建一个只有空的根目录的文件系统。
     pub fn format(vol: *Volume, blocks: u64) Error!void {
@@ -148,8 +151,9 @@ pub const Fs = struct {
         return fs;
     }
 
-    /// 做一个操作：成功就提交，出错就作废这个事务（之前做了一半的都不算）。
+    /// 做一个操作：成功就提交，出错就作废这个事务（之前做了一半的都不算）。读者不能用。
     pub fn run(fs: *Fs, comptime op: anytype, args: anytype) Error!@typeInfo(@typeInfo(@TypeOf(op)).@"fn".return_type.?).error_union.payload {
+        std.debug.assert(fs.view == null);
         const result = @call(.auto, op, .{fs} ++ args) catch |err| {
             try fs.vol.abort();
             return err;
@@ -158,11 +162,21 @@ pub const Fs = struct {
         return result;
     }
 
+    // ---- 查找：读者在快照上，修改的一方在当前的树上 ----
+
+    fn lookup(fs: *Fs, key: Key, out: ?[]u8) Error!?usize {
+        return fs.vol.lookupAt(fs.view orelse fs.vol.root, key, out);
+    }
+
+    fn next(fs: *Fs, key: Key, out: ?[]u8) Error!?ctree.Volume.Found {
+        return fs.vol.nextAt(fs.view orelse fs.vol.root, key, out);
+    }
+
     // ---- inode ----
 
     fn getInode(fs: *Fs, ino: u64) Error!Inode {
         var ind: Inode = undefined;
-        const size = try fs.vol.lookup(Key.init(ino, type_inode, 0), std.mem.asBytes(&ind)) orelse return error.NotFound;
+        const size = try fs.lookup(Key.init(ino, type_inode, 0), std.mem.asBytes(&ind)) orelse return error.NotFound;
         if (size != @sizeOf(Inode)) return error.Corrupt;
         return ind;
     }
@@ -186,7 +200,7 @@ pub const Fs = struct {
         var buf: [@sizeOf(DirHeader) + max_name]u8 = undefined;
         var k = Key.init(dir, type_dir, h << 32);
         var next_seq: u64 = 0;
-        while (try fs.vol.next(k, &buf)) |f| {
+        while (try fs.next(k, &buf)) |f| {
             if (f.key.objectid != dir or f.key.type != type_dir or f.key.offset >> 32 != h) break;
             if (f.size < @sizeOf(DirHeader)) return error.Corrupt;
             const head = std.mem.bytesToValue(DirHeader, buf[0..@sizeOf(DirHeader)]);
@@ -263,12 +277,12 @@ pub const Fs = struct {
     /// 删掉目录 dir 里的目录项 e 和它指向的 inode（unlink、rename 换掉已有的名字）。目录必须是空的。
     fn remove(fs: *Fs, dir: u64, e: Found) Error!void {
         if (e.kind == .dir) {
-            if (try fs.vol.next(Key.init(e.ino, type_dir, 0), null)) |f| {
+            if (try fs.next(Key.init(e.ino, type_dir, 0), null)) |f| {
                 if (f.key.objectid == e.ino and f.key.type == type_dir) return error.NotEmpty;
             }
         }
         // inode 号为 e.ino 的所有条目：inode 和文件内容
-        while (try fs.vol.next(Key.init(e.ino, 0, 0), null)) |f| {
+        while (try fs.next(Key.init(e.ino, 0, 0), null)) |f| {
             if (f.key.objectid != e.ino) break;
             try fs.dropItem(f.key);
         }
@@ -325,7 +339,7 @@ pub const Fs = struct {
     /// 删掉一个条目；是指向数据块的内容条目的话，数据块也释放。
     fn dropItem(fs: *Fs, key: Key) Error!void {
         var buf: [@sizeOf(BlockExtent)]u8 = undefined;
-        const size = try fs.vol.lookup(key, &buf) orelse return error.NotFound;
+        const size = try fs.lookup(key, &buf) orelse return error.NotFound;
         if (dataRefs(key, buf[0..@min(size, buf.len)])) |d| {
             if (size == @sizeOf(BlockExtent)) fs.vol.freeData(d.blockno, d.generation);
         }
@@ -336,7 +350,7 @@ pub const Fs = struct {
     pub fn readdir(fs: *Fs, dir: u64, cookie: u64, name: *[max_name]u8) Error!?Dirent {
         if ((try fs.getInode(dir)).kind != .dir) return error.NotDir;
         var buf: [@sizeOf(DirHeader) + max_name]u8 = undefined;
-        const f = try fs.vol.next(Key.init(dir, type_dir, cookie), &buf) orelse return null;
+        const f = try fs.next(Key.init(dir, type_dir, cookie), &buf) orelse return null;
         if (f.key.objectid != dir or f.key.type != type_dir) return null;
         if (f.size < @sizeOf(DirHeader)) return error.Corrupt;
         const head = std.mem.bytesToValue(DirHeader, buf[0..@sizeOf(DirHeader)]);
@@ -370,7 +384,7 @@ pub const Fs = struct {
 
     fn readPage(fs: *Fs, ino: u64, page: u64, a: usize, m: usize, out: anytype, at: usize) Error!void {
         var ebuf: [@sizeOf(ExtentHeader) + inline_max]u8 = undefined;
-        const size = try fs.vol.lookup(extentKey(ino, page), &ebuf) orelse return out.put(at, zeros[0..m]); // 洞
+        const size = try fs.lookup(extentKey(ino, page), &ebuf) orelse return out.put(at, zeros[0..m]); // 洞
         if (size < @sizeOf(ExtentHeader) or size > ebuf.len) return error.Corrupt;
         const head = std.mem.bytesToValue(ExtentHeader, ebuf[0..@sizeOf(ExtentHeader)]);
         switch (head.kind) {
@@ -430,7 +444,7 @@ pub const Fs = struct {
 
     fn page0Inline(fs: *Fs, ino: u64) Error!bool {
         var head: ExtentHeader = undefined;
-        _ = try fs.vol.lookup(extentKey(ino, 0), std.mem.asBytes(&head)) orelse return false;
+        _ = try fs.lookup(extentKey(ino, 0), std.mem.asBytes(&head)) orelse return false;
         return head.kind == .inline_data;
     }
 
@@ -440,7 +454,7 @@ pub const Fs = struct {
         var buf: [h + inline_max]u8 = undefined;
         const old: usize = @intCast(size);
         if (old > 0) {
-            const got = try fs.vol.lookup(extentKey(ino, 0), &buf) orelse return error.Corrupt;
+            const got = try fs.lookup(extentKey(ino, 0), &buf) orelse return error.Corrupt;
             if (got != h + old) return error.Corrupt;
         } else {
             @memcpy(buf[0..h], std.mem.asBytes(&ExtentHeader{ .kind = .inline_data }));
@@ -455,7 +469,7 @@ pub const Fs = struct {
     fn unInline(fs: *Fs, ino: u64) Error!void {
         const h = @sizeOf(ExtentHeader);
         var buf: [h + inline_max]u8 = undefined;
-        const size = try fs.vol.lookup(extentKey(ino, 0), &buf) orelse return error.Corrupt;
+        const size = try fs.lookup(extentKey(ino, 0), &buf) orelse return error.Corrupt;
         const blk = try fs.vol.allocData();
         const b = try bio.get(blk);
         defer bio.release(b);
@@ -477,7 +491,7 @@ pub const Fs = struct {
         const key = extentKey(ino, page);
         var old: ?BlockExtent = null;
         var ebuf: [@sizeOf(BlockExtent)]u8 = undefined;
-        if (try fs.vol.lookup(key, &ebuf)) |size| {
+        if (try fs.lookup(key, &ebuf)) |size| {
             const head = std.mem.bytesToValue(ExtentHeader, ebuf[0..@sizeOf(ExtentHeader)]);
             if (size != @sizeOf(BlockExtent) or head.kind != .block) return error.Corrupt;
             old = std.mem.bytesToValue(BlockExtent, &ebuf);
@@ -508,7 +522,7 @@ pub const Fs = struct {
     pub fn truncate(fs: *Fs, ino: u64) Error!void {
         var ind = try fs.getInode(ino);
         if (ind.kind != .file) return error.IsDir;
-        while (try fs.vol.next(extentKey(ino, 0), null)) |f| {
+        while (try fs.next(extentKey(ino, 0), null)) |f| {
             if (f.key.objectid != ino or f.key.type != type_extent) break;
             try fs.dropItem(f.key);
         }
@@ -544,7 +558,7 @@ pub const Fs = struct {
         var names: Tally = .{};
         var inodes: Tally = .{};
         var k = Key.init(0, 0, 0);
-        while (try fs.vol.next(k, &buf)) |f| : (k = f.key.successor() orelse break) {
+        while (try fs.next(k, &buf)) |f| : (k = f.key.successor() orelse break) {
             const ino = f.key.objectid;
             const data = buf[0..f.size]; // ctree 的 check 保证了不超过 max_data
             if (ino >= fs.next_ino) return error.Corrupt;

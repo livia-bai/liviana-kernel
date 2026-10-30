@@ -7,9 +7,13 @@
 //! - init 打开串口作为 0、1、2 号 fd，其他进程都从它那里 fork 继承；pipe 系统调用创建管道；
 //!   open 系统调用打开文件系统里的文件、目录。
 //!
-//! 文件表由 lock 保护（多核时几个 hart 会同时打开、关闭文件）。File 本身的 kind、readable、ino 等字段
-//! 在分配出来之后就不变了，读写时不用拿 lock；管道的状态由管道自己的锁保护（pipe.zig），
-//! 文件的读写位置 off 由文件系统的锁保护（fsys.lock）。
+//! 锁都在每个 File 里，没有整张表的锁：
+//! - File.lock（自旋锁）保护这个槽位的 ref：分配槽位（逐个槽位拿锁看 ref 是不是 0）、dup、close。
+//!   几个 hart 同时打开、关闭不同的文件不用排队。
+//! - kind、readable、ino 等字段在分配出来、交给 fd 之前填好，之后就不变了，读写时不用拿锁；
+//!   管道的状态由管道自己的锁保护（pipe.zig）。
+//! - File.pos_lock（睡眠锁）保护文件系统里的文件的读写位置 off：读写、lseek、readdir 的整个过程拿着它，
+//!   fork、dup 共用同一个 File 的进程同时读写时排队，off 不会乱。拿它在文件系统的锁之前（见 fsys.zig）。
 
 const std = @import("std");
 const uart = @import("uart.zig");
@@ -21,6 +25,7 @@ const fsys = @import("fsys.zig");
 const fs = @import("fs.zig");
 const abi = @import("abi.zig");
 const Spinlock = @import("spinlock.zig").Spinlock;
+const Sleeplock = @import("sleeplock.zig").Sleeplock;
 
 /// 整个系统最多同时有多少个打开的文件。每个进程最多 abi.max_fds 个 fd，但它们大多指向同一个串口。
 pub const max_files = 32;
@@ -28,31 +33,47 @@ pub const max_files = 32;
 pub const Kind = enum { none, console, pipe, inode };
 
 pub const File = struct {
+    /// 保护 ref
+    lock: Spinlock = .init("file"),
     /// 引用数：有多少个 fd 指向它。为 0 表示这个槽位空着
     ref: u32 = 0,
     kind: Kind = .none,
     readable: bool = false,
     writable: bool = false,
     pipe: *pipe.Pipe = undefined,
-    /// kind 为 inode 时：文件系统里的 inode 号，和下一次读写的位置（fsys.lock）
+    /// kind 为 inode 时：文件系统里的 inode 号，和下一次读写的位置（pos_lock）
     ino: u64 = 0,
     off: u64 = 0,
     /// open_append：每次写之前先把 off 挪到文件末尾
     append: bool = false,
+    /// 保护 off，见文件开头
+    pos_lock: Sleeplock = .init("file pos"),
+
+    /// 刚分配到的槽位：除了两把锁和 ref，字段都回到初始值。不写成 f.* = .{...}：那会连锁一起覆盖掉，
+    /// 而别的 hart 可能正拿着这个槽位的 lock 在看它的 ref（alloc 逐个槽位看）
+    fn reset(f: *File) void {
+        f.kind = .none;
+        f.readable = false;
+        f.writable = false;
+        f.pipe = undefined;
+        f.ino = 0;
+        f.off = 0;
+        f.append = false;
+    }
 };
 
-var lock: Spinlock = .init("file");
 var table: [max_files]File = @splat(.{});
 
 pub const Error = error{ NotReadable, NotWritable, BadAddress, BrokenPipe, NotSeekable, InvalidArgument } || fs.Error;
 
-/// 分配一个空的 File（ref = 1），由调用方填好其他字段。
+/// 分配一个空的 File（ref = 1），由调用方填好其他字段。一次只拿一个槽位的锁。
 fn alloc() error{TooManyFiles}!*File {
-    lock.acquire();
-    defer lock.release();
     for (&table) |*f| {
+        f.lock.acquire();
+        defer f.lock.release();
         if (f.ref == 0) {
-            f.* = .{ .ref = 1 };
+            f.ref = 1;
+            f.reset();
             return f;
         }
     }
@@ -75,8 +96,12 @@ pub fn openPipe() error{ TooManyFiles, OutOfMemory }![2]*File {
     const w = try alloc();
     errdefer close(w);
     const p = try pipe.create();
-    r.* = .{ .ref = 1, .kind = .pipe, .readable = true, .pipe = p };
-    w.* = .{ .ref = 1, .kind = .pipe, .writable = true, .pipe = p };
+    r.kind = .pipe;
+    r.readable = true;
+    r.pipe = p;
+    w.kind = .pipe;
+    w.writable = true;
+    w.pipe = p;
     return .{ r, w };
 }
 
@@ -93,8 +118,8 @@ pub fn openInode(ino: u64, readable: bool, writable: bool, append: bool) error{T
 
 /// 多一个引用（dup、fork），返回同一个 File。
 pub fn dup(f: *File) *File {
-    lock.acquire();
-    defer lock.release();
+    f.lock.acquire();
+    defer f.lock.release();
     std.debug.assert(f.ref > 0);
     f.ref += 1;
     return f;
@@ -102,18 +127,20 @@ pub fn dup(f: *File) *File {
 
 /// 少一个引用。是最后一个的话腾出槽位，再关掉底下的东西（管道的一端）。
 pub fn close(f: *File) void {
-    lock.acquire();
+    f.lock.acquire();
     std.debug.assert(f.ref > 0);
     f.ref -= 1;
     if (f.ref > 0) {
-        lock.release();
+        f.lock.release();
         return;
     }
-    const old = f.*;
-    f.* = .{};
-    lock.release();
-    // 放开文件表的锁之后再关管道：管道的锁和文件表的锁不嵌套，就不用规定加锁的顺序
-    if (old.kind == .pipe) pipe.close(old.pipe, old.writable);
+    const kind = f.kind;
+    const p = f.pipe;
+    const writable = f.writable;
+    f.reset();
+    f.lock.release();
+    // 放开 File 的锁之后再关管道：管道的锁和 File 的锁不嵌套，就不用规定加锁的顺序
+    if (kind == .pipe) pipe.close(p, writable);
 }
 
 /// 从 f 读最多 len 个字节到用户地址空间 space 的 ptr，返回读到的字节数，0 表示读到了结尾。
@@ -159,19 +186,24 @@ fn consoleWrite(space: *vm.PageTable, ptr: usize, len: usize) Error!usize {
 }
 
 /// 从文件当前的位置读，位置往后挪读到的字节数。读目录是 IsDir（列目录用 readdir 系统调用）。
+/// 在快照上读，不挡着别人读写文件系统。
 fn inodeRead(f: *File, space: *vm.PageTable, ptr: usize, len: usize) Error!usize {
-    const root = try fsys.get();
-    defer fsys.unlock();
-    const n = try root.read(f.ino, f.off, len, fsys.UserOut{ .space = space, .ptr = ptr });
+    f.pos_lock.acquire();
+    defer f.pos_lock.release();
+    var r = try fsys.reader();
+    defer r.end();
+    const n = try r.fs.read(f.ino, f.off, len, fsys.UserOut{ .space = space, .ptr = ptr });
     f.off += n;
     return n;
 }
 
 /// 写到文件当前的位置（open_append 的是文件末尾），位置挪到写完的地方。整个写是一个事务：
 /// 用户内存中途读不出来、磁盘满了，什么都不写，位置也不动。
-/// 查文件末尾和写拿着同一次 fsys.lock，几个进程同时往末尾追加不会写到同一个位置上。
+/// 查文件末尾和写拿着同一次文件系统的写锁，几个进程同时往末尾追加不会写到同一个位置上。
 fn inodeWrite(f: *File, space: *vm.PageTable, ptr: usize, len: usize) Error!usize {
-    const root = try fsys.get();
+    f.pos_lock.acquire();
+    defer f.pos_lock.release();
+    const root = try fsys.writer();
     defer fsys.unlock();
     const off = if (f.append) (try root.stat(f.ino)).size else f.off;
     const n = try root.run(fsys.Fs.write, .{ f.ino, off, len, fsys.UserIn{ .space = space, .ptr = ptr } });
@@ -184,9 +216,13 @@ fn inodeWrite(f: *File, space: *vm.PageTable, ptr: usize, len: usize) Error!usiz
 /// 新的位置不能是负的，可以在文件末尾之后。
 pub fn seek(f: *File, offset: i64, whence: usize) Error!u64 {
     if (f.kind != .inode) return error.NotSeekable;
-    const root = try fsys.get();
-    defer fsys.unlock();
-    const st = try root.stat(f.ino);
+    f.pos_lock.acquire();
+    defer f.pos_lock.release();
+    const st = blk: {
+        var r = try fsys.reader();
+        defer r.end();
+        break :blk try r.fs.stat(f.ino);
+    };
     if (st.kind == .dir) {
         if (whence != abi.seek_set or offset != 0) return error.InvalidArgument;
         f.off = 0;
@@ -246,17 +282,17 @@ test "文件表：dup 加引用，最后一个 close 才关掉管道；表满了
     var test_memory: [4 * page.size]u8 align(page.size) = undefined;
     const base = @intFromPtr(&test_memory);
     page.init(base, base + test_memory.len, &.{});
-    const before = page.free_pages;
+    const before = page.freePages();
 
     const r, const w = try openPipe();
-    try expectEqual(before - 1, page.free_pages);
+    try expectEqual(before - 1, page.freePages());
     _ = dup(w);
     close(w);
     try std.testing.expect(w.pipe.write_open); // 还有一个引用
     close(w);
     try std.testing.expect(!r.pipe.write_open);
     close(r);
-    try expectEqual(before, page.free_pages);
+    try expectEqual(before, page.freePages());
 
     // 只剩一个空槽位：openPipe 分配第二个 File 时失败，第一个也还回去
     var held: [max_files - 1]*File = undefined;
@@ -265,6 +301,6 @@ test "文件表：dup 加引用，最后一个 close 才关掉管道；表满了
     const last = try openConsole();
     close(last);
     for (held) |f| close(f);
-    try expectEqual(before, page.free_pages);
+    try expectEqual(before, page.freePages());
     for (table) |f| try expectEqual(0, f.ref);
 }

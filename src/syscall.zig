@@ -224,19 +224,26 @@ fn open(path_ptr: usize, path_len: usize, flags: usize) usize {
     const writable = access != abi.open_read;
     var buf: [abi.max_path]u8 = undefined;
     const path = userPath(path_ptr, path_len, &buf) catch |err| return abi.fail(fsys.errno(err));
-    const root = fsys.get() catch return abi.fail(.nodev);
-    const ino = openPath(root, proc.current().?.cwd, path, flags, writable) catch |err| {
-        fsys.unlock();
-        return abi.fail(fsys.errno(err));
+    const cwd = proc.current().?.cwd;
+    // 可能要建文件、截断的才拿写锁，只是打开已有的文件在快照上找
+    const modifies = flags & abi.open_create != 0 or (flags & abi.open_trunc != 0 and writable);
+    const ino = if (modifies) blk: {
+        const root = fsys.writer() catch return abi.fail(.nodev);
+        defer fsys.unlock();
+        break :blk openPath(root, cwd, path, flags, writable);
+    } else blk: {
+        var r = fsys.reader() catch return abi.fail(.nodev);
+        defer r.end();
+        break :blk openPath(&r.fs, cwd, path, flags, writable);
     };
-    fsys.unlock();
-    const f = file.openInode(ino, readable, writable, flags & abi.open_append != 0) catch return abi.fail(.nfile);
+    const f = file.openInode(ino catch |err| return abi.fail(fsys.errno(err)), readable, writable, flags & abi.open_append != 0) catch return abi.fail(.nfile);
     return installFd(f) orelse {
         file.close(f);
         return abi.fail(.mfile);
     };
 }
 
+/// root 是读者的话 flags 里不会有要改文件系统的（见 open）。
 fn openPath(root: *Fs, cwd: u64, path: []const u8, flags: usize, writable: bool) @import("fs.zig").Error!u64 {
     const ino = root.resolve(cwd, path) catch |err| switch (err) {
         error.NotFound => if (flags & abi.open_create != 0) return root.run(Fs.create, .{ cwd, path, .file }) else return err,
@@ -255,14 +262,21 @@ fn pathOp(path_ptr: usize, path_len: usize, op: PathOp) usize {
     var buf: [abi.max_path]u8 = undefined;
     const path = userPath(path_ptr, path_len, &buf) catch |err| return abi.fail(fsys.errno(err));
     const p = proc.current().?;
-    const root = fsys.get() catch return abi.fail(.nodev);
-    defer fsys.unlock();
     switch (op) {
-        .mkdir => _ = root.run(Fs.create, .{ p.cwd, path, .dir }) catch |err| return abi.fail(fsys.errno(err)),
-        .unlink => root.run(Fs.unlink, .{ p.cwd, path }) catch |err| return abi.fail(fsys.errno(err)),
+        .mkdir, .unlink => {
+            const root = fsys.writer() catch return abi.fail(.nodev);
+            defer fsys.unlock();
+            if (op == .mkdir) {
+                _ = root.run(Fs.create, .{ p.cwd, path, .dir }) catch |err| return abi.fail(fsys.errno(err));
+            } else {
+                root.run(Fs.unlink, .{ p.cwd, path }) catch |err| return abi.fail(fsys.errno(err));
+            }
+        },
         .chdir => {
-            const ino = root.resolve(p.cwd, path) catch |err| return abi.fail(fsys.errno(err));
-            const st = root.stat(ino) catch |err| return abi.fail(fsys.errno(err));
+            var r = fsys.reader() catch return abi.fail(.nodev);
+            defer r.end();
+            const ino = r.fs.resolve(p.cwd, path) catch |err| return abi.fail(fsys.errno(err));
+            const st = r.fs.stat(ino) catch |err| return abi.fail(fsys.errno(err));
             if (st.kind != .dir) return abi.fail(.notdir);
             p.cwd = ino;
         },
@@ -270,13 +284,13 @@ fn pathOp(path_ptr: usize, path_len: usize, op: PathOp) usize {
     return 0;
 }
 
-/// 两个路径都先复制进内核，再拿着 fsys.lock 一个事务改名（fs.Fs.rename）。
+/// 两个路径都先复制进内核，再拿着文件系统的写锁一个事务改名（fs.Fs.rename）。
 fn rename(old_ptr: usize, old_len: usize, new_ptr: usize, new_len: usize) usize {
     var old_buf: [abi.max_path]u8 = undefined;
     var new_buf: [abi.max_path]u8 = undefined;
     const old = userPath(old_ptr, old_len, &old_buf) catch |err| return abi.fail(fsys.errno(err));
     const new = userPath(new_ptr, new_len, &new_buf) catch |err| return abi.fail(fsys.errno(err));
-    const root = fsys.get() catch return abi.fail(.nodev);
+    const root = fsys.writer() catch return abi.fail(.nodev);
     defer fsys.unlock();
     root.run(Fs.rename, .{ proc.current().?.cwd, old, new }) catch |err| return abi.fail(fsys.errno(err));
     return 0;
@@ -295,9 +309,9 @@ fn fstat(fd: usize, ptr: usize) usize {
         .console => {},
         .pipe => st.kind = .pipe,
         .inode => {
-            const root = fsys.get() catch return abi.fail(.nodev);
-            defer fsys.unlock();
-            const s = root.stat(f.ino) catch |err| return abi.fail(fsys.errno(err));
+            var r = fsys.reader() catch return abi.fail(.nodev);
+            defer r.end();
+            const s = r.fs.stat(f.ino) catch |err| return abi.fail(fsys.errno(err));
             st = .{ .ino = s.ino, .size = s.size, .kind = @fromBackingInt(@backingInt(s.kind)) };
         },
     }
@@ -306,13 +320,16 @@ fn fstat(fd: usize, ptr: usize) usize {
 }
 
 /// 目录 fd 的下一个目录项：读写位置 off 就是 fs.readdir 的 cookie。写进用户内存成功了才往后挪。
+/// 拿着 pos_lock，共用这个 fd 的进程不会拿到同一项；在快照上找。
 fn readdir(fd: usize, ptr: usize) usize {
     const f = fileOf(fd) orelse return abi.fail(.badf);
     if (f.kind != .inode) return abi.fail(.notdir);
-    const root = fsys.get() catch return abi.fail(.nodev);
-    defer fsys.unlock();
+    f.pos_lock.acquire();
+    defer f.pos_lock.release();
+    var r = fsys.reader() catch return abi.fail(.nodev);
+    defer r.end();
     var ent: abi.Dirent = undefined;
-    const found = root.readdir(f.ino, f.off, &ent.name) catch |err| return abi.fail(fsys.errno(err));
+    const found = r.fs.readdir(f.ino, f.off, &ent.name) catch |err| return abi.fail(fsys.errno(err));
     const d = found orelse return 0;
     ent.ino = d.ino;
     ent.kind = @fromBackingInt(@backingInt(d.kind));
@@ -325,10 +342,10 @@ fn readdir(fd: usize, ptr: usize) usize {
 }
 
 /// 检查整个文件系统（fs.Fs.check）。先作废缓冲区缓存：要核对的是磁盘上的内容，校验和只在读盘时核对。
-/// 拿着 fsys.lock，别的进程的文件操作都在等，缓存里也没有做到一半的操作。
+/// 拿着文件系统的写锁：没有做到一半的修改，当前的树就是已提交的树。读者照常读（它们只会把块读进缓存）。
 fn scrub(ptr: usize) usize {
     vm.checkUser(space(), ptr, @sizeOf(abi.ScrubInfo), true) catch return abi.fail(.fault);
-    const root = fsys.get() catch return abi.fail(.nodev);
+    const root = fsys.writer() catch return abi.fail(.nodev);
     defer fsys.unlock();
     bio.invalidate();
     const st = root.check() catch |err| return abi.fail(fsys.errno(err));
@@ -427,7 +444,7 @@ fn procinfo(ptr: usize, n: usize) usize {
 }
 
 fn meminfo(ptr: usize) usize {
-    const info: abi.MemInfo = .{ .free_pages = page.free_pages, .total_pages = page.total_pages, .page_size = page.size };
+    const info: abi.MemInfo = .{ .free_pages = page.freePages(), .total_pages = page.total_pages, .page_size = page.size };
     vm.copyToUser(space(), ptr, std.mem.asBytes(&info)) catch return abi.fail(.fault);
     return 0;
 }

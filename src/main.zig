@@ -118,7 +118,8 @@ fn kmain(hartid: usize, dtb_addr: usize) callconv(.c) noreturn {
     });
 
     page.init(vm.kernelEnd(), info.memory.end(), info.reserved());
-    uart.print("[ok] page allocator: {d} free pages ({d} KiB)\n", .{ page.free_pages, page.free_pages * page.size / 1024 });
+    const free_pages = page.freePages();
+    uart.print("[ok] page allocator: {d} free pages ({d} KiB)\n", .{ free_pages, free_pages * page.size / 1024 });
 
     vm.init(info.memory) catch |err| std.debug.panic("cannot set up paging: {s}", .{@errorName(err)});
     uart.write("[ok] Sv39 paging enabled: kernel mapped 1:1, text r-x, rodata r--, data rw-\n");

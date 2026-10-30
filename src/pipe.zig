@@ -119,7 +119,7 @@ test "管道：环形缓冲区回绕、读到结尾、读端关了写返回 Brok
     vm.kernel_root = @ptrCast(try page.alloc());
     const space = try vm.createUserSpace();
     const buf = try vm.allocUserPage(space, vm.user_base, .{ .r = true, .w = true });
-    const before = page.free_pages;
+    const before = page.freePages();
 
     const p = try create();
     // 写 1500 字节、读 1000 字节，再写 1500 字节：第二次写越过了缓冲区末尾
@@ -144,13 +144,13 @@ test "管道：环形缓冲区回绕、读到结尾、读端关了写返回 Brok
     try expectEqual(10, try read(p, space, vm.user_base, 100));
     try expectEqual(0, try read(p, space, vm.user_base, 100));
     close(p, false);
-    try expectEqual(before, page.free_pages);
+    try expectEqual(before, page.freePages());
 
     // 读端关了，写返回 BrokenPipe
     const q = try create();
     close(q, false);
     try expectEqual(error.BrokenPipe, write(q, space, vm.user_base, 1));
     close(q, true);
-    try expectEqual(before, page.free_pages);
+    try expectEqual(before, page.freePages());
     vm.destroyUserSpace(space);
 }

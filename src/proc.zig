@@ -299,11 +299,11 @@ pub const ExecError = error{ NoSuchProgram, OutOfMemory, BadElf, IoError, NoDevi
 /// 失败时原来的地址空间和 TrapFrame 都不变，系统调用照常返回错误。pid、父进程、ticks、打开的文件、当前目录不变。
 pub fn exec(path: []const u8, args: []const []const u8) ExecError!void {
     const p = current().?;
-    // 加载期间一直拿着文件系统的锁：程序文件读到一半不会被别人改掉、删掉
-    const root = fsys.get() catch return error.NoDevice;
+    // 加载期间一直用同一个快照：程序文件读到一半被别人改掉、删掉，读到的也还是开始时的样子
+    var r = fsys.reader() catch return error.NoDevice;
     const image = blk: {
-        defer fsys.unlock();
-        break :blk try loadImage(try openProgram(root, p.cwd, path), args);
+        defer r.end();
+        break :blk try loadImage(try openProgram(&r.fs, p.cwd, path), args);
     };
     // 先切到新的地址空间，才能释放正在用的旧页表
     const old = p.space;
@@ -327,7 +327,7 @@ const Image = struct {
     brk: usize,
 };
 
-/// 找到 exec 要运行的程序文件。调用方拿着文件系统的锁。
+/// 找到 exec 要运行的程序文件。root 是调用方的快照。
 fn openProgram(root: *fs.Fs, cwd: u64, path: []const u8) ExecError!Source {
     if (path.len == 0) return error.NoSuchProgram;
     var buf: [abi.max_path]u8 = undefined;
@@ -346,7 +346,7 @@ fn openProgram(root: *fs.Fs, cwd: u64, path: []const u8) ExecError!Source {
     return .{ .file = .{ .fs = root, .ino = ino, .size = st.size } };
 }
 
-/// ELF 文件从哪来：嵌在内核里的字节（init、单元测试），或者文件系统里的一个文件（exec，调用方拿着 fsys.lock）。
+/// ELF 文件从哪来：嵌在内核里的字节（init、单元测试），或者文件系统里的一个文件（exec，在调用方的快照上读）。
 const Source = union(enum) {
     bytes: []const u8,
     file: struct { fs: *fs.Fs, ino: u64, size: u64 },
@@ -366,7 +366,7 @@ const Source = union(enum) {
             .file => |f| {
                 // 文件的内容直接读进 dst（exec 时就是新分配的用户页），不经过别的缓冲区
                 const n = f.fs.read(f.ino, off, dst.len, KernelOut{ .buf = dst }) catch return error.IoError;
-                if (n != dst.len) return error.IoError; // 文件在 stat 之后变短了：拿着锁，不应该发生
+                if (n != dst.len) return error.IoError; // 文件在 stat 之后变短了：同一个快照，不应该发生
             },
         }
     }
@@ -947,11 +947,11 @@ fn testLoad(image: []const u8) !usize {
     const base = @intFromPtr(&test_memory);
     page.init(base, base + test_memory.len, &.{});
     vm.kernel_root = @ptrCast(try page.alloc());
-    const before = page.free_pages;
+    const before = page.freePages();
     const space = try vm.createUserSpace();
     defer {
         vm.destroyUserSpace(space);
-        std.testing.expectEqual(before, page.free_pages) catch @panic("leaked pages");
+        std.testing.expectEqual(before, page.freePages()) catch @panic("leaked pages");
     }
     const entry = (try load(space, .{ .bytes = image })).entry;
     // 入口可读，栈的两端可读，栈下面的保护页没有映射

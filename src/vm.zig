@@ -422,13 +422,13 @@ fn testInit() void {
 test "对齐和长度允许时用大页" {
     testInit();
     kernel_root = @ptrCast(try page.alloc());
-    const before = page.free_pages;
+    const before = page.freePages();
     // 2 MiB + 4 KiB：一个 2 MiB 的大页（第 1 级叶子）加一个 4 KiB 的页（第 0 级叶子），需要第 1、0 级各一张页表
     try map(kernel_root, 0x8000_0000, 0x8000_0000, (2 << 20) + page.size, .{ .r = true, .w = true });
-    try std.testing.expectEqual(before - 2, page.free_pages);
+    try std.testing.expectEqual(before - 2, page.freePages());
     // 1 GiB 对齐的 1 GiB：根页表里的一项就够了，不需要新的页表
     try map(kernel_root, 0xc000_0000, 0xc000_0000, 1 << 30, .{ .r = true, .w = true });
-    try std.testing.expectEqual(before - 2, page.free_pages);
+    try std.testing.expectEqual(before - 2, page.freePages());
     // 已经被大页覆盖的地址不能再映射
     try std.testing.expectError(error.AlreadyMapped, map(kernel_root, 0x8010_0000, 0x8010_0000, page.size, .{ .r = true }));
 }
@@ -437,7 +437,7 @@ test "copyFromUser 只读得到 U 模式可读的用户页，用户空间释放�
     testInit();
     kernel_root = @ptrCast(try page.alloc());
     try map(kernel_root, 0x8020_0000, 0x8020_0000, page.size, .{ .r = true, .x = true });
-    const before = page.free_pages;
+    const before = page.freePages();
 
     const space = try createUserSpace();
     const p0 = try allocUserPage(space, user_base, .{ .r = true, .w = true });
@@ -459,17 +459,17 @@ test "copyFromUser 只读得到 U 模式可读的用户页，用户空间释放�
 
     // 释放的只是用户区的页和页表，和内核共用的页表不动
     destroyUserSpace(space);
-    try std.testing.expectEqual(before, page.free_pages);
+    try std.testing.expectEqual(before, page.freePages());
 }
 
 test "copyToUser 只写得进 U 模式可写的用户页，checkUser 检查整个范围" {
     testInit();
     kernel_root = @ptrCast(try page.alloc());
-    const before = page.free_pages;
+    const before = page.freePages();
     const space = try createUserSpace();
     defer {
         destroyUserSpace(space);
-        std.testing.expectEqual(before, page.free_pages) catch @panic("leaked pages");
+        std.testing.expectEqual(before, page.freePages()) catch @panic("leaked pages");
     }
     const p0 = try allocUserPage(space, user_base, .{ .r = true, .w = true });
     const p1 = try allocUserPage(space, user_base + page.size, .{ .r = true, .w = true });
@@ -492,7 +492,7 @@ test "copyToUser 只写得进 U 模式可写的用户页，checkUser 检查整�
 test "cloneUserSpace 写时复制：只建页表、共用页；谁先写谁复制，两边互不影响，释放后不漏页" {
     testInit();
     kernel_root = @ptrCast(try page.alloc());
-    const before = page.free_pages;
+    const before = page.freePages();
     const src = try createUserSpace();
     const data = try allocUserPage(src, user_base, .{ .r = true, .w = true });
     _ = try allocUserPage(src, user_base + page.size, .{ .r = true, .x = true });
@@ -500,9 +500,9 @@ test "cloneUserSpace 写时复制：只建页表、共用页；谁先写谁复�
     @memcpy(data[0..5], "hello");
 
     // 只分配了页表：根页表、第 1 级一张、第 0 级两张
-    const cloned = page.free_pages;
+    const cloned = page.freePages();
     const dst = try cloneUserSpace(src);
-    try std.testing.expectEqual(cloned - 4, page.free_pages);
+    try std.testing.expectEqual(cloned - 4, page.freePages());
     // 两边的可写页都变成了 cow（只读），代码页不是 cow，仍然只读
     for ([_]*PageTable{ src, dst }) |root| {
         try std.testing.expect(leafOf(root, user_base).?.cow and !leafOf(root, user_base).?.w);
@@ -515,13 +515,13 @@ test "cloneUserSpace 写时复制：只建页表、共用页；谁先写谁复�
     try std.testing.expectEqualStrings("hello", &buf);
     // 子进程先写：复制一份，父进程的不变
     try copyToUser(dst, user_base, "HELLO");
-    try std.testing.expectEqual(cloned - 5, page.free_pages);
+    try std.testing.expectEqual(cloned - 5, page.freePages());
     try copyFromUser(src, &buf, user_base);
     try std.testing.expectEqualStrings("hello", &buf);
     try std.testing.expect(!leafOf(dst, user_base).?.cow and leafOf(dst, user_base).?.w);
     // 父进程再写：这一页只剩它在用了，直接改回可写，不复制，还是原来那一页
     try copyToUser(src, user_base, "world");
-    try std.testing.expectEqual(cloned - 5, page.free_pages);
+    try std.testing.expectEqual(cloned - 5, page.freePages());
     try std.testing.expectEqual(@intFromPtr(data), leafOf(src, user_base).?.addr());
     try copyFromUser(dst, &buf, user_base);
     try std.testing.expectEqualStrings("HELLO", &buf);
@@ -545,7 +545,7 @@ test "cloneUserSpace 写时复制：只建页表、共用页；谁先写谁复�
     destroyUserSpace(dst);
     try copyToUser(grandchild, user_base, "again"); // 只剩它在用：不复制
     destroyUserSpace(grandchild);
-    try std.testing.expectEqual(before, page.free_pages);
+    try std.testing.expectEqual(before, page.freePages());
 }
 
 test "cloneUserSpace、写时复制内存不够时不漏页，什么都不坏" {
@@ -556,18 +556,18 @@ test "cloneUserSpace、写时复制内存不够时不漏页，什么都不坏" {
     _ = try allocUserPage(src, user_end - page.size, .{ .r = true, .w = true });
     // 只剩 3 页：根页表、第 1 级、第 0 级各一张之后，栈那一张第 0 级页表分配不到
     var hoard: std.SinglyLinkedList = .{};
-    while (page.free_pages > 3) hoard.prepend(@ptrCast(try page.alloc()));
+    while (page.freePages() > 3) hoard.prepend(@ptrCast(try page.alloc()));
     try std.testing.expectError(error.OutOfMemory, cloneUserSpace(src));
-    try std.testing.expectEqual(3, page.free_pages);
+    try std.testing.expectEqual(3, page.freePages());
     // 父进程已经改成 cow 的页只剩自己在用，写的时候直接改回可写，不用内存
-    while (page.free_pages > 0) hoard.prepend(@ptrCast(try page.alloc()));
+    while (page.freePages() > 0) hoard.prepend(@ptrCast(try page.alloc()));
     try copyToUser(src, user_base, "ok");
     try copyToUser(src, user_end - 2, "ok");
 
     // 真正共用的页：没有内存复制时返回 OutOfMemory / BadAddress，两边都不变
     for (0..4) |_| page.free(@ptrCast(@alignCast(hoard.popFirst().?)));
     const dst = try cloneUserSpace(src);
-    try std.testing.expectEqual(0, page.free_pages);
+    try std.testing.expectEqual(0, page.freePages());
     try std.testing.expectError(error.OutOfMemory, breakCow(dst, user_base + page.size));
     try std.testing.expectError(error.BadAddress, copyToUser(dst, user_base + page.size, "x"));
     try std.testing.expectError(error.BadAddress, checkUser(dst, user_base, 2 * page.size, true));
@@ -587,9 +587,9 @@ test "growUser、shrinkUser 按页映射和释放，内存不够时不留下半�
     // 长 1 字节也要映射一整页；再长到页中间，不用新的页
     try growUser(space, heap, heap + 1, .{ .r = true, .w = true });
     try copyToUser(space, heap, "x");
-    const one = page.free_pages;
+    const one = page.freePages();
     try growUser(space, heap + 1, heap + 100, .{ .r = true, .w = true });
-    try std.testing.expectEqual(one, page.free_pages);
+    try std.testing.expectEqual(one, page.freePages());
     // 跨过两页的边界
     try growUser(space, heap + 100, heap + 2 * page.size + 1, .{ .r = true, .w = true });
     try copyToUser(space, heap + 3 * page.size - 1, "y");
@@ -597,26 +597,26 @@ test "growUser、shrinkUser 按页映射和释放，内存不够时不留下半�
 
     // 缩到页中间：这一页还在，后面两页释放
     shrinkUser(space, heap + 2 * page.size + 1, heap + 10);
-    try std.testing.expectEqual(one, page.free_pages);
+    try std.testing.expectEqual(one, page.freePages());
     try std.testing.expectError(error.BadAddress, copyToUser(space, heap + page.size, "z"));
     try copyToUser(space, heap + page.size - 1, "z");
     shrinkUser(space, heap + 10, heap);
     try std.testing.expectError(error.BadAddress, copyToUser(space, heap, "z"));
 
     // 跨过 2 MiB 的边界，要一张新的第 0 级页表；缩回来时它也被释放
-    const before = page.free_pages;
+    const before = page.freePages();
     try growUser(space, heap, heap + (2 << 20), .{ .r = true, .w = true });
     try copyToUser(space, heap + (2 << 20) - 1, "z");
     shrinkUser(space, heap + (2 << 20), heap);
-    try std.testing.expectEqual(before, page.free_pages);
+    try std.testing.expectEqual(before, page.freePages());
     try std.testing.expectError(error.BadAddress, copyToUser(space, heap + (2 << 20) - 1, "z"));
 
     // 内存不够：一页都不留，页表也不留
     var hoard: std.SinglyLinkedList = .{};
-    while (page.free_pages > 3) hoard.prepend(@ptrCast(try page.alloc()));
-    const left = page.free_pages;
+    while (page.freePages() > 3) hoard.prepend(@ptrCast(try page.alloc()));
+    const left = page.freePages();
     try std.testing.expectError(error.OutOfMemory, growUser(space, heap, heap + 10 * page.size, .{ .r = true, .w = true }));
-    try std.testing.expectEqual(left, page.free_pages);
+    try std.testing.expectEqual(left, page.freePages());
     try std.testing.expectError(error.BadAddress, copyToUser(space, heap, "z"));
     destroyUserSpace(space);
 }

@@ -203,7 +203,7 @@ fn exec(path_ptr: usize, path_len: usize, argv_ptr: usize, argc: usize) usize
 
 1. 路径复制进内核（和 `open` 一样最长 256 字节，长了是 `-ENAMETOOLONG`）。
 2. `argc > max_args` 返回 `-E2BIG`。从 `argv_ptr` 复制 `argc` 个 `Arg`（每个 16 字节，`{ ptr, len }`），再把每个参数的字节依次复制进栈上 1024 字节的缓冲区，总长超过 `max_arg_bytes` 返回 `-E2BIG`。任何一个指针坏了都是 `-EFAULT`。长度为 0 的参数不检查 `ptr`。
-3. 交给 `proc.exec(path, args)`：参数这时已经在内核里了，`exec` 换掉旧的地址空间之后照样能用。它在文件系统里找程序（没有 `/` 的名字在 `/bin` 里找）、拿着 `fsys.lock` 加载（[process.md](process.md#exec)）。
+3. 交给 `proc.exec(path, args)`：参数这时已经在内核里了，`exec` 换掉旧的地址空间之后照样能用。它在文件系统里找程序（没有 `/` 的名字在 `/bin` 里找）、在一个快照上加载（[process.md](process.md#exec)）。
 4. 成功时返回 `argc`：`handleTrap` 把返回值写进 `a0`，正好是新程序看到的 `argc`；`a1` 和 `sp` 由 `proc.exec` 设成栈上 `Arg` 数组的地址（[process.md](process.md#命令行参数)）。
 
 所有检查都在换掉地址空间之前做完，所以失败时原来的程序照常运行，看到的是错误码。回归测试 `t_args check` 测了参数太多、太长、坏指针、正好用满上限、没有参数这几种情况；`t_fork` 测了找不到的名字和路径、空名字、太长的路径、坏 ELF、目录、路径中间是文件。
@@ -334,7 +334,7 @@ pub fn fprint(fd: Fd, comptime fmt: []const u8, args: anytype) void
 - 会等待的调用（`yield`、`sleep`、`read`、管道的 `write`、`wait`）不在里面开中断等待，而是切回调度器，由调度器开着中断去处理别的事。
 - `exec` 一次加载整个程序（分配页、从文件系统读内容），`fork` 一次复制整个地址空间，`sbrk` 一次映射所有新的页，期间都关着中断。现在的程序都只有几十 KiB，没有问题；`sbrk` 一次要上百 MiB 时会关着中断清零这么多页，`t_sbrk` 里长到超过物理内存（约 125 MiB）再失败、回滚，QEMU 里测试照常通过。
 - 运行在当前进程自己的内核栈上（16 KiB），系统调用里不要放大的局部数组，也不要按值复制大的结构体（[fs.md](fs.md#接进内核fsyszig)：8 KiB 的位图按值传过一次，把栈撑爆了）。局部数组最大的是 `exec` 复制参数和路径用的约 1.8 KiB（参数 1024 字节、`Arg` 数组和切片各 256 字节、路径 256 字节）；栈用得最深的是文件系统的调用（实测 Debug 模式不到 10 KiB，[process.md](process.md#进程表)）。
-- 文件系统的调用拿着睡眠锁 `fsys.lock` 读写磁盘，要等磁盘时和 `read` 一样切回调度器。
+- 文件系统的调用读写磁盘，要等磁盘时和 `read` 一样切回调度器。读的调用在快照上读、不拿锁，改的调用拿着睡眠锁 `fsys.write_lock`（[fs.md](fs.md#接进内核fsyszig)）。
 - `exit`、`shutdown` 和成功的 `exec` 不返回；其他调用返回后，用户程序从 `ecall` 的下一条指令继续执行，除 `a0` 以外的寄存器都不变。
 
 ## 新增一个系统调用

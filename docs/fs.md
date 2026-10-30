@@ -63,16 +63,18 @@ pub fn run(fs: *Fs, comptime op: anytype, args: anytype) Error!...
 
 ```zig
 var vol: ctree.Volume = .{};   // 唯一的一个卷
-var root: fs.Fs = undefined;   // 挂载好的文件系统
+var root: fs.Fs = undefined;   // 挂载好的文件系统（修改的一方用）
 pub var mounted = false;
-pub var lock: Sleeplock = .init("fs");
+var write_lock: Sleeplock = .init("fs write");
 pub var raw_base: u64 = 0;     // 原始区域：文件系统之后的块
 pub var raw_count: u64 = 0;
 
-pub fn init() void                    // 挂载
-pub fn get() error{NoDevice}!*Fs      // 拿着 lock 返回文件系统
-pub fn unlock() void
-pub fn errno(err: anyerror) abi.Errno // 文件系统的错误 → 系统调用的错误码
+pub const Reader = struct { fs: Fs, snap: ctree.Snapshot, pub fn end(r: *Reader) void };
+pub fn init() void                         // 挂载
+pub fn reader() error{NoDevice}!Reader     // 读：拿一个已提交的树的快照
+pub fn writer() error{NoDevice}!*Fs        // 改：拿着 write_lock 返回文件系统
+pub fn unlock() void                       // 放开 write_lock
+pub fn errno(err: anyerror) abi.Errno      // 文件系统的错误 → 系统调用的错误码
 ```
 
 **挂载**：第一个进程（init）第一次回到 U 模式之前，在 `forkretC` 里调用 `fsys.init()`（xv6 的 `forkret` 里调用 `fsinit` 也是这个原因）：挂载要读盘，读盘要睡着等中断，只有进程能做，`kmain` 不行。之后创建的进程都在这之后运行。成功时打印
@@ -83,11 +85,15 @@ pub fn errno(err: anyerror) abi.Errno // 文件系统的错误 → 系统调用�
 
 磁盘上没有文件系统时打印 `[warn] no file system on the disk: NotFormatted`（接一块全 0 的 4 MiB 镜像实测；超级块坏了是别的错误名），照常启动：文件系统的系统调用返回 `-ENODEV`（`ls /` 打印 `ls: /: NoDevice`），整个磁盘都是原始区域。
 
-**一把睡眠锁管整个文件系统**：每个系统调用拿着 `fsys.lock` 做完整个操作（包括读写文件时在缓冲区和用户内存之间复制），所以 `fs.zig`、`ctree.zig` 里不用加锁，同一时刻只有一个进程在用文件系统。代价是两个进程读写不同的文件也要排队；xv6 的 inode 各有一把睡眠锁，可以并行，这里的 B 树是整棵写时复制的，一个事务改的是整条路径，按文件分锁不容易。
+**读者不拿锁，在快照上读；修改的一方拿写锁，一个一个来。** 写时复制的 B 树天然有快照：已提交的树的块从来不改，修改只写别的块，最后写超级块“一下子换成新的树”。所以读的一方只要记下最近一次提交的根，就能在那棵树上读，不管修改的一方同时在做什么（[btree.md](btree.md#快照读者)）。
 
-- 是睡眠锁：拿着它要读写磁盘（睡着等）。拿它之前不能拿着自旋锁；它在缓冲区的睡眠锁之前拿（`fsys.lock` → 缓冲区的睡眠锁 → `virtio_disk.lock`），回到 U 模式之前放开。
-- `File.off`（几个 fd 共用的读写位置）也由它保护：读写的整个过程拿着它，并发的 `write` 不会写到同一个位置上。
-- 原始区域只由 `readblock`、`writeblock` 读写，不拿 `fsys.lock`：它和文件系统用的块不重叠。
+- **读**：`read`、`fstat`、`readdir`、`lseek`、`chdir`、只打开已有文件的 `open`、`exec` 加载程序。`fsys.reader()` 拿一个快照（`ctree.Volume.beginRead`），返回一个只读的 `Fs`（`view` 设成快照的根，所有查找都在那棵树上做），读完 `r.end()`。几个读者之间、读者和修改的一方之间都不用等（只在同一个缓冲区的睡眠锁上短暂地排队）。读者看到的是开始读时最近一次提交的样子：修改的一方做到一半的东西看不到；一次 `read` 读出的整个内容一定来自同一个版本，不会半新半旧（`t_fsmp` 测这个）。
+- **改**：`write`、`mkdir`、`unlink`、`rename`、建文件或者截断的 `open`、`scrub`。`fsys.writer()` 拿 `write_lock`（睡眠锁），在当前事务的树上做，`fs.run` 提交或作废，`fsys.unlock()`。B 树同一时刻只能有一个事务（一个事务是从根到叶子的整条写时复制路径，改的都是同一个根），所以修改之间还是排队；但它们不再挡着读。xv6 的 inode 各有一把睡眠锁，改不同的文件可以并行；这里要做到这一点得像 btrfs 那样让几个操作加入同一个正在进行的事务、给树的每个节点加锁，复杂得多。
+- **旧树的块不能马上重用**：读者可能还在读旧的那棵树，而提交之后旧树不用的块（`pending`）本来马上就能再分配、被改写。所以有旧树的读者时，这些块先进 `limbo`，旧树的读者都读完了才空出来；修改的一方在空闲块不够时睡着等它们读完（[btree.md](btree.md#快照读者)）。
+- **加锁顺序**：`File.pos_lock` → `write_lock` → 缓冲区的睡眠锁 → `virtio_disk.lock`。`write_lock` 是睡眠锁：拿着它要读写磁盘（睡着等），拿它之前不能拿着自旋锁，回到 U 模式之前放开。**拿着快照时不能去等 `pos_lock`、`write_lock`**：修改的一方可能拿着它们在等旧树的读者读完。系统调用都是先拿 `pos_lock`，再拿快照或写锁。
+- `File.off`（几个 fd 共用的读写位置）由 `File.pos_lock` 保护（[files.md](files.md#文件表)）：读写的整个过程拿着它，共用一个 `File` 的进程并发 `write` 不会写到同一个位置上。
+- `mounted`、`root` 只在 `init` 里写一次（那时还没有别的进程），之后只读，读者不拿锁读它们。`root.next_ino` 只有修改的一方用，由 `write_lock` 保护；读者的 `Fs` 里它是 0，不用。
+- 原始区域只由 `readblock`、`writeblock` 读写，不拿文件系统的锁：它和文件系统用的块不重叠。
 
 **打开的文件**：`file.File` 多了一种 `.inode`，记着 inode 号 `ino` 和读写位置 `off`（[files.md](files.md)）。`read`、`write` 系统调用对它调用 `fs.read`、`fs.run(Fs.write, ...)`，`out`、`in` 是 `UserOut`、`UserIn`（用户地址空间和指针，经 `vm.copyToUser`、`copyFromUser`，[syscalls.md](syscalls.md#访问用户内存)），成功了才挪 `off`。
 
@@ -97,20 +103,20 @@ pub fn errno(err: anyerror) abi.Errno // 文件系统的错误 → 系统调用�
 
 | 调用 | 做什么 |
 | --- | --- |
-| `open(path, flags)` | `resolve`；没有并且带 `O_CREATE` 时 `create`；是目录并且要写是 `EISDIR`；带 `O_TRUNC` 并且可写时 `truncate`；`O_APPEND` 记在 `File` 里。返回 fd |
+| `open(path, flags)` | `resolve`；没有并且带 `O_CREATE` 时 `create`；是目录并且要写是 `EISDIR`；带 `O_TRUNC` 并且可写时 `truncate`；`O_APPEND` 记在 `File` 里。返回 fd。带 `O_CREATE`、或者可写并带 `O_TRUNC` 的拿写锁，别的在快照上找 |
 | `mkdir(path)`、`unlink(path)` | `create(.dir)`、`unlink` |
 | `chdir(path)` | `resolve`，不是目录是 `ENOTDIR` |
 | `fstat(fd)` | inode 号、长度、种类；串口和管道也能查（种类是 `console`、`pipe`） |
 | `readdir(fd)` | 目录的下一项：`File.off` 就是 `fs.readdir` 的 cookie，结果写进用户内存成功了才往后挪 |
-| `read`、`write` | 从 `off` 开始读写；读写目录是 `EISDIR`。`open_append` 打开的，写之前先把 `off` 挪到文件末尾（同一次拿锁里） |
+| `read`、`write` | 从 `off` 开始读写（读在快照上，写拿写锁）；读写目录是 `EISDIR`。`open_append` 打开的，写之前先把 `off` 挪到文件末尾（同一次拿锁里） |
 | `rename(old, new)` | `rename`（[改名](#改名rename)） |
 | `lseek(fd, offset, whence)` | 改 `File.off`，`seek_end` 要先 `stat`（[files.md](files.md#文件表)） |
 | `scrub` | 先作废缓存，再 `check` 整个文件系统（[检查](#检查整个文件系统checkscrub)） |
-| `exec` | 在 `/bin`（或给的路径）里找程序，拿着 `fsys.lock` 把 ELF 直接读进新的用户页（[process.md](process.md#程序从哪来)） |
+| `exec` | 在 `/bin`（或给的路径）里找程序，在同一个快照上把 ELF 直接读进新的用户页（[process.md](process.md#程序从哪来)） |
 
 路径先复制进内核栈上的缓冲区（最长 `abi.max_path` = 256 字节，长了是 `ENAMETOOLONG`）。错误码：`NotFound` → `ENOENT`，`Exists` → `EEXIST`，`NotDir` → `ENOTDIR`，`IsDir` → `EISDIR`，`NotEmpty` → `ENOTEMPTY`，`NameTooLong` → `ENAMETOOLONG`，`InvalidName` → `EINVAL`，`NoSpace` → `ENOSPC`，`FileTooBig` → `EFBIG`，`BadAddress` → `EFAULT`，`Corrupt` 等磁盘上的东西不对 → `EIO`。
 
-**内核栈**：系统调用在 16 KiB 的进程内核栈上运行，B 树的操作走得很深。开发时内核栈被撑爆过一次（Debug 模式用到 54 KiB）：`std.bit_set` 的 `isSet`、`count` 按值接收整个位图，每调用一次在栈上复制 8 KiB；`x.* = y.*` 复制 4 KiB 的块也会先放在栈上。改成自己写的 `Bitmap`（方法接收指针）和 `@memcpy` 之后，实测跑完全部 QEMU 测试（包括 `t_fs`、掉电后重新启动、从文件系统 `exec`），最深 Debug 10056 字节、safe 5904 字节、small 5192 字节（加了 `rename`、`scrub` 之后重新量的，测法见 [process.md](process.md#进程表)）。
+**内核栈**：系统调用在 16 KiB 的进程内核栈上运行，B 树的操作走得很深。开发时内核栈被撑爆过一次（Debug 模式用到 54 KiB）：`std.bit_set` 的 `isSet`、`count` 按值接收整个位图，每调用一次在栈上复制 8 KiB；`x.* = y.*` 复制 4 KiB 的块也会先放在栈上。改成自己写的 `Bitmap`（方法接收指针）和 `@memcpy` 之后，实测跑完全部 QEMU 测试（包括 `t_fs`、掉电后重新启动、从文件系统 `exec`），最深 Debug 10488 字节、safe 6128 字节、small 5592 字节（文件系统改成读者在快照上读、加了 `t_fsmp` 之后重新量的，测法见 [process.md](process.md#进程表)）。
 
 ## 改名（`rename`）
 
@@ -141,7 +147,7 @@ pub fn errno(err: anyerror) abi.Errno // 文件系统的错误 → 系统调用�
 
 **缓存**：校验和只在从磁盘读进来的时候核对（`bio.load` 返回 true 时），缓存里的块不再算。`scrub` 要核对的是磁盘上的内容，所以先 `bio.invalidate()`，把没人在用的缓冲区都作废（[disk.md](disk.md#写和放开)），之后读到的每一块都是刚从磁盘读的。
 
-**`scrub` 系统调用**（30 号）：拿着 `fsys.lock` 做完，期间别的进程的文件操作都在等，缓存里也不会有做到一半的操作（每个操作在放开锁之前都写完了）。都对的话把 `abi.ScrubInfo`（上面这些数，加上空闲块数、总块数、事务号）写进用户内存；`Corrupt` 返回 `-EIO`。实测刚启动、跑完 `t_fs` 之后：
+**`scrub` 系统调用**（30 号）：拿着写锁做完，期间别的修改都在等，没有做到一半的事务，当前的树就是已提交的树（每个修改在放开锁之前都写完了）。读者照常在快照上读，它们只会把块读进缓存，不改东西。都对的话把 `abi.ScrubInfo`（上面这些数，加上空闲块数、总块数、事务号）写进用户内存；`Corrupt` 返回 `-EIO`。实测刚启动、跑完 `t_fs` 之后：
 
 ```
 > run scrub
@@ -186,7 +192,7 @@ mkfs <输出文件> <总块数> <文件系统的块数> <文件>...
 
 ## QEMU 里的测试
 
-`tools/qemu_test.py` 的 `fs` 用例（[testing.md](testing.md)）：shell 里的 `ls`、`cat`、`mkdir`、`rm`、`mv`、`cd`、`<`、`>`、`>>`；回归测试 `t_fs` 测系统调用的边界情况和并发；关机之后在同一个镜像上再启动，上一次写的文件还在；然后边写边把 QEMU 杀掉（掉电），再启动一次，`t_fs verify` 检查每个操作要么做完了、要么没做，`scrub` 通过；最后在镜像里改坏一个数据块，第四次启动，`scrub` 发现它（见上面的[检查](#检查整个文件系统checkscrub)）。
+`tools/qemu_test.py` 的 `fs` 用例（[testing.md](testing.md)）：shell 里的 `ls`、`cat`、`mkdir`、`rm`、`mv`、`cd`、`<`、`>`、`>>`；回归测试 `t_fs` 测系统调用的边界情况和并发，`t_fsmp` 测读者和修改的一方同时进行（读到的总是完整的某个版本）；关机之后在同一个镜像上再启动，上一次写的文件还在；然后边写边把 QEMU 杀掉（掉电），再启动一次，`t_fs verify` 检查每个操作要么做完了、要么没做，`scrub` 通过；最后在镜像里改坏一个数据块，第四次启动，`scrub` 发现它（见上面的[检查](#检查整个文件系统checkscrub)）。
 
 这个用例在开发时抓到过一个 bug：目录项的头里名字长度是 `u8`，`@sizeOf(DirHeader) + head.name_len` 按 `u8` 算，名字长于 239 字节时溢出（Debug、safe 模式下 panic；fast、small 模式下不检查溢出，是未定义行为）。单元测试原来只建了 255 字节的名字，没有再找它、列它，碰不到这段代码，现在补上了。
 
@@ -196,4 +202,4 @@ mkfs <输出文件> <总块数> <文件系统的块数> <文件>...
 - 一页一个数据块，没有 btrfs 那种连续多块的 extent；也没有压缩。
 - 每个操作一个事务，每次都写超级块。
 - 删除打开着的文件之后，打开它的人再读写会出错（`ENOENT`）。
-- 一把锁管整个文件系统，读写不同文件的进程也要排队。
+- 修改之间排队：改不同文件的进程也要一个一个来（读不排队）。

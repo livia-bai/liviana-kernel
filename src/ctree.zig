@@ -21,11 +21,16 @@
 //!   算出空闲块。所以文件系统应该每个系统调用提交一次（以后），出错只丢这一次的改动。
 //!   磁盘满不会做到一半才发现：每个操作开始前先按最坏情况预留块数（reserve）。
 //!
-//! 并发：调用方保证同一时刻只有一个进程在用（以后由文件系统的一把睡眠锁保证）。
+//! 并发：修改（insert、update、delete、commit、abort 等）同一时刻只能有一个调用方在做，由调用方保证
+//! （内核里是文件系统的写锁，fsys.zig）。读可以和修改、和别的读同时进行：读者用 beginRead 拿一个
+//! 已提交的树的快照，用 lookupAt、nextAt 在它上面找。已提交的树的块从来不改，修改只碰别的块；
+//! 只要提交之后释放的块等还在读旧树的读者都读完了才再分配（limbo），读者看到的就一直是完整的那棵树。
 
 const std = @import("std");
 const btree = @import("btree.zig");
 const bio = @import("bio.zig");
+const proc = @import("proc.zig");
+const Spinlock = @import("spinlock.zig").Spinlock;
 const Key = btree.Key;
 const Node = btree.Node;
 const Ptr = btree.Ptr;
@@ -75,6 +80,12 @@ pub const Root = struct {
     level: u8,
 };
 
+/// 读者拿到的快照：一棵已提交的树的根，和提交它的事务号（endRead 用它判断这棵树是不是还是最新的）。
+pub const Snapshot = struct {
+    root: Root,
+    generation: u64,
+};
+
 /// 树外的块（文件数据）：叶子里的某个条目指向它，记着它是哪个事务写的（释放时要用，见 Volume.free）。
 pub const DataRef = struct {
     blockno: u64,
@@ -111,7 +122,7 @@ const Bitmap = struct {
 
 pub const Volume = struct {
     blocks: u64 = 0,
-    /// 磁盘上最新的超级块的事务号，和它指向的根
+    /// 磁盘上最新的超级块的事务号，和它指向的根。commit 拿着 snap_lock 改，读者拿着 snap_lock 读
     generation: u64 = 0,
     committed: Root = undefined,
     /// 当前事务的事务号（generation + 1）和当前的根
@@ -125,6 +136,15 @@ pub const Volume = struct {
     /// 挂载、检查时走树用的临时位图
     seen: Bitmap = .{},
     free_count: u64 = 0,
+    /// 提交时释放了、但可能还有读者在旧树上读的块（提交时 old_readers > 0 的话，pending 挪到这里）。
+    /// 算作用着的（used 里有，不在 free_count 里），没有旧树的读者了才真正空出来（reclaim）
+    limbo: Bitmap = .{},
+    limbo_count: u64 = 0,
+    /// 保护 generation、committed（修改的一方写、读者读）和下面两个读者计数
+    snap_lock: Spinlock = .init("fs snapshot"),
+    /// 读着最新的已提交的树（generation）的读者个数，和读着更早的树的读者个数
+    readers: usize = 0,
+    old_readers: usize = 0,
     /// 叶子里的条目指向的树外的块（文件系统的数据块）。挂载、检查走树时对每个条目调用它，
     /// 返回的块也算用着的（同一块被引用两次是 Corrupt）。由文件系统在挂载之前设好，没有就是 null
     data_refs: ?*const fn (key: Key, data: []const u8) ?DataRef = null,
@@ -159,7 +179,11 @@ pub const Volume = struct {
         const s = best orelse return error.NotFormatted;
         if (s.blocks > max_blocks) return error.DiskTooLarge;
         if (s.blocks > bio.blockCount() or s.root_level >= max_levels) return error.Corrupt;
-        // 逐个字段赋值：整个 Volume 有 24 KiB，`v.* = .{...}` 可能先在栈上造一个
+        // 逐个字段赋值：整个 Volume 有 32 KiB，`v.* = .{...}` 可能先在栈上造一个。挂载时还没有读者
+        v.limbo.clear();
+        v.limbo_count = 0;
+        v.readers = 0;
+        v.old_readers = 0;
         v.blocks = s.blocks;
         v.generation = s.generation;
         v.committed = .{ .blockno = s.root, .generation = s.root_generation, .level = s.root_level };
@@ -168,18 +192,19 @@ pub const Volume = struct {
         try v.rescan();
     }
 
-    /// 根据当前的根重新算用着的块（挂载、作废事务时）。
+    /// 根据当前的根重新算用着的块（挂载、作废事务时）。limbo 里的块可能还有读者在读，也算用着的。
     fn rescan(v: *Volume) Error!void {
         v.pending.clear();
         v.seen.clear();
         try v.walk(v.root, null, null, null);
-        @memcpy(&v.used.masks, &v.seen.masks);
+        for (&v.used.masks, &v.seen.masks, &v.limbo.masks) |*u, *x, *l| u.* = x.* | l.*;
         for (0..super_blocks) |i| v.used.set(i);
         v.free_count = v.blocks - v.used.count();
         v.dirty = false;
     }
 
-    /// 提交当前事务：新节点都已经写下去了，写一个超级块指向新的根。写完之后 pending 里的块才能再分配。
+    /// 提交当前事务：新节点都已经写下去了，写一个超级块指向新的根。写完之后 pending 里的块才能再分配；
+    /// 还有读者在读旧树的话，它们先进 limbo，等这些读者都读完。
     pub fn commit(v: *Volume) Error!void {
         if (!v.dirty) return;
         try writeSuper(.{
@@ -191,13 +216,72 @@ pub const Volume = struct {
             .root_generation = v.root.generation,
             .root_level = v.root.level,
         });
-        v.free_count += v.pending.count();
-        for (&v.used.masks, &v.pending.masks) |*u, *p| u.* &= ~p.*;
-        v.pending.clear();
+        v.snap_lock.acquire();
         v.generation = v.transid;
         v.committed = v.root;
+        // 刚才还是最新的那棵树的读者，从现在起读的是旧树：它们可能正读着 pending 里的块
+        v.old_readers += v.readers;
+        v.readers = 0;
+        const hold = v.old_readers > 0;
+        v.snap_lock.release();
+        const n = v.pending.count();
+        if (hold) {
+            for (&v.limbo.masks, &v.pending.masks) |*l, *p| l.* |= p.*;
+            v.limbo_count += n;
+        } else {
+            v.free_count += n;
+            for (&v.used.masks, &v.pending.masks) |*u, *p| u.* &= ~p.*;
+        }
+        v.pending.clear();
         v.transid += 1;
         v.dirty = false;
+        v.reclaim();
+    }
+
+    // ---- 快照：读者 ----
+
+    /// 开始读：拿最新的已提交的树的快照。读完一定要 endRead。可以和修改同时进行（见文件开头）；
+    /// 修改的一方可能在等旧树的读者读完（reserve、alloc），所以拿着快照时不能去等修改的一方拿着的东西。
+    pub fn beginRead(v: *Volume) Snapshot {
+        v.snap_lock.acquire();
+        defer v.snap_lock.release();
+        v.readers += 1;
+        return .{ .root = v.committed, .generation = v.generation };
+    }
+
+    /// 读完了。是最后一个读旧树的读者的话，叫醒可能在等 limbo 的修改的一方。
+    pub fn endRead(v: *Volume, s: Snapshot) void {
+        v.snap_lock.acquire();
+        defer v.snap_lock.release();
+        if (s.generation == v.generation) {
+            v.readers -= 1;
+        } else {
+            v.old_readers -= 1;
+            if (v.old_readers == 0) proc.wakeup(&v.old_readers);
+        }
+    }
+
+    /// 旧树的读者都读完了的话，limbo 里的块空出来。只有修改的一方调用（它改 used、free_count）。
+    fn reclaim(v: *Volume) void {
+        if (v.limbo_count == 0) return;
+        v.snap_lock.acquire();
+        // old_readers 只在 commit 里变大，commit 也是修改的一方做的，所以看到 0 之后它不会再变大
+        const busy = v.old_readers > 0;
+        v.snap_lock.release();
+        if (busy) return;
+        for (&v.used.masks, &v.limbo.masks) |*u, *l| u.* &= ~l.*;
+        v.free_count += v.limbo_count;
+        v.limbo.clear();
+        v.limbo_count = 0;
+    }
+
+    /// 等旧树的读者都读完，再 reclaim（空闲块不够、limbo 里又有块时）。读者读完一次系统调用就放开快照，
+    /// 不会等修改的一方，所以等得到。只有进程能调用；单元测试里没有并发的读者，不会走到 sleep。
+    fn waitReaders(v: *Volume) void {
+        v.snap_lock.acquire();
+        while (v.old_readers > 0) proc.sleep(&v.old_readers, &v.snap_lock);
+        v.snap_lock.release();
+        v.reclaim();
     }
 
     /// 作废当前事务：退回已提交的树。当前事务新写的节点都在已提交的树没用的块上，不用管它们。
@@ -210,7 +294,9 @@ pub const Volume = struct {
 
     /// 分配编号最小的空闲块（first fit）。刚放出来的块马上就会被重用：哪里提前放出了已提交的树的块，
     /// 掉电测试马上就能撞上（按顺序往后找的 next fit 要绕一圈才会重用，掩盖了这种错误）。
+    /// 不等读者：调用方可能拿着已提交的树的缓冲区（cow），读者也可能正在等它。节点的分配靠事先 reserve。
     fn alloc(v: *Volume) Error!u64 {
+        v.reclaim();
         for (&v.used.masks, 0..) |*m, i| {
             if (m.* == std.math.maxInt(u64)) continue;
             const b = i * 64 + @ctz(~m.*);
@@ -236,14 +322,20 @@ pub const Volume = struct {
         }
     }
 
-    /// 保证接下来的操作分配 n 个块不会失败。
+    /// 保证接下来的操作分配 n 个块不会失败。算上 limbo 才够的话，等旧树的读者读完。
     fn reserve(v: *Volume, n: u64) Error!void {
-        if (v.free_count < n) return error.NoSpace;
+        v.reclaim();
+        if (v.free_count >= n) return;
+        if (v.free_count + v.limbo_count < n) return error.NoSpace;
+        v.waitReaders();
     }
 
     /// 分配一个数据块（树外的块，比如文件的内容），返回块号，它属于当前事务（generation = transid）。
     /// 调用方把内容写下去，再在树里插一个指向它的条目（data_refs 要认得这个条目）。
+    /// 没有空闲块、limbo 里有的话等旧树的读者读完，所以调用方不能拿着已提交的树的缓冲区。
     pub fn allocData(v: *Volume) Error!u64 {
+        v.reclaim();
+        if (v.free_count == 0 and v.limbo_count > 0) v.waitReaders();
         return v.alloc();
     }
 
@@ -310,10 +402,10 @@ pub const Volume = struct {
 
     // ---- 查找 ----
 
-    /// 从根走到 key 所在的叶子，拿着叶子的缓冲区返回，一路只拿着一个缓冲区。
+    /// 从根 root 走到 key 所在的叶子，拿着叶子的缓冲区返回，一路只拿着一个缓冲区。
     /// 同时返回下一个叶子的下界：走过的各层里，右边还有兄弟的最深那一层的下一个键（没有就是 null）。
-    fn findLeaf(v: *Volume, key: Key) Error!struct { *bio.Buf, ?Key } {
-        var r = v.root;
+    fn findLeaf(v: *Volume, root: Root, key: Key) Error!struct { *bio.Buf, ?Key } {
+        var r = root;
         var upper: ?Key = null;
         while (true) {
             const b = try v.readNode(r.blockno, r.generation, r.level);
@@ -327,9 +419,14 @@ pub const Volume = struct {
         }
     }
 
-    /// 找键正好是 key 的条目，把数据复制进 out（最多 out.len 字节），返回数据的长度；没有返回 null。
+    /// 在当前的树里找键正好是 key 的条目，把数据复制进 out（最多 out.len 字节），返回数据的长度；没有返回 null。
     pub fn lookup(v: *Volume, key: Key, out: ?[]u8) Error!?usize {
-        const b, _ = try v.findLeaf(key);
+        return v.lookupAt(v.root, key, out);
+    }
+
+    /// 同 lookup，在根为 root 的树里找（读者用快照的根）。
+    pub fn lookupAt(v: *Volume, root: Root, key: Key, out: ?[]u8) Error!?usize {
+        const b, _ = try v.findLeaf(root, key);
         defer bio.release(b);
         const n = Node.of(b.data);
         const i, const found = n.leafSearch(key);
@@ -341,11 +438,16 @@ pub const Volume = struct {
 
     pub const Found = struct { key: Key, size: usize };
 
-    /// 找第一个键 >= key 的条目（遍历用：下一次从 found.key.successor() 开始），数据复制进 out。
+    /// 在当前的树里找第一个键 >= key 的条目（遍历用：下一次从 found.key.successor() 开始），数据复制进 out。
     pub fn next(v: *Volume, key: Key, out: ?[]u8) Error!?Found {
+        return v.nextAt(v.root, key, out);
+    }
+
+    /// 同 next，在根为 root 的树里找（读者用快照的根）。
+    pub fn nextAt(v: *Volume, root: Root, key: Key, out: ?[]u8) Error!?Found {
         var k = key;
         while (true) {
-            const b, const upper = try v.findLeaf(k);
+            const b, const upper = try v.findLeaf(root, k);
             defer bio.release(b);
             const n = Node.of(b.data);
             const i, _ = n.leafSearch(k);
@@ -636,16 +738,17 @@ pub const Volume = struct {
         }
     }
 
-    /// 检查当前的树：结构、校验和，以及位图：用着的块正好是树的块、超级块、等着释放的块。
+    /// 检查当前的树：结构、校验和，以及位图：用着的块正好是树的块、超级块、等着释放的块（pending、limbo）。
     pub fn check(v: *Volume) Error!Stats {
         var stats: Stats = .{ .height = v.height() };
         v.seen.clear();
         try v.walk(v.root, null, null, &stats);
         for (0..super_blocks) |i| v.seen.set(i);
         // 当前的树不能用着等释放的块：那些块属于已提交的树，提交之前不能分配出去
-        for (&v.seen.masks, &v.pending.masks) |*x, *p| if (x.* & p.* != 0) return error.Corrupt;
-        for (&v.seen.masks, &v.pending.masks) |*x, *p| x.* |= p.*;
-        if (!std.mem.eql(u64, &v.seen.masks, &v.used.masks) or v.free_count != v.blocks - v.used.count()) return error.Corrupt;
+        for (&v.seen.masks, &v.pending.masks, &v.limbo.masks) |*x, *p, *l| if (x.* & (p.* | l.*) != 0 or p.* & l.* != 0) return error.Corrupt;
+        for (&v.seen.masks, &v.pending.masks, &v.limbo.masks) |*x, *p, *l| x.* |= p.* | l.*;
+        if (!std.mem.eql(u64, &v.seen.masks, &v.used.masks) or v.free_count != v.blocks - v.used.count() or
+            v.limbo_count != v.limbo.count()) return error.Corrupt;
         return stats;
     }
 };
@@ -771,13 +874,18 @@ const Model = struct {
 
 /// 树的内容和 model 完全一样：逐个 next 遍历，键按顺序、数据对得上、个数相同。
 fn expectContents(v: *Volume, model: *const Model) !void {
+    return expectContentsAt(v, v.root, model);
+}
+
+/// 同 expectContents，看根为 root 的树（快照）。
+fn expectContentsAt(v: *Volume, root: Root, model: *const Model) !void {
     var buf: [btree.max_data]u8 = undefined;
     var want: [btree.max_data]u8 = undefined;
     var count: usize = 0;
     var k: ?Key = Key.min;
     var prev: ?Key = null;
     while (k) |key| {
-        const f = try v.next(key, &buf) orelse break;
+        const f = try v.nextAt(root, key, &buf) orelse break;
         if (prev) |p| try std.testing.expect(p.lessThan(f.key));
         prev = f.key;
         const id: u32 = @intCast(f.key.offset);
@@ -894,6 +1002,75 @@ test "没提交的改动重新挂载后就没了；等着释放的块提交之�
     const writes = test_writes;
     try v.commit();
     try std.testing.expectEqual(writes, test_writes);
+}
+
+test "快照：提交之后读者还看得到旧树；旧树的块进 limbo，读者读完才再分配" {
+    try testSetup(512);
+    defer testFree();
+    const v = &test_vol;
+    var model: Model = .{};
+    defer model.deinit();
+    var prng = std.Random.DefaultPrng.init(3);
+    const rng = prng.random();
+    for (0..100) |_| try randomOp(v, &model, rng, 200);
+    try v.commit();
+
+    // 拿着快照的时候提交很多次：快照的内容一直不变，旧树释放的块都进 limbo、不会被分配出去
+    const snap = v.beginRead();
+    var scratch = try model.clone();
+    defer scratch.deinit();
+    for (0..200) |i| {
+        try randomOp(v, &scratch, rng, 200);
+        if (i % 10 == 9) {
+            try v.commit();
+            _ = try v.check(); // limbo 里的块不在当前的树里，used 也算上了它们
+            try expectContentsAt(v, snap.root, &model);
+        }
+    }
+    try std.testing.expect(v.limbo_count > 0);
+    try std.testing.expectEqual(1, v.old_readers);
+    // 提交之后才开始读的读者读最新的树；它读完不会影响 limbo
+    const fresh = v.beginRead();
+    try expectContentsAt(v, fresh.root, &scratch);
+    v.endRead(fresh);
+    try std.testing.expect(v.limbo_count > 0);
+
+    // 读完了：下一次分配之前 limbo 空出来
+    v.endRead(snap);
+    const free_before = v.free_count;
+    const limbo = v.limbo_count;
+    try randomOp(v, &scratch, rng, 200);
+    try v.commit();
+    try std.testing.expectEqual(0, v.limbo_count);
+    try std.testing.expect(v.free_count + 20 > free_before + limbo); // 一次操作最多再用掉十几块
+    _ = try v.check();
+    try expectContents(v, &scratch);
+
+    // 没有快照时提交释放的块直接空出来，不进 limbo；同一个事务号里开始又结束的读者也不留下什么
+    const s2 = v.beginRead();
+    v.endRead(s2);
+    for (0..20) |_| try randomOp(v, &scratch, rng, 200);
+    try v.commit();
+    try std.testing.expectEqual(0, v.limbo_count);
+    try std.testing.expectEqual(0, v.readers + v.old_readers);
+
+    // 作废事务（abort 重新走树算用着的块）时 limbo 里的块也还算用着的
+    const s3 = v.beginRead();
+    var after = try scratch.clone();
+    defer after.deinit();
+    for (0..20) |_| try randomOp(v, &after, rng, 200);
+    try v.commit();
+    try std.testing.expect(v.limbo_count > 0);
+    try randomOp(v, &after, rng, 200);
+    try v.abort();
+    _ = try v.check();
+    try expectContentsAt(v, s3.root, &scratch);
+    v.endRead(s3);
+
+    testReboot();
+    try v.mount();
+    try std.testing.expectEqual(0, v.limbo_count);
+    _ = try v.check();
 }
 
 test "磁盘满：放不下时返回 NoSpace、什么都不改；删掉一些、提交之后又能放" {

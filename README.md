@@ -16,7 +16,7 @@
 - 文件系统，类似 btrfs：所有东西（inode、目录项、文件内容）都是一棵写时复制 B 树里的条目，每个操作一个事务，掉电后总是某个操作做完的样子；小文件内联在树里，数据块带校验和；构建时由主机上的 `mkfs` 生成磁盘镜像，用户程序装在 `/bin`
 - 32 个系统调用：文件描述符（`read`/`write`/`close`/`dup`）和管道（`pipe`），文件系统（`open`（含 `O_APPEND`）/`lseek`/`rename`/`mkdir`/`unlink`/`chdir`/`fstat`/`readdir`，检查整个文件系统的 `scrub`），命令行参数（`exec` 带 `argv`），堆（`sbrk`），读写磁盘的原始区域（`readblock`/`writeblock`）
 - 用户态的 init 和 shell：init 启动 shell，shell 用 `fork` + `exec` 运行程序（直接写程序名，或者 `run 程序名`），可以带参数、在后台运行、用 `|` 接成管道、用 `<`、`>`、`>>` 重定向到文件，`cd` 换当前目录
-- 照 xv6 加锁：每个进程一把锁、`wait_lock`、tickslock，页分配器、文件表、管道、串口的输入和输出、磁盘队列、缓冲区缓存都有自旋锁，缓冲区和文件系统还有睡眠锁
+- 照 xv6 加锁，并且尽量细：每个进程、每个管道、每个打开的文件一把锁；页分配器每个 hart 一条空闲链表；缓冲区缓存按块号分桶；文件系统的读者在已提交的树的快照上读、不拿锁，修改之间才排队
 
 ```
 Hello from a Zig kernel on RISC-V!

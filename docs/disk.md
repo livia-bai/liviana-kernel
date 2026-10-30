@@ -151,12 +151,14 @@ pub const Sleeplock = struct {
 
 ```zig
 pub const nbuf = 32;
+const nbucket = 13;
 pub const Buf = struct {
     lock: Sleeplock,     // 保护 valid、data
-    refcnt: u32,         // bio.lock：几个人拿着或在等
-    blockno: u64,        // bio.lock：装的是哪一块
+    refcnt: u32,         // 桶的锁：几个人拿着或在等
+    blockno: u64,        // 桶的锁：装的是哪一块，决定在哪个桶里（还没装过块的是 maxInt）
+    stamp: u64,          // 桶的锁：最后一次变成没人用的时刻（LRU）
     valid: bool,         // data 是不是这一块在磁盘上的内容
-    node: std.DoublyLinkedList.Node,   // LRU 链表，表头是最近用过的
+    node: std.DoublyLinkedList.Node,   // 桶里的链表
     data: *align(4096) [block_size]u8,
 };
 pub const Device = struct { blocks: u64, transfer: *const fn (u64, *[block_size]u8, bool) void };
@@ -175,16 +177,24 @@ pub fn blockCount() u64
 1. **缓存**：最近用过的块留在内存里，再读不用等磁盘。
 2. **同一块在内存里只有一份，同时只有一个进程用**：`read`/`get` 返回时拿着这一块的睡眠锁，别的进程要同一块就睡着等。
 
+**按块号散列的桶**（xv6 lock lab 的 bcache）：缓冲区按 `blockno % 13` 分进 13 个桶，每个桶一把自旋锁和一个链表。xv6 原来是一把锁管整个缓存，几个 hart 同时读不同的块（文件系统的读者在快照上并发读，[fs.md](fs.md#接进内核fsyszig)）也要抢这一把锁；分桶之后，块已经在缓存里时只拿它那一个桶的锁。桶的个数取质数，块号连续的块散到不同的桶里。
+
+**LRU 用时间戳**：没有全局的 LRU 链表了（维护它又要一把全局的锁）。缓冲区变成没人用（`refcnt` 减到 0）时，从一个原子计数器 `clock` 取下一个值记进 `stamp`；换块时换掉所有没人用的缓冲区里 `stamp` 最小的。xv6 lock lab 用的是 `ticks`，同一个 tick 里放开的分不出先后；计数器每次加 1，先后是精确的（单元测试检查换掉的就是最久没用的那一块）。
+
 ### 找缓冲区（`get`）
 
-拿着 `bio.lock`：
+1. 拿块号对应的桶的锁，在桶里找 `blockno` 相同的。找到了就 `refcnt += 1`，放开桶的锁，再拿缓冲区的睡眠锁：可能要睡着等别的进程用完。`refcnt` 在放开桶的锁之前加，所以别人没法在“找到了”和“拿到睡眠锁”之间把这个缓冲区换成别的块。
+2. 没有就放开桶的锁，**换块**（`evict`），拿着 `evict_lock`：
+   1. 再在桶里找一次：放开桶的锁到拿到 `evict_lock` 之间，别的进程可能刚把这一块换进来。换进来都要拿着 `evict_lock`，所以拿着它查一次就够了，之后没人能再换进同一块：**同一块在缓存里不会有两份**。
+   2. 依次看每个桶（`takeOldest`），找 `refcnt == 0`、`stamp` 最小的缓冲区。一直拿着目前最好的候选所在的桶的锁，找到更好的才换成新的桶，这样候选的 `refcnt` 不会在找完之前被别人加上去。最后把它从原来的桶里摘下来，改成这一块（`valid = false`、`refcnt = 1`），挂进新的桶。摘下来到挂进去之间它不在任何桶里，别人找不到它。
+   3. 都有人在用（32 个都有人拿着）就 `proc.sleep(&evicting, &evict_lock)`，等有人 `release`。xv6 在这里 panic。
+3. 换来的缓冲区同样再拿睡眠锁。
 
-1. 从表头（最近用过）往后找 `blockno` 相同、并且 `refcnt > 0` 或 `valid` 的缓冲区：这一块已经在缓存里（或者正有人在读它）。
-2. 没有的话从表尾（最久没用）往前找 `refcnt == 0` 的，改成这一块，`valid = false`。
-3. 都没有（32 个都有人拿着）就 `proc.sleep(&lru, &bio.lock)`，等有人 `release`。xv6 在这里 panic。等下去不会死锁：同时拿着好几个缓冲区的只有文件系统（B 树的一条路径加上分裂出来的节点，最多 17 个），而同一时刻只有一个进程在用文件系统（`fsys.lock`）；`readblock`、`writeblock` 最多拿一个，拿着的时候不等别的东西。
-4. `refcnt += 1`，放开 `bio.lock`，再拿缓冲区的睡眠锁：可能要睡着等别的进程用完。
+**两把桶的锁同时拿只发生在换块的时候**，而换块拿着 `evict_lock`，一次只有一个进程在换，所以不会互相等。顺序是 `evict_lock` → 桶的锁；找已经缓存着的块只拿一把桶的锁，拿着它不再拿别的锁。
 
-`refcnt` 在放开 `bio.lock` 之前加，所以别人没法在“找到了”和“拿到睡眠锁”之间把这个缓冲区换成别的块。
+**等空闲缓冲区不会丢 wakeup**：换块的进程先把 `evicting` 加 1（拿着 `evict_lock`、找之前），找完才睡；`release` 拿着桶的锁把 `refcnt` 减到 0、放开之后看 `evicting`，不为 0 才拿 `evict_lock` 去 `wakeup`。如果 `release` 在换块的进程看那个桶之前减到 0，换块的进程会看到它；如果在之后，那时 `evicting` 早已加过（同一把桶的锁保证了先后），`release` 就会来拿 `evict_lock`，而换块的进程睡下之前一直拿着它，所以 `wakeup` 一定在它睡下之后。平时没人在换块，`release` 不碰 `evict_lock`。
+
+**等下去不会死锁**：同时拿着好几个缓冲区的只有修改文件系统的一方（B 树的一条路径加上分裂出来的节点，再加一两个数据块，不到 20 个），而修改之间一个一个来（文件系统的写锁）；文件系统的读者、`readblock`、`writeblock` 一次只拿一个，拿着它的时候不去等别的缓冲区，用完就放开。所以修改的一方要等的缓冲区，迟早会被别人放开。
 
 `read` = `get` + `load`：`valid` 为 false 时 `device.transfer(blockno, data, false)` 读进来。`load` 返回这次是不是真的读了盘，写时复制 B 树只在读盘时验节点的校验和（[btree.md](btree.md#节点格式btreezig)）；发现内容不对的调用方把 `valid` 设回 false，下次重新读盘。几个进程同时 `read` 同一块时，第一个拿到睡眠锁的去读盘，后面的醒来时看到 `valid` 已经是 true，不再读。
 
@@ -193,8 +203,8 @@ pub fn blockCount() u64
 ### 写和放开
 
 - `write` 要求拿着睡眠锁、`valid` 为 true，同步写回磁盘（write-through）：返回时数据已经交给设备了。
-- `invalidate` 把 `refcnt` 为 0 的缓冲区都标成 `valid = false`，之后再读它们都要重新读盘。给 `scrub` 用：校验和只在读盘时核对，要核对磁盘上的内容就不能用缓存里的（[fs.md](fs.md#检查整个文件系统checkscrub)）。写都是同步的，缓存里没有还没写下去的内容，作废不会丢东西；`valid` 本来由缓冲区的睡眠锁保护，`refcnt` 为 0 说明没人拿着、也没人在等这把睡眠锁，所以拿着 `bio.lock` 改它也安全。
-- `release` 放开睡眠锁，`refcnt -= 1`；减到 0 就把它挪到表头（最近用过），有人在等空闲缓冲区的话叫醒（`waiting` 计数，不用每次都扫一遍进程表）。
+- `invalidate` 逐个桶拿锁，把 `refcnt` 为 0 的缓冲区都标成 `valid = false`，之后再读它们都要重新读盘。给 `scrub` 用：校验和只在读盘时核对，要核对磁盘上的内容就不能用缓存里的（[fs.md](fs.md#检查整个文件系统checkscrub)）。写都是同步的，缓存里没有还没写下去的内容，作废不会丢东西；`valid` 本来由缓冲区的睡眠锁保护，`refcnt` 为 0 说明没人拿着、也没人在等这把睡眠锁，所以拿着桶的锁改它也安全。
+- `release` 放开睡眠锁，拿桶的锁 `refcnt -= 1`；减到 0 就记下 `stamp`，有人在换块（`evicting` 不为 0）的话叫醒它。拿着睡眠锁时别人换不掉这个缓冲区，所以 `release` 用 `blockno` 算出来的桶就是它所在的桶。
 
 ### 磁盘是可以换的（`Device`）
 
@@ -208,9 +218,10 @@ bio.init(if (virtio_disk.blocks > 0) .{ .blocks = virtio_disk.blocks, .transfer 
 
 ### 锁
 
-- `bio.lock`（自旋锁）：LRU 链表、每个缓冲区的 `refcnt`、`blockno`，`waiting`。等空闲缓冲区时拿着它睡下。
+- 每个桶的锁（自旋锁）：桶里的链表，桶里每个缓冲区的 `refcnt`、`blockno`、`stamp`。
+- `evict_lock`（自旋锁）：换块一个一个来；等空闲缓冲区时拿着它睡下。`evicting`、`clock` 是原子变量。
 - 每个缓冲区的睡眠锁：`valid`、`data`。拿着它读写磁盘（睡着等）。
-- 顺序：先 `bio.lock` 找到缓冲区、加 `refcnt`，放开，再拿睡眠锁；读写磁盘时拿着睡眠锁去拿 `virtio_disk.lock`。
+- 顺序：`evict_lock` → 桶的锁（同时拿两个桶的只有拿着 `evict_lock` 的）；先拿桶的锁找到缓冲区、加 `refcnt`，放开，再拿睡眠锁；读写磁盘时拿着睡眠锁去拿 `virtio_disk.lock`。
 
 ## 系统调用
 
@@ -229,4 +240,4 @@ bio.init(if (virtio_disk.blocks > 0) .{ .blocks = virtio_disk.blocks, .transfer 
 - 只有一个队列、16 个描述符，最多同时 5 个请求在设备里；没有协商 event idx、间接描述符，每个请求都写一次 QueueNotify。
 - 设备报错直接 panic，没有把错误交回调用方。
 - 缓冲区缓存是 write-through：每次 `write` 都等磁盘写完。以后文件系统的事务可以把一批块攒着一起写。
-- 只有一把 `bio.lock`；xv6 的 lock lab 把它拆成按块号散列的几个桶，减少多核时的争用。
+- 换块要拿 `evict_lock`、扫所有桶，比找缓存着的块慢；缓存一直不命中时，换块的进程之间还是要排队。

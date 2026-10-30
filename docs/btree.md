@@ -123,9 +123,13 @@ pub const Volume = struct {
     committed: Root,     // 它指向的根
     transid: u64,        // 当前事务 = generation + 1
     root: Root,          // 当前的根
-    used: Bitmap,        // 用着的块：当前的树、已提交的树、超级块
+    used: Bitmap,        // 用着的块：当前的树、已提交的树、超级块、limbo
     pending: Bitmap,     // 已提交的树用着、当前的树不用了的块
     free_count: u64,
+    limbo: Bitmap,       // 提交时释放了、可能还有读者在旧树上读的块（见“快照”）
+    snap_lock: Spinlock, // generation、committed、读者计数
+    readers: usize,      // 读着最新的已提交的树的读者
+    old_readers: usize,  // 读着更早的树的读者
     ...
 };
 pub fn format(blocks: u64) Error!void
@@ -133,6 +137,9 @@ pub fn mount(v: *Volume) Error!void
 pub fn commit(v: *Volume) Error!void
 pub fn abort(v: *Volume) Error!void
 pub fn insert / update / delete / lookup / next
+pub fn beginRead(v: *Volume) Snapshot           // 读者：拿快照
+pub fn endRead(v: *Volume, s: Snapshot) void
+pub fn lookupAt / nextAt                        // 在快照的根上找
 pub fn check(v: *Volume) Error!Stats
 ```
 
@@ -157,9 +164,33 @@ commit:  写超级块（事务号 transid，写到第 transid % 2 块） → pen
 
 **空闲空间不存在磁盘上**：`mount` 从根把树走一遍（`walk`），用到的块记进 `used`。这样磁盘上没有一份“哪些块空闲”的记录需要和树保持一致，掉电也就不会让它们不一致。代价是挂载要读整棵树（以后文件的数据块也要从树里的条目算出来）。btrfs 用 extent tree 记每个块的引用，挂载时不用走树，但那棵树自己也要写时复制、和分配互相牵扯，复杂得多。位图是静态的，每块一位，最多管 65536 块（256 MiB），一个位图 8 KiB。
 
-**出错时整个事务作废**（`abort`）：操作做到一半出错（读到坏块），树可能改了一半。这时根退回 `committed`，重新走一遍已提交的树算出用着的块（和挂载一样）。当前事务写下去的节点都在已提交的树没用的块上，不用管。以后文件系统每个系统调用提交一次，出错只丢这一次的改动。磁盘满不会走到这一步（先预留）。
+**出错时整个事务作废**（`abort`）：操作做到一半出错（读到坏块），树可能改了一半。这时根退回 `committed`，重新走一遍已提交的树算出用着的块（和挂载一样，再加上 `limbo` 里的块）。当前事务写下去的节点都在已提交的树没用的块上，不用管。以后文件系统每个系统调用提交一次，出错只丢这一次的改动。磁盘满不会走到这一步（先预留）。
 
-**位图不能在栈上复制**：一个位图 8 KiB，`Volume` 有三个（`used`、`pending` 和走树用的 `seen`），比内核栈的一半还大。只在原地改（`clear`、逐个 `masks` 的循环），不写 `.initEmpty()`、`complement()`、`v.* = .{...}` 这类可能先在栈上造一个临时值的写法。
+**位图不能在栈上复制**：一个位图 8 KiB，`Volume` 有四个（`used`、`pending`、`limbo` 和走树用的 `seen`），每一个都比内核栈的一半还大。只在原地改（`clear`、逐个 `masks` 的循环），不写 `.initEmpty()`、`complement()`、`v.* = .{...}` 这类可能先在栈上造一个临时值的写法。
+
+## 快照（读者）
+
+修改（`insert`、`update`、`delete`、`commit`、`abort`……）同一时刻只能有一个调用方在做，由调用方保证（内核里是文件系统的写锁，[fs.md](fs.md#接进内核fsyszig)）。**读可以和修改同时进行**，不拿那把锁：
+
+```zig
+pub const Snapshot = struct { root: Root, generation: u64 };
+const s = v.beginRead();                  // 最近一次提交的根
+_ = try v.lookupAt(s.root, key, &buf);    // 在那棵树上找（nextAt 一样）
+v.endRead(s);
+```
+
+**为什么能同时读**：已提交的树的块从来不改，修改的一方只写别的块（写时复制），提交时才把 `committed` 换成新的根。读者拿着旧的根往下走，看到的一直是那棵完整的树；修改做到一半的节点都在别的块上，读者走不到。`committed`、`generation` 由 `snap_lock` 保护：`commit` 拿着它换，`beginRead` 拿着它读。
+
+**难点是旧树的块什么时候能重用。** 没有读者时，事务 g 提交之后，它释放的 g-1 的树的块（`pending`）马上空出来，事务 g+1 就可能分配到、改写它们。可是在 g 提交之前开始读的读者还在 g-1 的树上走，改写了就会读到别的东西（读到的节点块号、事务号对不上，报 `Corrupt`；数据块在缓存里的话连校验和都不核对，直接读到别的文件的内容）。所以：
+
+- `readers` 数着读最新的已提交的树的读者，`old_readers` 数着读更早的树的读者（`endRead` 用快照里的 `generation` 判断它是哪一种）。`commit` 换根的同时把 `readers` 并进 `old_readers`：刚才还是最新的那棵树，从现在起是旧树。
+- `commit` 时 `old_readers > 0`，`pending` 就并进 **`limbo`**，不空出来：仍然算用着的（`used` 里有，`free_count` 不算它们）。否则照常空出来。
+- **`reclaim`**：没有旧树的读者了，`limbo` 整个空出来。修改的一方在每次 `commit`、`reserve`、分配之前调用它；`old_readers` 只在 `commit` 里变大，而 `commit` 也是修改的一方做的，所以它看到 0 之后，直到它自己下一次提交都不会再变大。
+- **空闲块不够时等读者读完**（`waitReaders`）：`reserve` 发现 `free_count` 不够、加上 `limbo` 才够，就拿着 `snap_lock` 睡在 `&old_readers` 上，最后一个旧树的读者 `endRead` 时叫醒它，再 `reclaim`。`allocData` 没有空闲块、`limbo` 里有时也这样等。节点的分配（`alloc`）**不等**：它在 `cow` 里调用，那时手里拿着已提交的树的一个缓冲区，读者可能正在等这个缓冲区的睡眠锁，等它就是死锁；节点的块数事先 `reserve` 过了，用不着等。`allocData` 的调用方（文件系统写数据页）这时不拿着已提交的树的缓冲区。
+- 等得到：读者只在一次系统调用里拿着快照，期间不去等修改的一方拿着的东西（文件系统的写锁、`File.pos_lock`；缓冲区它一次只拿一个，用完就放）。
+- `rescan`（挂载、`abort`）重新算 `used` 时也算上 `limbo`；`check` 核对 `used` 正好是当前的树 + 超级块 + `pending` + `limbo`，当前的树不用 `pending`、`limbo` 里的块，两者不重叠。挂载时 `limbo` 是空的（还没有读者）。
+
+单元测试（`ctree.zig` 末尾）拿着一个快照提交 20 次随机修改，每次之后快照的内容都和拿快照时一样、`check` 通过；读完之后下一次提交 `limbo` 清空；拿着快照时 `abort` 也对。在 QEMU 里，`t_fsmp` 让读者在两个写者反复改写大文件的同时一直读；把 `commit` 改成不管有没有读者都马上空出 `pending`，读者打开、读文件出错，`exec` 失败（4 个 hart 上实测两次都失败；改回来之后通过）。
 
 ## 给文件系统用的接口
 
@@ -177,7 +208,7 @@ pub fn lastKey(v: *Volume) Error!?Key
 
 ## 检查（`check`）
 
-走一遍当前的树，检查：每个节点的校验和、块号、事务号（不大于当前事务）、层数；键在节点里严格递增，并且都在父节点给的 `[下界, 上界)` 里（跳过 `ptrs[0].key`）；所有叶子在同一层；叶子的数据正好从块末尾往前挨着放、不和条目重叠；同一个块不被引用两次；当前的树不用 `pending` 里的块；`used` 正好等于树的块 + 超级块 + `pending`，`free_count` 和它一致。挂载时走的是同一个 `walk`（不数条目），所以坏块、写丢了在挂载时就能发现。
+走一遍当前的树，检查：每个节点的校验和、块号、事务号（不大于当前事务）、层数；键在节点里严格递增，并且都在父节点给的 `[下界, 上界)` 里（跳过 `ptrs[0].key`）；所有叶子在同一层；叶子的数据正好从块末尾往前挨着放、不和条目重叠；同一个块不被引用两次；当前的树不用 `pending`、`limbo` 里的块；`used` 正好等于树的块 + 超级块 + `pending` + `limbo`，`free_count`、`limbo_count` 和它们一致。挂载时走的是同一个 `walk`（不数条目），所以坏块、写丢了在挂载时就能发现。
 
 ## 单元测试
 

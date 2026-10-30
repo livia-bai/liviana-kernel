@@ -88,7 +88,7 @@ pub fn current() ?*Process              // cpus[hart.id()].proc
 
 所有的状态变化都拿着这个进程的锁。
 
-- **每个进程一块 16 KiB 的内核栈**，静态分配在 `.bss` 里（16 块共 256 KiB）。不从页分配器要：它一次只给一页，给不出连续的 16 KiB。实测 Debug 模式下跑完全部 QEMU 测试（单核和 4 核，包括文件系统的 `t_fs` 和掉电后重新启动），最深用了 10056 字节，safe 模式下 5904 字节，small 模式下 5192 字节（加了 `rename`、`scrub` 之后重新量的），最深的是文件系统的系统调用（B 树的操作，[fs.md](fs.md#接进内核fsyszig)）。测法：`.bss` 启动时清零，`shutdown` 时从每块栈的底部找第一个不为 0 的字节，取最大值（临时加的代码，没有留在仓库里；最底下 256 字节的金丝雀不算）。内核栈两侧没有保护页：内核内存是用大页恒等映射的，要在中间挖出不映射的页得拆大页，现在没做。
+- **每个进程一块 16 KiB 的内核栈**，静态分配在 `.bss` 里（16 块共 256 KiB）。不从页分配器要：它一次只给一页，给不出连续的 16 KiB。实测 Debug 模式下跑完全部 QEMU 测试（单核和 4 核，包括文件系统的 `t_fs` 和掉电后重新启动），最深用了 10488 字节，safe 模式下 6128 字节，small 模式下 5592 字节（文件系统改成读者在快照上读之后重新量的），最深的是文件系统的系统调用（B 树的操作，[fs.md](fs.md#接进内核fsyszig)）。测法：`.bss` 启动时清零，`shutdown` 时从每块栈的底部找第一个不为 0 的字节，取最大值（临时加的代码，没有留在仓库里；最底下 256 字节的金丝雀不算）。内核栈两侧没有保护页：内核内存是用大页恒等映射的，要在中间挖出不映射的页得拆大页，现在没做。
 - **栈底的金丝雀**（`src/canary.zig`）：没有保护页，进程 i 的内核栈往下溢出时不会缺页，而是正好写进进程 i-1 内核栈的最顶上，也就是它的 `TrapFrame`，那个进程回到 U 模式时寄存器就乱了，很难查。所以每块内核栈最底下的 256 字节写着固定的图案（`allocSlot` 拿到空槽位时写，这时这块栈没人用），切回调度器（`sched`）、回到 U 模式之前（`handleTrap` 末尾、`forkretC`）由 `proc.checkStack` 检查，图案被改了就 panic：`kernel stack overflow: pid N (name)`。这是尽力而为的检查：一个很大、只写了一部分的栈帧可能整个跨过 256 字节而不碰它。临时在 `getpid` 里放一个 15.5 KiB 的数组实测过，shell 一调用 `getpid` 就 panic。启动栈也有一份（[boot.md](boot.md#每个-hart-的启动栈)）。
 - init 和 shell 一直占着两个槽位，所以同时最多运行 14 个别的程序。
 - `current()` 返回当前 hart 上正在运行的进程：`cpus[hart.id()].proc`，只在 `scheduler` 切到进程前设置、切回来后清回 `null`。系统调用和陷阱处理程序用 `current().?` 取当前进程，Debug/safe 模式下没有进程时会 panic。它不用加锁：只有这个 hart 自己读写自己那一项，而且内核关着中断运行，读到之后到开中断之前，这个 hart 不会换进程（xv6 的 `myproc` 为此要 `push_off`）。
@@ -259,10 +259,10 @@ pub fn fork() ForkError!usize {
 ```zig
 pub fn exec(path: []const u8, args: []const []const u8) ExecError!void {
     const p = current().?;
-    const root = fsys.get() catch return error.NoDevice;   // 拿着文件系统的锁加载
+    var r = fsys.reader() catch return error.NoDevice;   // 在文件系统的一个快照上加载
     const image = blk: {
-        defer fsys.unlock();
-        break :blk try loadImage(try openProgram(root, p.cwd, path), args);   // 新地址空间 + 加载 + 参数放到栈顶
+        defer r.end();
+        break :blk try loadImage(try openProgram(&r.fs, p.cwd, path), args);   // 新地址空间 + 加载 + 参数放到栈顶
     };
     const old = p.space;
     p.space = image.space;
@@ -278,7 +278,7 @@ pub fn exec(path: []const u8, args: []const []const u8) ExecError!void {
 ```
 
 - **找程序**（`openProgram`）：`path` 里没有 `/` 的在 `/bin` 里找（`run hello` 就是 `/bin/hello`，相当于 `PATH` 只有 `/bin`），有的按路径找，相对路径从当前目录开始。找不到是 `NoSuchProgram`（`ENOENT`），是目录是 `BadElf`（`ENOEXEC`），路径中间不是目录是 `NotDir`，`/bin/` 加上名字超过 256 字节是 `NameTooLong`，没挂上文件系统是 `NoDevice`。
-- **加载期间拿着 `fsys.lock`**：程序文件读到一半不会被别的进程改掉、删掉。拿着这把睡眠锁再去分配页（`page.lock`，自旋锁）是允许的方向。
+- **加载期间用同一个快照**（[fs.md](fs.md#接进内核fsyszig)）：程序文件读到一半被别的进程改掉、删掉，读到的也还是开始时的样子，不会半新半旧；也不挡着别人读写文件系统（几个 hart 同时 `exec` 各读各的）。拿着快照分配页（页分配器的锁，自旋锁）是允许的：它不用等修改文件系统的一方。
 - 先把新程序完整加载进**新的**地址空间，全部成功之后才换掉旧的。失败时旧的地址空间和 `TrapFrame` 都没动，系统调用返回错误，原来的程序接着运行（xv6 也是这样）。
 - `args` 已经在**内核内存**里了：参数在旧的地址空间里，换掉之前 `exec` 系统调用就把它们复制到了内核栈上（[syscalls.md](syscalls.md#exec)）。
 - **释放旧的页表之前必须先切走**：这时 `satp` 还指着旧的根页表。
@@ -711,16 +711,26 @@ Ctrl-C 结束的是**前台进程和它的所有子孙**：shell 用 `fork` 启�
 | `Process.lock`（每个进程一把） | 这个进程的 `state`、`hart`、`pid`、`name`、`chan`、`killed`、`xstatus`、`ticks`；调度器拿着它切到进程，进程拿着它切回调度器 | 本文 |
 | `proc.wait_lock` | 所有进程的 `parent`；`wait` 拿着它睡在自己身上 | 本文 |
 | `timer.lock` | `timer.ticks`；`sleep` 系统调用拿着它睡在 `&ticks` 上 | [devices.md](devices.md#定时器timerzig) |
-| `page.lock` | 空闲页链表、`free_pages`、每一页的引用数（写时复制） | [page-allocator.md](page-allocator.md) |
-| `file.lock` | 文件表（每个 `File` 的引用数） | [files.md](files.md#文件表) |
+| `page.Pool.lock`（每个 hart 一把） | 这个 hart 的空闲页链表和页数；每一页的引用数是原子变量，不用锁 | [page-allocator.md](page-allocator.md#并发) |
+| `File.lock`（每个打开的文件一把） | 这个 `File` 的引用数（文件表没有整张表的锁） | [files.md](files.md#文件表) |
 | `Pipe.lock` | 一个管道的缓冲区和两端的状态；读写的进程拿着它睡在管道上 | [files.md](files.md#管道) |
 | `uart.rx_lock` | 串口的输入缓冲区；`read` 拿着它睡在 `uart.rx_chan` 上，串口中断也要拿它 | [devices.md](devices.md#输入环形缓冲区) |
 | `virtio_disk.lock` | 磁盘的请求队列；发出请求的进程拿着它睡着等，磁盘中断拿着它叫醒 | [disk.md](disk.md#锁) |
-| `bio.lock` | 缓冲区缓存的 LRU 链表、每个缓冲区的 `refcnt`、`blockno`；等空闲缓冲区时拿着它睡下 | [disk.md](disk.md#锁-1) |
+| `bio` 的桶的锁（13 把） | 桶里的缓冲区链表，和这些缓冲区的 `refcnt`、`blockno`、`stamp` | [disk.md](disk.md#锁-1) |
+| `bio.evict_lock` | 换块一个一个来；等空闲缓冲区时拿着它睡下 | [disk.md](disk.md#找缓冲区get) |
+| `Volume.snap_lock` | 文件系统已提交的根、读者计数；修改的一方等旧树的读者时拿着它睡下 | [btree.md](btree.md#快照读者) |
 | `Sleeplock.lk` | 一把睡眠锁的 `locked`、`holder`；等锁的进程拿着它睡下 | [disk.md](disk.md#睡眠锁sleeplockzig) |
 | `uart.tx_lock` | 串口输出：一次 `print`、一次 `write` 系统调用整段输出，不和别的 hart 的输出交错 | [devices.md](devices.md#串口uartzig) |
 
-不用锁的：`proc.next_pid`、`proc.foreground` 是原子变量；`init_proc` 只在启动时写一次；`cpus[i]`、`spinlock` 的 `held[i]`、`timer.deadline[i]` 只有 hart i 自己读写；进程的 `space`、`context`、`files`、`heap_start`、`brk`、`cwd` 只有进程自己读写（见[进程表](#进程表)）；内核页表启动后不再改。
+不用锁的：`proc.next_pid`、`proc.foreground`、每一页的引用数（`page.refs`）、缓冲区缓存的 `clock`、`evicting` 是原子变量；`init_proc` 只在启动时写一次；`cpus[i]`、`spinlock` 的 `held[i]`、`timer.deadline[i]` 只有 hart i 自己读写；进程的 `space`、`context`、`files`、`heap_start`、`brk`、`cwd` 只有进程自己读写（见[进程表](#进程表)）；内核页表启动后不再改。
+
+**锁尽量细**：进程、管道、打开的文件、页分配器（每个 hart 一把）、缓冲区缓存（按块号分桶）各有各的锁，文件系统的读者不拿锁（快照）。几个 hart 做互不相干的事（各自分配页、读各自的文件、读同一个文件的不同块）时不抢同一把锁。剩下几把全局的锁是有原因的：
+
+- `wait_lock`：照 xv6。父子关系跨进程（`finish` 要把子进程交给 init、叫醒父进程），用每个进程的锁就得同时拿父子两把，顺序不好定，还会丢 `wakeup`；它只在 `fork`、`exit`、`wait` 时拿一下。
+- `timer.lock`：保护一个计数器 `ticks`，`sleep` 系统调用拿着它睡在 `&ticks` 上。
+- `virtio_disk.lock`、`uart.tx_lock`、`uart.rx_lock`：设备只有一个（一个请求队列、一个串口），本来就要一个一个来。
+- `fsys.write_lock`：写时复制的 B 树同一时刻只能有一个事务（[fs.md](fs.md#接进内核fsyszig)）。读不拿它。
+- `bio.evict_lock`：只在换块时拿；缓存命中时不碰它。
 
 规矩（`spinlock.zig` 的开头也写了）：
 
@@ -729,16 +739,19 @@ Ctrl-C 结束的是**前台进程和它的所有子孙**：shell 用 `fork` 启�
 - **加锁顺序**（只按这个方向嵌套，就不会死锁）：
 
   ```
-  wait_lock → Process.lock → page.lock、file.lock、uart.tx_lock
-  timer.lock、Pipe.lock、uart.rx_lock、virtio_disk.lock、bio.lock、Sleeplock.lk → Process.lock
+  wait_lock → Process.lock → page.Pool.lock、File.lock、uart.tx_lock
+  bio.evict_lock → bio 的桶的锁
+  timer.lock、Pipe.lock、uart.rx_lock、virtio_disk.lock、bio.evict_lock、Volume.snap_lock、Sleeplock.lk → Process.lock
   ```
 
-  另外有**睡眠锁**（[disk.md](disk.md#睡眠锁sleeplockzig)：文件系统的 `fsys.lock` 和缓冲区缓存的每一块）：拿着它可以睡觉，所以拿它之前不能拿着任何自旋锁；拿着它可以再去拿自旋锁（读写磁盘时拿 `virtio_disk.lock`）。回到 U 模式时也不能拿着睡眠锁（`proc.assertNoLocksHeld`）。睡眠锁之间的顺序是 `fsys.lock` → 缓冲区的睡眠锁（[fs.md](fs.md#接进内核fsyszig)）。文件系统会同时拿着好几个缓冲区，但同一时刻只有一个进程在用文件系统，别的拿缓冲区的只有 `readblock`、`writeblock`（一次一个，原始区域的块和文件系统的不重叠），所以不会互相等。
+  另外有**睡眠锁**（[disk.md](disk.md#睡眠锁sleeplockzig)：打开的文件的 `File.pos_lock`、文件系统的写锁 `fsys.write_lock`、缓冲区缓存的每一块）：拿着它可以睡觉，所以拿它之前不能拿着任何自旋锁；拿着它可以再去拿自旋锁（读写磁盘时拿 `virtio_disk.lock`）。回到 U 模式时也不能拿着睡眠锁（`proc.assertNoLocksHeld`）。睡眠锁之间的顺序是 `File.pos_lock` → `fsys.write_lock` → 缓冲区的睡眠锁（[fs.md](fs.md#接进内核fsyszig)）。同时拿着好几个缓冲区的只有修改文件系统的一方（一次一个，`write_lock`）；文件系统的读者、`readblock`、`writeblock` 一次只拿一个，拿着的时候不等别的缓冲区，所以不会互相等（[disk.md](disk.md#找缓冲区get)）。
+
+  文件系统的读者拿着的**快照**不是锁，但修改的一方可能睡着等旧树的读者读完（[btree.md](btree.md#快照读者)），所以它也算在顺序里：`File.pos_lock` → 快照，拿着快照时不去等 `pos_lock`、`write_lock`。
 
   - `wait_lock` 在进程锁前面：`fork`、`finish`、`wait`、`interruptForeground`、`info` 都是先拿 `wait_lock` 再拿进程锁。
   - 等待条件的锁在进程锁前面：`sleep` 拿着 `lock` 去拿进程锁；改条件的一方拿着 `lock` 调用 `wakeup`、`isKilled`，它们拿进程锁。`wait_lock` 也是这种用法。
-  - 页分配器、文件表、串口输出的锁是“叶子”：拿着它们时不再拿别的锁。`fork` 拿着 `wait_lock` 和子进程的锁时调用 `file.dup`（拿 `file.lock`），`reap` 拿着锁释放页（拿 `page.lock`），各处拿着锁打印（拿 `uart.tx_lock`）。
-  - 同一层的锁不嵌套：`file.close` 先放开 `file.lock` 再去关管道（拿 `Pipe.lock`）；一次只拿一个进程的锁（`sleep` 里交接时拿着自己的进程锁和 `lock`，两者不同层）。
+  - 页分配器、`File`、串口输出的锁是“叶子”：拿着它们时不再拿别的锁。`fork` 拿着 `wait_lock` 和子进程的锁时调用 `file.dup`（拿 `File.lock`），`reap` 拿着锁释放页（拿当前 hart 的 `Pool.lock`），各处拿着锁打印（拿 `uart.tx_lock`）。
+  - 同一层的锁不嵌套：`file.close` 先放开 `File.lock` 再去关管道（拿 `Pipe.lock`）；一次只拿一个进程的锁（`sleep` 里交接时拿着自己的进程锁和 `lock`，两者不同层）；页分配器从别的 hart 拿页（`steal`）时先放开别人的链表的锁再拿自己的；`file.alloc` 一个槽位一个槽位地拿锁；缓冲区缓存的两把桶的锁只有拿着 `evict_lock` 时才同时拿。
 - 同一个 hart 重复拿同一把锁直接 panic（`holding()` 比较锁里记的 hart 编号和 `hart.id()`）。
 - 等锁时每转一圈看一眼是不是有别的 hart 在 panic（`hart.checkPanic`）：锁可能在已经停下的 hart 手里，永远等不到。
 

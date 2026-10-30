@@ -1,14 +1,21 @@
 //! 缓冲区缓存（buffer cache），照 xv6 的 bio.c 写：在内存里缓存磁盘上最近用过的块，
 //! 同一个块读第二次不用再等磁盘；同时保证同一个块在内存里只有一份，几个进程要改它时排队（睡眠锁）。
 //!
-//! - nbuf 个缓冲区，每个装一个 4 KiB 的块（abi.block_size，正好一页），按最近使用的顺序串成链表（LRU）。
-//!   要一个不在缓存里的块时，从最久没用的一端找一个没人在用的（refcnt 为 0）换掉。
+//! - nbuf 个缓冲区，每个装一个 4 KiB 的块（abi.block_size，正好一页）。
+//!   照 xv6 lock lab 的做法按块号散列成 nbucket 个桶，每个桶一把锁：找已经缓存着的块只拿它那个桶的锁，
+//!   读写不同块的进程不用排队。要一个不在缓存里的块时（换块），从所有桶里找最久没用（stamp 最小）、
+//!   没人在用（refcnt 为 0）的缓冲区换掉，挪进新块的桶。
 //! - read 返回拿着睡眠锁的缓冲区，内容就是磁盘上的；改完调用 write 写回磁盘（同步：写完才返回）；
 //!   用完调用 release。拿着缓冲区的期间，别的进程要同一个块会睡着等。
 //! - 磁盘读写交给 Device（内核里是 virtio_disk，单元测试里是一块内存）。
 //!
-//! 锁：lock（自旋锁）保护链表、每个缓冲区的 refcnt 和 blockno；每个缓冲区的睡眠锁保护 valid 和 data。
-//! 拿到睡眠锁之后才读写磁盘，读写时睡着等，不占 CPU。
+//! 锁：
+//! - 每个桶的 lock（自旋锁）保护桶里的链表，和桶里每个缓冲区的 refcnt、blockno、stamp。
+//! - evict_lock（自旋锁）让换块一个一个来：拿着它的才能把缓冲区从一个桶挪到另一个桶，
+//!   所以同一个块不会被两个进程同时换进来、在缓存里有两份。拿着它可以再拿桶的锁（evict_lock → 桶），
+//!   找换掉哪个时会同时拿着两个桶的锁，但只有拿着 evict_lock 的才这样做，不会互相等。
+//!   所有缓冲区都有人在用时，拿着它睡下，等 release 叫醒。
+//! - 每个缓冲区的睡眠锁保护 valid 和 data。拿到睡眠锁之后才读写磁盘，读写时睡着等，不占 CPU。
 
 const std = @import("std");
 const abi = @import("abi.zig");
@@ -19,6 +26,10 @@ const Sleeplock = @import("sleeplock.zig").Sleeplock;
 pub const block_size = abi.block_size;
 /// 缓冲区的个数
 pub const nbuf = 32;
+/// 桶的个数。取质数，块号连续的块散到不同的桶里
+const nbucket = 13;
+/// 还没装过块的缓冲区的 blockno（check 不让任何块号等于它）
+const no_block = std.math.maxInt(u64);
 
 /// 磁盘：有多少块，怎么读写一块（同步，做完才返回，可以睡）。
 pub const Device = struct {
@@ -29,23 +40,42 @@ pub const Device = struct {
 pub const Buf = struct {
     /// 保护 valid 和 data，拿着它才能读写磁盘
     lock: Sleeplock = .init("buf"),
-    /// lock（bio.lock）。有几个人拿着（或者在等）这个缓冲区；为 0 时可以换成别的块
+    /// 所在的桶的锁。有几个人拿着（或者在等）这个缓冲区；为 0 时可以换成别的块
     refcnt: u32 = 0,
-    /// bio.lock。装的是哪个块
-    blockno: u64 = 0,
+    /// 所在的桶的锁。装的是哪个块，决定了在哪个桶里
+    blockno: u64 = no_block,
+    /// 所在的桶的锁。最后一次放开（refcnt 变成 0）的时刻，换块时换掉最小的（最久没用）
+    stamp: u64 = 0,
     /// data 是不是这个块在磁盘上的内容（换成别的块之后为 false，第一次 read 时才去读）
     valid: bool = false,
-    /// LRU 链表的节点，表头是最近用过的
+    /// 桶里链表的节点
     node: std.DoublyLinkedList.Node = .{},
     data: *align(4096) [block_size]u8,
 };
 
-var lock: Spinlock = .init("bcache");
+const Bucket = struct {
+    lock: Spinlock = .init("bcache bucket"),
+    list: std.DoublyLinkedList = .{},
+
+    /// 桶里装着块 blockno 的缓冲区。调用方拿着 lock。
+    fn find(bk: *Bucket, blockno: u64) ?*Buf {
+        var it = bk.list.first;
+        while (it) |n| : (it = n.next) {
+            const b: *Buf = @fieldParentPtr("node", n);
+            if (b.blockno == blockno) return b;
+        }
+        return null;
+    }
+};
+
+var buckets: [nbucket]Bucket = @splat(.{});
+var evict_lock: Spinlock = .init("bcache evict");
 var bufs: [nbuf]Buf = undefined;
 var datas: [nbuf][block_size]u8 align(4096) = undefined;
-var lru: std.DoublyLinkedList = .{};
-/// 在等空闲缓冲区的进程个数（release 时有人等才 wakeup）
-var waiting: usize = 0;
+/// LRU 的时钟：每次有缓冲区变成没人用时加 1，记进它的 stamp
+var clock: std.atomic.Value(u64) = .init(0);
+/// 正在换块的进程个数（拿着 evict_lock 时加减）。release 看到它不为 0 才去拿 evict_lock 叫醒等着的进程
+var evicting: std.atomic.Value(usize) = .init(0);
 var device: ?Device = null;
 
 pub const Error = error{ NoDevice, OutOfRange };
@@ -53,10 +83,10 @@ pub const Error = error{ NoDevice, OutOfRange };
 /// 清空缓存，换上磁盘 dev（null 表示没有磁盘）。kmain 调用一次；单元测试每次换一块内存当磁盘。
 pub fn init(dev: ?Device) void {
     device = dev;
-    lru = .{};
+    for (&buckets) |*bk| bk.list = .{};
     for (&bufs, &datas) |*b, *d| {
         b.* = .{ .data = d };
-        lru.append(&b.node);
+        buckets[0].list.append(&b.node); // 还没装块的都放在第 0 个桶里，反正谁也找不到它们
     }
 }
 
@@ -71,41 +101,87 @@ fn check(blockno: u64) Error!Device {
     return dev;
 }
 
+fn bucketOf(blockno: u64) *Bucket {
+    return &buckets[blockno % nbucket];
+}
+
 /// 块 blockno 的缓冲区，拿着睡眠锁返回，不读磁盘：valid 为 false 时内容是别的块留下的。
 /// 要整块覆盖的调用方用它，省掉一次读；覆盖完把 valid 设成 true，再 write。
 /// 所有缓冲区都有人在用时睡着等。只能由进程调用。
 pub fn get(blockno: u64) Error!*Buf {
     _ = try check(blockno);
-    lock.acquire();
-    const b = while (true) {
-        if (find(blockno)) |b| break b;
-        waiting += 1;
-        proc.sleep(&lru, &lock);
-        waiting -= 1;
-    };
-    b.refcnt += 1;
-    lock.release();
+    const bk = bucketOf(blockno);
+    bk.lock.acquire();
+    if (bk.find(blockno)) |b| {
+        b.refcnt += 1;
+        bk.lock.release();
+        b.lock.acquire();
+        return b;
+    }
+    bk.lock.release();
+    const b = evict(bk, blockno);
     b.lock.acquire();
     return b;
 }
 
-/// 已经缓存着的块，或者换掉一个最久没用、没人在用的缓冲区；都没有返回 null。调用方拿着 lock。
-fn find(blockno: u64) ?*Buf {
-    var it = lru.first;
-    while (it) |n| : (it = n.next) {
-        const b: *Buf = @fieldParentPtr("node", n);
-        if (b.blockno == blockno and (b.refcnt > 0 or b.valid)) return b;
-    }
-    it = lru.last;
-    while (it) |n| : (it = n.prev) {
-        const b: *Buf = @fieldParentPtr("node", n);
-        if (b.refcnt == 0) {
-            b.blockno = blockno;
-            b.valid = false;
+/// 块 blockno 不在缓存里：换掉一个最久没用的缓冲区，挪进桶 bk，refcnt 为 1。
+fn evict(bk: *Bucket, blockno: u64) *Buf {
+    evict_lock.acquire();
+    defer evict_lock.release();
+    // 先登记再找：release 在找完之后才把某个缓冲区放成没人用的话，一定看得到 evicting 不为 0，会来叫醒
+    _ = evicting.fetchAdd(1, .seq_cst);
+    defer _ = evicting.fetchSub(1, .seq_cst);
+    while (true) {
+        // 放开桶的锁到拿到 evict_lock 之间，别人可能已经把这个块换进来了。
+        // 换进来都要拿着 evict_lock，所以现在查一次就够了：之后没人能再换进它
+        bk.lock.acquire();
+        if (bk.find(blockno)) |b| {
+            b.refcnt += 1;
+            bk.lock.release();
             return b;
         }
+        bk.lock.release();
+        if (takeOldest()) |b| {
+            b.blockno = blockno;
+            b.valid = false;
+            b.refcnt = 1;
+            bk.lock.acquire();
+            bk.list.prepend(&b.node);
+            bk.lock.release();
+            return b;
+        }
+        proc.sleep(&evicting, &evict_lock);
     }
-    return null;
+}
+
+/// 从所有桶里找 refcnt 为 0、stamp 最小的缓冲区，从它的桶里摘下来返回（不在任何桶里，别人找不到它）；
+/// 都有人在用返回 null。调用方拿着 evict_lock。一直拿着目前最好的候选所在的桶的锁，
+/// 这样它的 refcnt 不会在找完之前被别人加上去。
+fn takeOldest() ?*Buf {
+    var best: ?*Buf = null;
+    var best_bk: ?*Bucket = null;
+    for (&buckets) |*bk| {
+        bk.lock.acquire();
+        var found = false;
+        var it = bk.list.first;
+        while (it) |n| : (it = n.next) {
+            const b: *Buf = @fieldParentPtr("node", n);
+            if (b.refcnt == 0 and (best == null or b.stamp < best.?.stamp)) {
+                best = b;
+                found = true;
+            }
+        }
+        if (found) {
+            if (best_bk) |old| old.lock.release();
+            best_bk = bk;
+        } else {
+            bk.lock.release();
+        }
+    }
+    const b = best orelse return null;
+    best_bk.?.list.remove(&b.node);
+    best_bk.?.lock.release();
+    return b;
 }
 
 /// 块 blockno 的缓冲区，拿着睡眠锁返回，内容是磁盘上的（不在缓存里就读进来）。
@@ -128,12 +204,16 @@ pub fn load(b: *Buf) bool {
 
 /// 没人在用的缓冲区都作废（valid = false），之后读它们都重新读盘。scrub 用：要核对的是磁盘上的内容，
 /// 不是缓存里的（校验和只在读盘时核对）。写都是同步的，缓存里没有还没写下去的内容，作废不会丢东西；
-/// refcnt 为 0 说明没人拿着、也没人在等它的睡眠锁，所以拿着 lock 就能改 valid。
+/// refcnt 为 0 说明没人拿着、也没人在等它的睡眠锁，所以拿着桶的锁就能改 valid。
 pub fn invalidate() void {
-    lock.acquire();
-    defer lock.release();
-    for (&bufs) |*b| {
-        if (b.refcnt == 0) b.valid = false;
+    for (&buckets) |*bk| {
+        bk.lock.acquire();
+        defer bk.lock.release();
+        var it = bk.list.first;
+        while (it) |n| : (it = n.next) {
+            const b: *Buf = @fieldParentPtr("node", n);
+            if (b.refcnt == 0) b.valid = false;
+        }
     }
 }
 
@@ -143,16 +223,20 @@ pub fn write(b: *Buf) void {
     device.?.transfer(b.blockno, b.data, true);
 }
 
-/// 用完了：放开睡眠锁。没人用了就挪到 LRU 链表的表头（最近用过），叫醒在等空闲缓冲区的进程。
+/// 用完了：放开睡眠锁。没人用了就记下现在的时刻（LRU），有进程在等空闲缓冲区的话叫醒它。
 pub fn release(b: *Buf) void {
     b.lock.release();
-    lock.acquire();
-    defer lock.release();
+    // 拿着睡眠锁时别人换不掉它（refcnt > 0），blockno 不会变，所以桶也不会变
+    const bk = bucketOf(b.blockno);
+    bk.lock.acquire();
     b.refcnt -= 1;
-    if (b.refcnt == 0) {
-        lru.remove(&b.node);
-        lru.prepend(&b.node);
-        if (waiting > 0) proc.wakeup(&lru);
+    const idle = b.refcnt == 0;
+    if (idle) b.stamp = clock.fetchAdd(1, .monotonic) + 1;
+    bk.lock.release();
+    if (idle and evicting.load(.seq_cst) > 0) {
+        evict_lock.acquire();
+        proc.wakeup(&evicting);
+        evict_lock.release();
     }
 }
 
