@@ -126,6 +126,17 @@ pub fn load(b: *Buf) bool {
     return true;
 }
 
+/// 没人在用的缓冲区都作废（valid = false），之后读它们都重新读盘。scrub 用：要核对的是磁盘上的内容，
+/// 不是缓存里的（校验和只在读盘时核对）。写都是同步的，缓存里没有还没写下去的内容，作废不会丢东西；
+/// refcnt 为 0 说明没人拿着、也没人在等它的睡眠锁，所以拿着 lock 就能改 valid。
+pub fn invalidate() void {
+    lock.acquire();
+    defer lock.release();
+    for (&bufs) |*b| {
+        if (b.refcnt == 0) b.valid = false;
+    }
+}
+
 /// 把缓冲区写回磁盘，写完才返回。调用方拿着它的睡眠锁。
 pub fn write(b: *Buf) void {
     std.debug.assert(b.lock.holding() and b.valid);
@@ -190,6 +201,25 @@ test "缓存命中不读磁盘；超出 nbuf 时换掉最久没用的块" {
     try expectEqual(nbuf + 1, test_reads);
     release(try read(10));
     try expectEqual(nbuf + 2, test_reads);
+}
+
+test "invalidate 之后重新读盘，拿着的缓冲区不受影响" {
+    const expectEqual = std.testing.expectEqual;
+    testInit();
+    release(try read(3));
+    const held = try read(4);
+    try expectEqual(2, test_reads);
+    test_disk[3][0] = 0xee; // 磁盘上变了，缓存里还是旧的
+    var b = try read(3);
+    try expectEqual(3, b.data[0]);
+    release(b);
+    invalidate();
+    try std.testing.expect(held.valid); // 有人拿着的不作废
+    b = try read(3);
+    try expectEqual(0xee, b.data[0]);
+    release(b);
+    try expectEqual(3, test_reads);
+    release(held);
 }
 
 test "write 写回磁盘；get 不读磁盘；拿着的缓冲区不会被换掉；超出范围、没有磁盘" {

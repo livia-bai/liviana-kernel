@@ -2,6 +2,13 @@
 
 每次改了内核（`src/`、`user/`、`build.zig`、链接脚本），在最上面加几行：新增了什么功能，修了什么 bug。最新的在前面。
 
+## 2026-10-30 scrub：检查整个文件系统
+
+- 新增：系统调用 `scrub`（30）和用户程序 `scrub`：作废缓冲区缓存，再把整个文件系统核对一遍（B 树、每个数据块的校验和都重新从磁盘读），只读不改；都对就返回统计（`abi.ScrubInfo`），坏了返回 `-EIO`。
+- 改动：`Fs.check` 除了 B 树，还核对条目之间的关系：每个条目都有 inode，目录项指向的 inode 存在、种类和 `parent` 对得上，内容条目在文件长度之内、内联的只在第 0 页，所有目录连得到根目录，每个 inode（除了根目录）正好一个名字；并且读一遍每个数据块核对校验和。返回文件数、目录数、数据块数。
+- 新增：`bio.invalidate`，作废没人在用的缓冲区。
+- 新增：`t_fs scrubfile`；QEMU 测试用例 `fs` 在镜像里改坏一个数据块，再启动一次，`scrub` 要发现它。
+
 ## 2026-10-30 内核栈底的金丝雀
 
 - 新增：`src/canary.zig`。每块进程内核栈和每个 hart 的启动栈最底下 256 字节写着固定的图案：进程的在分配槽位时写，启动栈在 `kmain`、`kmainSecondary` 一开始写。切回调度器、回到 U 模式之前检查当前进程的，调度器每一轮检查自己 hart 的启动栈，图案被改了就 panic（`kernel stack overflow: pid N (name)`、`kernel stack overflow: boot stack of hart N`）。以前内核栈溢出不会被发现，会悄悄改坏相邻进程的 `TrapFrame`。

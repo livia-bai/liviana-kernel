@@ -1,6 +1,6 @@
 # 用户程序
 
-涉及文件：`user/start.zig`、`user/sys.zig`、`user/linker.ld`、`user/init.zig`、`user/sh.zig`、`user/hello.zig`、`user/fault.zig`、`user/spin.zig`、`user/ticker.zig`、`user/echo.zig`、`user/cat.zig`、`user/wc.zig`、`user/ls.zig`、`user/mkdir.zig`、`user/rm.zig`
+涉及文件：`user/start.zig`、`user/sys.zig`、`user/linker.ld`、`user/init.zig`、`user/sh.zig`、`user/hello.zig`、`user/fault.zig`、`user/spin.zig`、`user/ticker.zig`、`user/echo.zig`、`user/cat.zig`、`user/wc.zig`、`user/ls.zig`、`user/mkdir.zig`、`user/rm.zig`、`user/scrub.zig`
 
 用户程序运行在 U 模式，只能访问自己地址空间里的页，要输出文字、读键盘、用管道、创建进程、退出都要通过系统调用（[syscalls.md](syscalls.md)）。它们在构建时编译成独立的 ELF，由 `mkfs` 装进磁盘镜像的 `/bin`；只有 `init` 嵌在内核里（[build.md](build.md#用户程序)、[process.md](process.md#程序从哪来)）。内核启动时只加载 `init`，其他程序都是由已有的进程 `fork` 再 `exec` 出来的（[process.md](process.md#创建进程)）：init 启动 shell（`sh`），shell 的 `run` 命令再启动别的程序。
 
@@ -276,6 +276,17 @@ dir         0 e
 ```
 
 （Debug 构建，`/bin` 只摘了两行。）
+
+### scrub
+
+`scrub`（`user/scrub.zig`）调用 `scrub` 系统调用检查整个文件系统，打印统计；坏了打印 `scrub: the file system is damaged: IoError`，以 1 结束（[fs.md](fs.md#检查整个文件系统checkscrub)）：
+
+```
+> run scrub
+scrub: ok: 33 files, 2 dirs, 197 data blocks verified
+scrub: tree of 8 nodes, 267 items, height 2; 6961 of 7168 blocks free, generation 723
+[proc] pid 4 (scrub) exited with code 0
+```
 
 ## 写一个新程序
 

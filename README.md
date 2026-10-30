@@ -14,7 +14,7 @@
 - 写时复制的 `fork`：父子进程共用物理页（页分配器记引用数），谁先写哪一页谁在缺页异常里复制一份
 - 磁盘：virtio 块设备驱动（DMA + 中断，等磁盘时进程睡着），睡眠锁，照 xv6 的缓冲区缓存（LRU）
 - 文件系统，类似 btrfs：所有东西（inode、目录项、文件内容）都是一棵写时复制 B 树里的条目，每个操作一个事务，掉电后总是某个操作做完的样子；小文件内联在树里，数据块带校验和；构建时由主机上的 `mkfs` 生成磁盘镜像，用户程序装在 `/bin`
-- 29 个系统调用：文件描述符（`read`/`write`/`close`/`dup`）和管道（`pipe`），文件系统（`open`/`mkdir`/`unlink`/`chdir`/`fstat`/`readdir`），命令行参数（`exec` 带 `argv`），堆（`sbrk`），读写磁盘的原始区域（`readblock`/`writeblock`）
+- 30 个系统调用：文件描述符（`read`/`write`/`close`/`dup`）和管道（`pipe`），文件系统（`open`/`mkdir`/`unlink`/`chdir`/`fstat`/`readdir`，检查整个文件系统的 `scrub`），命令行参数（`exec` 带 `argv`），堆（`sbrk`），读写磁盘的原始区域（`readblock`/`writeblock`）
 - 用户态的 init 和 shell：init 启动 shell，shell 用 `fork` + `exec` 运行程序，可以带参数、在后台运行、用 `|` 接成管道、用 `<`、`>` 重定向到文件，`cd` 换当前目录
 - 照 xv6 加锁：每个进程一把锁、`wait_lock`、tickslock，页分配器、文件表、管道、串口的输入和输出、磁盘队列、缓冲区缓存都有自旋锁，缓冲区和文件系统还有睡眠锁
 
@@ -32,7 +32,7 @@ SBI: OpenSBI, spec v1.0 | hart 0 | device tree at 0x87e00000
 [ok] file system: 6840 of 7168 blocks free, generation 27
 Type 'help' for commands.
 > run
-programs: cat echo fault hello init ls mkdir rm sh spin ticker wc
+programs: cat echo fault hello init ls mkdir rm scrub sh spin ticker wc
 > run hello
 Hello from U-mode! I am pid 3, the kernel has been up for 280 ms.
 write() refused a kernel pointer: BadAddress
@@ -108,7 +108,7 @@ shell 是用户程序（`user/sh.zig`），由 init 启动。
 | `mem` | 物理页的使用情况 |
 | `disk` | 磁盘的原始区域（文件系统之后的块）有多大 |
 | `cd [DIR]` | 换当前目录，不给时回到 `/` |
-| `run NAME [ARGS...]` | 用 `fork` + `exec` 运行用户程序 `NAME`（`hello`、`fault`、`spin`、`ticker`、`echo`、`cat`、`wc`、`ls`、`mkdir`、`rm`），带上参数，等它结束，Ctrl-C 结束它；不带参数时列出所有程序 |
+| `run NAME [ARGS...]` | 用 `fork` + `exec` 运行用户程序 `NAME`（`hello`、`fault`、`spin`、`ticker`、`echo`、`cat`、`wc`、`ls`、`mkdir`、`rm`、`scrub`），带上参数，等它结束，Ctrl-C 结束它；不带参数时列出所有程序 |
 | `run A \| B \| ...` | 管道：A 的输出接到 B 的输入，最多 4 个程序；Ctrl-C 结束整条管道 |
 | `run ... > F`、`run ... < F` | 标准输出写进文件 `F`（没有就建，有就清空）、标准输入从 `F` 读 |
 | `run ... &` | 在后台运行，马上回到提示符 |

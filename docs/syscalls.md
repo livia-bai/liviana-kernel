@@ -27,6 +27,7 @@ pub const Syscall = enum(usize) {
     close = 17, dup = 18, pipe = 19, sbrk = 20,
     blockcount = 21, readblock = 22, writeblock = 23,
     open = 24, mkdir = 25, unlink = 26, chdir = 27, fstat = 28, readdir = 29,
+    scrub = 30,
     _,
 };
 
@@ -124,6 +125,7 @@ pub fn errnoOf(ret: usize) ?Errno      // 返回值在 [-4095, -1] 内时取出�
 | 27 | `chdir` | 同上 | 0；`-ENOENT`、`-ENOTDIR` 等 | 换当前目录（`Process.cwd`，`fork` 继承） |
 | 28 | `fstat` | `a0` = fd，`a1` = `Stat` 的地址 | 0；`-EBADF`、`-EFAULT`、`-ENOENT` | inode 号、长度、种类。串口、管道的 inode 号和长度是 0 |
 | 29 | `readdir` | `a0` = fd，`a1` = `Dirent` 的地址 | 1；列完了是 0；`-EBADF`、`-ENOTDIR`、`-EFAULT` | 目录的下一项（不含 `.`、`..`），按名字的散列排序。读写位置就是 `fs.readdir` 的 cookie，结果写进用户内存成功了才往后挪 |
+| 30 | `scrub` | `a0` = `ScrubInfo` 的地址 | 0；`-EIO`（文件系统坏了）、`-ENODEV`、`-EFAULT` | 检查整个文件系统：作废缓冲区缓存，B 树、每个数据块的校验和、条目之间的关系都核对一遍，只读不改（[fs.md](fs.md#检查整个文件系统checkscrub)）。统计（文件数、目录数、数据块数、B 树的节点数、条目数、层数、空闲块数、总块数、事务号）写进 `a0` 指向的地方 |
 | 其他 | | | `-ENOSYS` | |
 
 ### 分发
@@ -289,6 +291,7 @@ pub fn unlink(path: []const u8) FsError!void
 pub fn chdir(path: []const u8) FsError!void
 pub fn fstat(fd: Fd) FsError!abi.Stat
 pub fn readdir(fd: Fd, ent: *abi.Dirent) FsError!bool        // 列完了是 false
+pub fn scrub() FsError!abi.ScrubInfo                         // 坏了是 IoError
 // FsError = error{ NotFound, Exists, NotDir, IsDir, NotEmpty, NameTooLong, InvalidArgument, NoSpace,
 //                  FileTooBig, IoError, NoDevice, BadAddress, BadFd, TooManyOpenFiles, SystemFdQuotaExceeded, Unexpected }
 pub fn close(fd: Fd) error{ BadFd, Unexpected }!void

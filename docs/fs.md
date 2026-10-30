@@ -103,11 +103,50 @@ pub fn errno(err: anyerror) abi.Errno // 文件系统的错误 → 系统调用�
 | `fstat(fd)` | inode 号、长度、种类；串口和管道也能查（种类是 `console`、`pipe`） |
 | `readdir(fd)` | 目录的下一项：`File.off` 就是 `fs.readdir` 的 cookie，结果写进用户内存成功了才往后挪 |
 | `read`、`write` | 从 `off` 开始读写；读写目录是 `EISDIR` |
+| `scrub` | 先作废缓存，再 `check` 整个文件系统（[检查](#检查整个文件系统checkscrub)） |
 | `exec` | 在 `/bin`（或给的路径）里找程序，拿着 `fsys.lock` 把 ELF 直接读进新的用户页（[process.md](process.md#程序从哪来)） |
 
 路径先复制进内核栈上的缓冲区（最长 `abi.max_path` = 256 字节，长了是 `ENAMETOOLONG`）。错误码：`NotFound` → `ENOENT`，`Exists` → `EEXIST`，`NotDir` → `ENOTDIR`，`IsDir` → `EISDIR`，`NotEmpty` → `ENOTEMPTY`，`NameTooLong` → `ENAMETOOLONG`，`InvalidName` → `EINVAL`，`NoSpace` → `ENOSPC`，`FileTooBig` → `EFBIG`，`BadAddress` → `EFAULT`，`Corrupt` 等磁盘上的东西不对 → `EIO`。
 
 **内核栈**：系统调用在 16 KiB 的进程内核栈上运行，B 树的操作走得很深。开发时内核栈被撑爆过一次（Debug 模式用到 54 KiB）：`std.bit_set` 的 `isSet`、`count` 按值接收整个位图，每调用一次在栈上复制 8 KiB；`x.* = y.*` 复制 4 KiB 的块也会先放在栈上。改成自己写的 `Bitmap`（方法接收指针）和 `@memcpy` 之后，实测跑完全部 QEMU 测试（包括 `t_fs`、掉电后重新启动、从文件系统 `exec`），最深 Debug 9944 字节、safe 5840 字节、small 5096 字节（测法见 [process.md](process.md#进程表)）。
+
+## 检查整个文件系统（`check`、`scrub`）
+
+`Fs.check` 把整个文件系统核对一遍，只读不改，哪里不对就是 `Corrupt`。单元测试几乎每一步之后都调用它（包括掉电测试的每一次重新挂载），`mkfs` 写完镜像调用一次，运行中由 `scrub` 系统调用调用（用户程序 `scrub`，[user-programs.md](user-programs.md#scrub)）。核对的东西：
+
+- **B 树**：`Volume.check`，每个节点的校验和、块号、事务号、层数，键的顺序和上下界，空闲空间的位图正好是没被树（和等着释放的）用着的块（[btree.md](btree.md#检查check)）。
+- **每个数据块**：按内容条目读一遍（`readData`），核对条目里记的 crc32c。
+- **条目之间**：按键的顺序扫一遍所有条目（同一个 inode 的条目挨在一起，inode 条目在最前面），一边扫一边核对：
+  - 每个条目前面都有它的 inode 条目，inode 号小于 `next_ino`；inode 的种类是文件或目录。
+  - 目录项只出现在目录里：名字合法（`checkName`）、长度和头里的 `name_len` 一样、键里的散列就是名字的散列；指向的 inode 存在、种类和目录项里记的一样、`parent` 就是这个目录；不能指向根目录。
+  - 内容条目只出现在文件里，偏移是 4096 的倍数、在文件长度之内；内联的只能是第 0 页、长度正好是文件长度（不超过 512），后面不能再有别的内容条目。
+  - 根目录是目录、`parent` 是自己；别的目录沿着 `parent` 往上走得到根目录（走的步数超过 inode 号的个数就是有环，比如两个目录互为 `parent`、和根目录断开了）。
+  - 除了根目录，每个 inode 正好有一个目录项指着它（没有硬链接）。不用记下每个 inode 号：目录项指向的 inode 号和 inode 条目的 inode 号各算一份“指纹”——个数、和、每个号搅乱（splitmix64）之后的和，都是回绕的加法，和顺序无关——三样都一样才算对上。一个 inode 两个名字、另一个没有名字，这三样同时对上的概率可以忽略。
+
+返回文件数、目录数、核对过的数据块数，以及 B 树的节点数、条目数、层数。
+
+**缓存**：校验和只在从磁盘读进来的时候核对（`bio.load` 返回 true 时），缓存里的块不再算。`scrub` 要核对的是磁盘上的内容，所以先 `bio.invalidate()`，把没人在用的缓冲区都作废（[disk.md](disk.md#写和放开)），之后读到的每一块都是刚从磁盘读的。
+
+**`scrub` 系统调用**（30 号）：拿着 `fsys.lock` 做完，期间别的进程的文件操作都在等，缓存里也不会有做到一半的操作（每个操作在放开锁之前都写完了）。都对的话把 `abi.ScrubInfo`（上面这些数，加上空闲块数、总块数、事务号）写进用户内存；`Corrupt` 返回 `-EIO`。实测刚启动、跑完 `t_fs` 之后：
+
+```
+> run scrub
+scrub: ok: 33 files, 2 dirs, 197 data blocks verified
+scrub: tree of 8 nodes, 267 items, height 2; 6961 of 7168 blocks free, generation 723
+[proc] pid 4 (scrub) exited with code 0
+```
+
+QEMU 测试里在镜像上改坏 `/scrub.dat` 一个数据块的一个字节，再启动：
+
+```
+> run scrub
+scrub: the file system is damaged: IoError
+[proc] pid 3 (scrub) exited with code 1
+```
+
+`cat` 这个文件先输出没坏的第 0 页，读到第 1 页时报 `cat: /scrub.dat: IoError`；`rm` 它不读数据块，能删掉，删掉之后 `scrub` 又通过了。
+
+只能发现问题，不能修：坏了的数据块没有副本可以换（btrfs 的 scrub 用镜像副本修复）。
 
 ## 生成磁盘镜像（`mkfs.zig`）
 
@@ -125,13 +164,14 @@ mkfs <输出文件> <总块数> <文件系统的块数> <文件>...
 - `readdir` 列出 62 个名字一个不少、不重复；散列相同的两个名字都找得到，删掉一个另一个还在。
 - 文件内容：内联的读写、中间补 0；正好 512 字节还是内联，再长一个字节换成数据块、内容不变；跨页的写；洞读出来是 0、不占块；读到末尾之后返回 0；写到一半“用户内存”出错，整个写作废、文件不变；`FileTooBig`；截断之后再写又是内联；删除文件之后空闲块数和创建之前一样。
 - 数据块的校验和：在磁盘上改一个字节，读这一页是 `Corrupt`，别的页照常；重新挂载之后内容还在。
+- `check`：数对文件、目录（含根目录）、数据块（有洞的文件只算有块的页）；在磁盘上改一个数据块、改根节点，缓存里还是好的时 `check` 照样通过，`bio.invalidate` 之后就是 `Corrupt`，改回来又通过。条目之间对不上的 8 种坏法（没有名字的 inode、指向不存在的 inode 的目录项、`parent` 不对、没有 inode 的条目、内容条目超出文件长度、一个 inode 两个名字、两个目录成环、文件里有目录项）在当前事务里直接改 B 树做出来，每一种都是 `Corrupt`，`abort` 之后又通过。验证过它能抓住错误：去掉“每个 inode 正好一个名字”那一项，没有名字的 inode 就查不出来了。
 - **掉电**：一串 25 个随机操作（创建、删除、截断、在随机位置写最多 3 页），每个操作提交一次，完整跑一遍写盘 120 次；对每一个 N，在第 N 次写之后掉电，重新挂载，要求：挂载成功、`check` 通过、所有文件的内容正好是某一个操作做完之后的样子、不早于最后一个做完了的操作。然后接着创建、写一个新文件，再核对一遍旧文件：挂载时漏算了哪个块（当成了空闲块），这里就会被改写。
 
   验证过它能抓住错误：改数据页时直接在旧块上改（不写时复制），掉电测试失败；挂载时不把数据块算作用着的（`dataRefs` 总返回 null），掉电测试失败（这一种是在加了“挂载之后接着写”之后才抓到的）。
 
 ## QEMU 里的测试
 
-`tools/qemu_test.py` 的 `fs` 用例（[testing.md](testing.md)）：shell 里的 `ls`、`cat`、`mkdir`、`rm`、`cd`、`<`、`>`；回归测试 `t_fs` 测系统调用的边界情况和并发；关机之后在同一个镜像上再启动，上一次写的文件还在；然后边写边把 QEMU 杀掉（掉电），再启动一次，`t_fs verify` 检查每个操作要么做完了、要么没做。
+`tools/qemu_test.py` 的 `fs` 用例（[testing.md](testing.md)）：shell 里的 `ls`、`cat`、`mkdir`、`rm`、`cd`、`<`、`>`；回归测试 `t_fs` 测系统调用的边界情况和并发；关机之后在同一个镜像上再启动，上一次写的文件还在；然后边写边把 QEMU 杀掉（掉电），再启动一次，`t_fs verify` 检查每个操作要么做完了、要么没做，`scrub` 通过；最后在镜像里改坏一个数据块，第四次启动，`scrub` 发现它（见上面的[检查](#检查整个文件系统checkscrub)）。
 
 这个用例在开发时抓到过一个 bug：目录项的头里名字长度是 `u8`，`@sizeOf(DirHeader) + head.name_len` 按 `u8` 算，名字长于 239 字节时溢出（Debug、safe 模式下 panic；fast、small 模式下不检查溢出，是未定义行为）。单元测试原来只建了 255 字节的名字，没有再找它、列它，碰不到这段代码，现在补上了。
 

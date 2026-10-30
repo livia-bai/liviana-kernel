@@ -178,7 +178,7 @@ def case_shell(q, c, mode):
     c.contains(q.command("uptime"), r"up \d+\.\d\ds\n", "uptime")
     c.contains(q.command("nope"), r"unknown command: nope", "unknown command")
     # /bin 里的程序按名字排序（测试程序 t_* 也在里面）
-    c.contains(q.command("run"), r"programs: cat echo fault hello init ls mkdir rm sh spin( t_\w+)+ ticker wc\n",
+    c.contains(q.command("run"), r"programs: cat echo fault hello init ls mkdir rm scrub sh spin( t_\w+)+ ticker wc\n",
                "run without a name")
     c.contains(q.command("run nope"), r"no such program: nope\nprograms: ", "run nope")
 
@@ -556,9 +556,37 @@ def reboot(q, c, what, steps):
     c.expect("KERNEL PANIC" not in r.text(), f"{what}: KERNEL PANIC in the serial output")
 
 
+def scrub_ok(c, out, what):
+    """scrub 通过了，返回它数出来的文件数。"""
+    m = c.contains(out, r"scrub: ok: (\d+) files, \d+ dirs, \d+ data blocks verified\n", what)
+    exited(c, out, "scrub", 0)
+    return int(m.group(1)) if m else None
+
+
+def scrub_page(i):
+    """t_fs scrubfile 写的 /scrub.dat 的第 i 页。"""
+    line = f"scrub test page {i}\n".encode()
+    return (line * (BLOCK_SIZE // len(line) + 1))[:BLOCK_SIZE]
+
+
+def corrupt_scrub_file(q, c):
+    """在镜像里找到 /scrub.dat 第 1 页的数据块，改掉一个字节。返回找到了没有。"""
+    with open(q.disk, "r+b") as f:
+        image = bytearray(f.read(FS_BLOCKS * BLOCK_SIZE))
+        target = scrub_page(1)
+        found = [b for b in range(FS_BLOCKS) if image[b * BLOCK_SIZE:(b + 1) * BLOCK_SIZE] == target]
+        c.expect(len(found) == 1, f"/scrub.dat page 1: found in {len(found)} blocks of the disk image, expected 1")
+        if len(found) != 1:
+            return False
+        f.seek(found[0] * BLOCK_SIZE + 100)
+        f.write(bytes([image[found[0] * BLOCK_SIZE + 100] ^ 0x20]))
+    return True
+
+
 def check_fs_reboots(q, c):
     """QEMU 正常关机之后：第二次启动，上一次写的文件还在；然后边写边把 QEMU 杀掉（掉电），
-    第三次启动，文件系统能挂上，t_fs verify 检查每个操作要么做完了、要么没做。"""
+    第三次启动，文件系统能挂上，t_fs verify 检查每个操作要么做完了、要么没做，scrub 通过。
+    关机后在镜像里改坏一个数据块，第四次启动，scrub 发现它，读那个文件出错，删掉之后 scrub 又通过了。"""
     delay = random.uniform(0.2, 1.0)
 
     def second(r):
@@ -574,11 +602,23 @@ def check_fs_reboots(q, c):
         if m:
             c.expect(int(m.group(1)) > 0, f"verify: no records survived {delay:.2f}s of churn")
         check_counts(c, out, "t_fs")
+        scrub_ok(c, r.command("run scrub"), "scrub after power loss")
+        c.contains(r.command("run t_fs scrubfile"), r"scrubfile: written\n", "t_fs scrubfile")
         r.send("shutdown\r")
         c.expect(r.finish(COMMAND_TIMEOUT) == 0, "shutdown after verify")
 
+    def fourth(r):
+        out = r.command("run scrub")
+        c.contains(out, r"scrub: the file system is damaged: IoError\n", "scrub after corrupting a data block")
+        exited(c, out, "scrub", 1)
+        c.contains(r.command("run cat /scrub.dat"), r"cat: /scrub.dat: IoError\n", "cat a corrupted file")
+        exited(c, r.command("run rm /scrub.dat"), "rm", 0)  # 删除不读数据块
+        scrub_ok(c, r.command("run scrub"), "scrub after removing the corrupted file")
+
     reboot(q, c, "boot2", second)
     reboot(q, c, "boot3", third)
+    if corrupt_scrub_file(q, c):
+        reboot(q, c, "boot4", fourth)
 
 
 def case_fs(q, c, mode):
@@ -620,8 +660,9 @@ def case_fs(q, c, mode):
     c.contains(q.command("run /bad"), r"run: cannot load /bad: BadElf\n", "run /bad")
     c.contains(q.command("run /bin"), r"no such program: /bin\n", "run /bin")
     exited(c, q.command("run rm /h /bad"), "rm", 0)
-    # 系统调用的边界情况、并发
+    # 系统调用的边界情况、并发；之后整个文件系统检查一遍
     check_counts(c, q.command("run t_fs"), "t_fs")
+    scrub_ok(c, q.command("run scrub"), "run scrub")
     # 关机之后：重新启动看文件还在，再测掉电
     q.command("run echo persist across reboots > /keep.txt")
     q.after_shutdown.append((c, lambda c: check_fs_reboots(q, c)))
@@ -678,7 +719,7 @@ CASES = {
                          "user/tests/t_disk.zig"]),
     "fs": (case_fs, ["src/sleeplock.zig", "src/bio.zig", "src/virtio_disk.zig", "src/btree.zig", "src/ctree.zig",
                      "src/fs.zig", "src/fsys.zig", "src/mkfs.zig", "user/ls.zig", "user/mkdir.zig", "user/rm.zig",
-                     "user/cat.zig", "user/echo.zig", "user/wc.zig", "user/tests/t_fs.zig"]),
+                     "user/cat.zig", "user/echo.zig", "user/wc.zig", "user/scrub.zig", "user/tests/t_fs.zig"]),
     "smp": (case_smp, ["src/timer.zig", "src/plic.zig", "src/pipe.zig", "user/spin.zig", "user/tests/t_smp.zig"]),
 }
 

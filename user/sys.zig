@@ -193,6 +193,13 @@ pub fn fstat(fd: Fd) FsError!abi.Stat {
     return st;
 }
 
+/// 检查整个文件系统（见 abi.Syscall.scrub）。坏了是 IoError。
+pub fn scrub() FsError!abi.ScrubInfo {
+    var info: abi.ScrubInfo = undefined;
+    _ = try fsResult(syscall(.scrub, @intFromPtr(&info), 0, 0));
+    return info;
+}
+
 /// 目录 fd 的下一个目录项写进 ent，返回 true；列完了返回 false。
 pub fn readdir(fd: Fd, ent: *abi.Dirent) FsError!bool {
     return try fsResult(syscall(.readdir, fd, @intFromPtr(ent), 0)) == 1;

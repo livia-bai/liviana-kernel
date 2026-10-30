@@ -4,6 +4,7 @@
 //! - `run t_fs churn &`：掉电测试的写的一方，一直写到被杀（或者 QEMU 被杀）：往 /churn.dat 末尾追加记录，
 //!   反复截断、重写 /churn/ 下面的几个文件。
 //! - `run t_fs verify`：掉电之后重新启动时运行，检查 churn 写的东西：每个操作要么做完了、要么没做。
+//! - `run t_fs scrubfile`：建 /scrub.dat 给 scrub 的测试用（见 scrubFile）。
 
 const std = @import("std");
 const sys = @import("sys");
@@ -102,6 +103,7 @@ pub fn main() u8 {
     if (sys.arg(1)) |a| {
         if (std.mem.eql(u8, a, "churn")) churn();
         if (std.mem.eql(u8, a, "verify")) return verify();
+        if (std.mem.eql(u8, a, "scrubfile")) return scrubFile();
     }
 
     // 串口、管道的 fstat
@@ -433,6 +435,25 @@ fn churn() noreturn {
             },
         }
     }
+}
+
+/// 建 /scrub.dat：3 页，第 i 页是 "scrub test page i\n" 重复到填满。内容是独一无二的，
+/// qemu_test.py 关机之后能在磁盘镜像里按内容找到第 1 页的数据块，改坏它，再启动看 scrub 能不能发现。
+fn scrubFile() u8 {
+    const fd = mustOpen("/scrub.dat", .{ .write = true, .create = true, .truncate = true });
+    defer sys.close(fd) catch {};
+    const page = big_buf[0..4096];
+    for (0..3) |i| {
+        var line_buf: [32]u8 = undefined;
+        const line = std.fmt.bufPrint(&line_buf, "scrub test page {d}\n", .{i}) catch unreachable;
+        for (page, 0..) |*c, j| c.* = line[j % line.len];
+        if (!writeAll(fd, page)) {
+            sys.print("FAIL: scrubfile: write page {d}\n", .{i});
+            return 1;
+        }
+    }
+    sys.print("scrubfile: written\n", .{});
+    return 0;
 }
 
 fn verify() u8 {

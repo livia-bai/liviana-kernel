@@ -171,7 +171,7 @@ const cmd = std.meta.stringToEnum(Command, name) orelse { ... "unknown command" 
 | `mem` | 物理页的使用情况（`meminfo`，[page-allocator.md](page-allocator.md)） | `31600 of 31676 pages free (126400 KiB), 4 KiB each` |
 | `disk` | 磁盘的原始区域（文件系统之后的块）有多大（`blockcount`，[disk.md](disk.md#系统调用)）；没有磁盘时打印 `no disk` | `1024 blocks of 4 KiB (4 MiB)` |
 | `cd [DIR]` | 换 shell 的当前目录（`chdir`），之后启动的程序继承它；不给 `DIR` 时回到 `/`。出错时打印 `cd: DIR: NotFound`（或 `NotDir`） | |
-| `run` | 列出 `/bin` 里的程序（`readdir`），按名字排序 | `programs: cat echo fault hello init ls mkdir rm sh spin ticker wc` |
+| `run` | 列出 `/bin` 里的程序（`readdir`），按名字排序 | `programs: cat echo fault hello init ls mkdir rm scrub sh spin ticker wc` |
 | `run NAME [ARGS...]` | 在前台运行用户程序 `NAME`（`/bin/NAME`；带 `/` 的按路径找，比如 `run /h`），带上参数，等它结束；Ctrl-C 结束它 | 程序自己的输出 + `[proc] pid 3 (hello) exited with code 0` |
 | `run A \| B \| ...` | 管道（[管道](#管道)） | `run echo one two three \| wc` 打印 `1 3 14` |
 | `run ... > F`、`run ... < F` | 标准输出写进文件 `F`、标准输入从 `F` 读（[重定向](#重定向)） | |

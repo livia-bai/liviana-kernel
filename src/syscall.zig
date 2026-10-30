@@ -53,6 +53,7 @@ pub fn dispatch(frame: *TrapFrame) usize {
         .chdir => pathOp(args[0], args[1], .chdir),
         .fstat => fstat(args[0], args[1]),
         .readdir => readdir(args[0], args[1]),
+        .scrub => scrub(args[0]),
         _ => abi.fail(.nosys),
     };
 }
@@ -300,6 +301,29 @@ fn readdir(fd: usize, ptr: usize) usize {
     vm.copyToUser(space(), ptr, std.mem.asBytes(&ent)) catch return abi.fail(.fault);
     f.off = d.next;
     return 1;
+}
+
+/// 检查整个文件系统（fs.Fs.check）。先作废缓冲区缓存：要核对的是磁盘上的内容，校验和只在读盘时核对。
+/// 拿着 fsys.lock，别的进程的文件操作都在等，缓存里也没有做到一半的操作。
+fn scrub(ptr: usize) usize {
+    vm.checkUser(space(), ptr, @sizeOf(abi.ScrubInfo), true) catch return abi.fail(.fault);
+    const root = fsys.get() catch return abi.fail(.nodev);
+    defer fsys.unlock();
+    bio.invalidate();
+    const st = root.check() catch |err| return abi.fail(fsys.errno(err));
+    const info: abi.ScrubInfo = .{
+        .files = st.files,
+        .dirs = st.dirs,
+        .data_blocks = st.data_blocks,
+        .nodes = st.tree.nodes,
+        .items = st.tree.items,
+        .height = st.tree.height,
+        .free_blocks = root.vol.free_count,
+        .blocks = root.vol.blocks,
+        .generation = root.vol.generation,
+    };
+    vm.copyToUser(space(), ptr, std.mem.asBytes(&info)) catch unreachable; // 上面检查过了
+    return 0;
 }
 
 fn fork() usize {

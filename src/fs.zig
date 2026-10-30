@@ -465,10 +465,128 @@ pub const Fs = struct {
         try fs.putInode(ino, ind);
     }
 
-    /// 检查：B 树（含数据块的引用）和每个 inode 的条目对得上。单元测试、以后的 scrub 用。
-    pub fn check(fs: *Fs) Error!ctree.Volume.Stats {
-        return fs.vol.check();
+    pub const CheckStats = struct {
+        tree: ctree.Volume.Stats,
+        files: u64 = 0,
+        dirs: u64 = 0,
+        /// 读过、校验和对得上的数据块
+        data_blocks: u64 = 0,
+    };
+
+    /// 检查整个文件系统（scrub 系统调用、单元测试）。不对就返回 Corrupt，什么都不改。
+    ///
+    /// - B 树：结构、每个节点的校验和、空闲空间的位图（ctree 的 check）。
+    /// - 每个数据块都读一遍，核对校验和。只有从磁盘读进来的才核对（readData），
+    ///   要核对磁盘上的内容的话，调用方先作废缓存（bio.invalidate）。
+    /// - 条目之间对得上：每个条目前面都有它的 inode；目录项只在目录里，内容条目只在文件里；
+    ///   目录项的名字合法、散列对得上，指向的 inode 存在、种类相同、parent 就是这个目录；
+    ///   内容条目在文件长度之内，内联的只能是第 0 页、长度就是文件长度、后面没有别的内容条目；
+    ///   根目录的 parent 是自己，别的目录沿着 parent 能走到根目录（没有和根目录断开的环）。
+    /// - 除了根目录，每个 inode 正好有一个目录项指着它：目录项的个数、指向的 inode 号之和、
+    ///   之和的散列版本都和 inode 的一样（一个 inode 两个名字、另一个没有名字，这三个同时对上的概率可以忽略）。
+    pub fn check(fs: *Fs) Error!CheckStats {
+        var stats: CheckStats = .{ .tree = try fs.vol.check() };
+        var buf: [btree.max_data]u8 = undefined;
+        var cur: ?Inode = null; // 正在看的 inode（条目按 inode 号排，同一个 inode 的条目挨在一起，inode 条目在最前）
+        var cur_ino: u64 = 0;
+        var cur_inline = false;
+        var names: Tally = .{};
+        var inodes: Tally = .{};
+        var k = Key.init(0, 0, 0);
+        while (try fs.vol.next(k, &buf)) |f| : (k = f.key.successor() orelse break) {
+            const ino = f.key.objectid;
+            const data = buf[0..f.size]; // ctree 的 check 保证了不超过 max_data
+            if (ino >= fs.next_ino) return error.Corrupt;
+            if (f.key.type != type_inode and (cur == null or cur_ino != ino)) return error.Corrupt; // 没有 inode 的条目
+            switch (f.key.type) {
+                type_inode => {
+                    if (f.key.offset != 0 or data.len != @sizeOf(Inode)) return error.Corrupt;
+                    const ind = std.mem.bytesToValue(Inode, data);
+                    switch (ind.kind) {
+                        .file => stats.files += 1,
+                        .dir => {
+                            stats.dirs += 1;
+                            try fs.checkReachesRoot(ino, ind);
+                        },
+                        _ => return error.Corrupt,
+                    }
+                    if (ino == root_ino) {
+                        if (ind.kind != .dir) return error.Corrupt;
+                    } else {
+                        inodes.add(ino);
+                    }
+                    cur = ind;
+                    cur_ino = ino;
+                    cur_inline = false;
+                },
+                type_dir => {
+                    if (cur.?.kind != .dir or data.len < @sizeOf(DirHeader)) return error.Corrupt;
+                    const head = std.mem.bytesToValue(DirHeader, data[0..@sizeOf(DirHeader)]);
+                    const name = data[@sizeOf(DirHeader)..];
+                    if (name.len != head.name_len or f.key.offset >> 32 != nameHash(name)) return error.Corrupt;
+                    checkName(name) catch return error.Corrupt;
+                    if (head.ino == root_ino) return error.Corrupt;
+                    const child = fs.getInode(head.ino) catch |err| return if (err == error.NotFound) error.Corrupt else err;
+                    if (child.kind != head.kind or child.parent != ino) return error.Corrupt;
+                    names.add(head.ino);
+                },
+                type_extent => {
+                    const ind = cur.?;
+                    if (ind.kind != .file or f.key.offset % block_size != 0 or f.key.offset >= ind.size or cur_inline or
+                        data.len < @sizeOf(ExtentHeader)) return error.Corrupt;
+                    const head = std.mem.bytesToValue(ExtentHeader, data[0..@sizeOf(ExtentHeader)]);
+                    switch (head.kind) {
+                        .inline_data => {
+                            if (f.key.offset != 0 or data.len - @sizeOf(ExtentHeader) != ind.size or ind.size > inline_max) return error.Corrupt;
+                            cur_inline = true;
+                        },
+                        .block => {
+                            if (data.len != @sizeOf(BlockExtent)) return error.Corrupt;
+                            const b = try fs.readData(std.mem.bytesToValue(BlockExtent, data));
+                            bio.release(b);
+                            stats.data_blocks += 1;
+                        },
+                        _ => return error.Corrupt,
+                    }
+                },
+                else => return error.Corrupt,
+            }
+        }
+        if (stats.dirs == 0 or !std.meta.eql(names, inodes)) return error.Corrupt;
+        return stats;
     }
+
+    /// 目录 ino（inode 是 ind）沿着 parent 往上走得到根目录。一路上都得是目录；走的步数比 inode 号的个数还多就是有环。
+    fn checkReachesRoot(fs: *Fs, ino: u64, ind: Inode) Error!void {
+        var at = ino;
+        var parent = ind.parent;
+        var steps: u64 = 0;
+        while (at != root_ino) : (steps += 1) {
+            if (steps >= fs.next_ino or parent == at) return error.Corrupt;
+            const p = fs.getInode(parent) catch |err| return if (err == error.NotFound) error.Corrupt else err;
+            if (p.kind != .dir) return error.Corrupt;
+            at = parent;
+            parent = p.parent;
+        }
+        if (parent != root_ino) return error.Corrupt; // 根目录的 parent 是自己
+    }
+
+    /// 一组 inode 号的“指纹”：个数、和、散列之和（都是回绕的加法，和顺序无关）。
+    const Tally = struct {
+        count: u64 = 0,
+        sum: u64 = 0,
+        mixed: u64 = 0,
+
+        fn add(t: *Tally, ino: u64) void {
+            t.count += 1;
+            t.sum +%= ino;
+            // splitmix64 的最后一步：把 ino 的每一位搅到所有位上
+            var z = ino +% 0x9e37_79b9_7f4a_7c15;
+            z = (z ^ (z >> 30)) *% 0xbf58_476d_1ce4_e5b9;
+            z = (z ^ (z >> 27)) *% 0x94d0_49bb_1331_11eb;
+            t.mixed +%= z ^ (z >> 31);
+        }
+    };
 };
 
 // ---- 单元测试：内存当磁盘，可以掉电（和 ctree.zig 的测试一样的办法） ----
@@ -727,6 +845,98 @@ test "数据块的校验和：磁盘上的内容坏了读出来是 Corrupt；重
     fs = try Fs.mount(&test_vol); // 挂载不读数据块
     try std.testing.expectError(error.Corrupt, readAll(&fs, "/big", &buf));
     try std.testing.expectEqual(block_size, try fs.read(f, 0, block_size, SliceOut{ .buf = &buf })); // 第 0 页没坏
+}
+
+test "check：数清文件、目录、数据块；磁盘上的数据块坏了，作废缓存之后才查得出来" {
+    var fs = try testSetup(256);
+    defer testFree();
+    _ = try fs.run(Fs.create, .{ root_ino, "/d", Kind.dir });
+    _ = try fs.run(Fs.create, .{ root_ino, "/d/e", Kind.dir });
+    const small = try fs.run(Fs.create, .{ root_ino, "/d/small", Kind.file });
+    const big = try fs.run(Fs.create, .{ root_ino, "/d/e/big", Kind.file });
+    _ = try fs.run(Fs.create, .{ root_ino, "/empty", Kind.file });
+    try writeAt(&fs, small, 0, "tiny");
+    var data: [3 * block_size]u8 = undefined;
+    for (&data, 0..) |*c, i| c.* = @truncate(i * 7);
+    try writeAt(&fs, big, 0, &data);
+    try writeAt(&fs, big, 10 * block_size, "after a hole"); // 中间是洞
+    const st = try fs.check();
+    try std.testing.expectEqual(3, st.files);
+    try std.testing.expectEqual(3, st.dirs); // 根目录、d、e
+    try std.testing.expectEqual(4, st.data_blocks);
+
+    var e: BlockExtent = undefined;
+    _ = try fs.vol.lookup(Fs.extentKey(big, 2), std.mem.asBytes(&e));
+    test_disk[e.blockno][100] ^= 0x40;
+    _ = try fs.check(); // 缓存里还是好的
+    bio.invalidate();
+    try std.testing.expectError(error.Corrupt, fs.check());
+    test_disk[e.blockno][100] ^= 0x40;
+    bio.invalidate();
+    _ = try fs.check();
+
+    // 树的节点坏了也查得出来（根节点）
+    test_disk[fs.vol.root.blockno][200] ^= 1;
+    bio.invalidate();
+    try std.testing.expectError(error.Corrupt, fs.check());
+    test_disk[fs.vol.root.blockno][200] ^= 1;
+    bio.invalidate();
+    _ = try fs.check();
+}
+
+test "check：条目之间对不上的都是 Corrupt" {
+    var fs = try testSetup(256);
+    defer testFree();
+    const d = try fs.run(Fs.create, .{ root_ino, "/d", Kind.dir });
+    const f = try fs.run(Fs.create, .{ root_ino, "/d/f", Kind.file });
+    try writeAt(&fs, f, 0, "hello");
+    _ = try fs.check();
+    const v = fs.vol;
+    const n = fs.next_ino;
+    fs.next_ino += 10;
+
+    // 每一种坏法：在当前事务里改，check 报 Corrupt，再 abort 退回好的状态
+    const Bad = enum { orphan_inode, dangling_entry, wrong_parent, stray_item, extent_past_end, two_names, cycle, entry_in_file };
+    for (std.enums.values(Bad)) |bad| {
+        var entry: [@sizeOf(DirHeader) + 1]u8 = undefined;
+        const dirEntry = struct {
+            fn make(buf: *[@sizeOf(DirHeader) + 1]u8, ino: u64, kind: Kind) []const u8 {
+                @memcpy(buf[0..@sizeOf(DirHeader)], std.mem.asBytes(&DirHeader{ .ino = ino, .kind = kind, .name_len = 1 }));
+                buf[@sizeOf(DirHeader)] = 'x';
+                return buf;
+            }
+        }.make;
+        const x_key = Key.init(d, type_dir, nameHash("x") << 32);
+        switch (bad) {
+            // 没有名字的 inode
+            .orphan_inode => try v.insert(Key.init(n, type_inode, 0), std.mem.asBytes(&Inode{ .kind = .file, .size = 0, .parent = d })),
+            // 目录项指向不存在的 inode
+            .dangling_entry => try v.insert(x_key, dirEntry(&entry, n, .file)),
+            // inode 的 parent 不是装着它的目录
+            .wrong_parent => try v.update(Key.init(f, type_inode, 0), std.mem.asBytes(&Inode{ .kind = .file, .size = 5, .parent = root_ino })),
+            // 没有 inode 的条目
+            .stray_item => try v.insert(Fs.extentKey(n, 0), std.mem.asBytes(&ExtentHeader{ .kind = .inline_data })),
+            // 内容条目在文件长度之外
+            .extent_past_end => try v.update(Key.init(f, type_inode, 0), std.mem.asBytes(&Inode{ .kind = .file, .size = 0, .parent = d })),
+            // 一个 inode 两个名字
+            .two_names => try v.insert(x_key, dirEntry(&entry, f, .file)),
+            // 两个目录互为 parent，和根目录断开
+            .cycle => {
+                try v.insert(Key.init(n, type_inode, 0), std.mem.asBytes(&Inode{ .kind = .dir, .size = 0, .parent = n + 1 }));
+                try v.insert(Key.init(n + 1, type_inode, 0), std.mem.asBytes(&Inode{ .kind = .dir, .size = 0, .parent = n }));
+                try v.insert(Key.init(n, type_dir, nameHash("x") << 32), dirEntry(&entry, n + 1, .dir));
+                try v.insert(Key.init(n + 1, type_dir, nameHash("x") << 32), dirEntry(&entry, n, .dir));
+            },
+            // 文件里有目录项
+            .entry_in_file => try v.insert(Key.init(f, type_dir, nameHash("x") << 32), dirEntry(&entry, d, .dir)),
+        }
+        std.testing.expectError(error.Corrupt, fs.check()) catch |err| {
+            std.debug.print("not detected: {s}\n", .{@tagName(bad)});
+            return err;
+        };
+        try v.abort();
+        _ = try fs.check();
+    }
 }
 
 /// 掉电测试：一串随机的文件系统操作（每个操作提交一次），在每一次写盘之后掉电，重新挂载后

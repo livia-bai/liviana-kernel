@@ -193,6 +193,7 @@ pub fn blockCount() u64
 ### 写和放开
 
 - `write` 要求拿着睡眠锁、`valid` 为 true，同步写回磁盘（write-through）：返回时数据已经交给设备了。
+- `invalidate` 把 `refcnt` 为 0 的缓冲区都标成 `valid = false`，之后再读它们都要重新读盘。给 `scrub` 用：校验和只在读盘时核对，要核对磁盘上的内容就不能用缓存里的（[fs.md](fs.md#检查整个文件系统checkscrub)）。写都是同步的，缓存里没有还没写下去的内容，作废不会丢东西；`valid` 本来由缓冲区的睡眠锁保护，`refcnt` 为 0 说明没人拿着、也没人在等这把睡眠锁，所以拿着 `bio.lock` 改它也安全。
 - `release` 放开睡眠锁，`refcnt -= 1`；减到 0 就把它挪到表头（最近用过），有人在等空闲缓冲区的话叫醒（`waiting` 计数，不用每次都扫一遍进程表）。
 
 ### 磁盘是可以换的（`Device`）

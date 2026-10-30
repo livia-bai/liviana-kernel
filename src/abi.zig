@@ -74,6 +74,10 @@ pub const Syscall = enum(usize) {
     fstat = 28,
     /// readdir(fd, ptr) 把目录 fd 的下一个目录项（Dirent）写进用户内存，返回 1；列完了返回 0
     readdir = 29,
+    /// scrub(ptr) 检查整个文件系统：B 树的结构和每个节点的校验和、每个数据块的校验和（都重新从磁盘读）、
+    /// 条目之间对不对得上（每个 inode 正好一个名字、都连得到根目录等）。都对就把 ScrubInfo 写进用户内存，
+    /// 返回 0；不对返回 -EIO。只读不改；检查期间别的进程的文件操作都要等着
+    scrub = 30,
     _,
 };
 
@@ -237,6 +241,23 @@ pub const MemInfo = extern struct {
     free_pages: u64,
     total_pages: u64,
     page_size: u64,
+};
+
+/// scrub 返回的统计。
+pub const ScrubInfo = extern struct {
+    files: u64,
+    dirs: u64,
+    /// 读过、校验和对得上的数据块（不算内联在树里的小文件）
+    data_blocks: u64,
+    /// B 树的节点数、条目数、层数
+    nodes: u64,
+    items: u64,
+    height: u64,
+    free_blocks: u64,
+    /// 文件系统的总块数
+    blocks: u64,
+    /// 最后提交的事务号
+    generation: u64,
 };
 
 const max_errno = 4095;
