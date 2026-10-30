@@ -89,7 +89,7 @@ const user_programs = [_]UserProgram{
     .{ .name = "fault" }, .{ .name = "spin" },  .{ .name = "ticker" },
     .{ .name = "echo" },  .{ .name = "cat" },   .{ .name = "wc" },
     .{ .name = "ls" },    .{ .name = "mkdir" }, .{ .name = "rm" },
-    .{ .name = "scrub" },
+    .{ .name = "scrub" }, .{ .name = "mv" },
 };
 const test_programs = [_]UserProgram{
     .{ .name = "t_sys", .dir = "user/tests" },

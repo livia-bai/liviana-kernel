@@ -118,7 +118,7 @@ for (stages, 0..) |*st, i| {
 
 ## 重定向
 
-`run 程序 > 文件` 把标准输出换成文件（没有就建，有就截成 0 字节），`run 程序 < 文件` 把标准输入换成文件；`<`、`>` 和文件名之间可以有空格也可以没有，在管道的哪一段都行（`run echo a b c | cat >/p.txt`）。和管道一样是在子进程里、`exec` 之前换（`redirect`）：
+`run 程序 > 文件` 把标准输出换成文件（没有就建，有就截成 0 字节），`run 程序 >> 文件` 也是，但不截断、每次写都写在文件末尾（`open_append`，[files.md](files.md#文件表)），`run 程序 < 文件` 把标准输入换成文件；`<`、`>`、`>>` 和文件名之间可以有空格也可以没有，在管道的哪一段都行（`run echo a b c | cat >/p.txt`）。和管道一样是在子进程里、`exec` 之前换（`redirect`）：
 
 ```zig
 fn replaceFd(target: sys.Fd, path: []const u8, flags: sys.OpenFlags) void {
@@ -129,7 +129,7 @@ fn replaceFd(target: sys.Fd, path: []const u8, flags: sys.OpenFlags) void {
 }
 ```
 
-- `>` 用 `open(.{ .read = false, .write = true, .create = true, .truncate = true })`，`<` 用只读的 `open`。
+- `>` 用 `open(.{ .read = false, .write = true, .create = true, .truncate = true })`，`>>` 把 `.truncate` 换成 `.append = true`，`<` 用只读的 `open`。
 - 管道里的一段同时有管道和重定向时，重定向在后面做，所以它优先（和 Unix 的 sh 一样）。
 - 打不开（`run cat < /nope`、`run echo x > /bin`）时子进程打印 `run: /nope: NotFound`、`run: /bin: IsDir`，以 1 结束，不运行程序。`>` 或 `<` 后面没有文件名打印 `run: missing file name after < or >`，不 `fork`。
 - 例子：
@@ -148,18 +148,22 @@ fn replaceFd(target: sys.Fd, path: []const u8, flags: sys.OpenFlags) void {
 const trimmed = std.mem.trim(u8, input, " ");
 if (trimmed.len == 0) return;
 const name, const arg = std.mem.cutScalar(u8, trimmed, ' ') orelse .{ trimmed, "" };
-const cmd = std.meta.stringToEnum(Command, name) orelse { ... "unknown command" ... };
+const cmd = std.meta.stringToEnum(Command, name) orelse {
+    const prog = trimmed[0 .. std.mem.indexOfAny(u8, trimmed, " |<>&") orelse trimmed.len];
+    if (prog.len > 0 and programExists(prog)) return run(trimmed);
+    ... "unknown command" ...
+};
 ```
 
 - 去掉首尾空格；空行什么也不做。
 - 第一个空格之前是命令名，之后是参数（`std.mem.cutScalar` 是 0.17 新增的，返回分割点前后两段）。参数只有 `run`、`kill`、`cd` 用。
-- 命令名用 `std.meta.stringToEnum` 转成 `Command` 枚举，不认识就打印 `unknown command: NAME (try 'help')`。
+- 命令名用 `std.meta.stringToEnum` 转成 `Command` 枚举。不是内置命令的话，看开头的程序名（到空格、`|`、`<`、`>`、`&` 为止，所以 `echo hi|wc` 也认得出 `echo`）是不是程序（`programExists`，和 `run` 用的一样）：是就把整行当作 `run` 的参数，`hello`、`echo a | wc`、`spin &` 和加上 `run` 一样；不是才打印 `unknown command: NAME (try 'help')`。内置命令优先：`/bin` 里要是有个叫 `kill` 的程序，得写 `run kill` 才能运行它。
 
 `run` 的参数再拆一次（`parse`）：
 
 - 末尾的 `&` 表示后台运行，`&` 前面有没有空格都行（`run spin&` 也可以）。
-- 剩下的按 `|` 拆成几段（`std.mem.splitScalar`），每段按空格拆成词（`std.mem.tokenizeScalar`，连续的空格算一个）。以 `<`、`>` 开头的词是重定向（[重定向](#重定向)），其余的第一个词是程序名，所有词（包括程序名）就是它的命令行参数。词是 `line` 里的切片，不复制。
-- 没有引号、没有转义：参数里不能有空格、`|`，也不能以 `<`、`>` 开头。
+- 剩下的按 `|` 拆成几段（`std.mem.splitScalar`），每段按空格拆成词（`std.mem.tokenizeScalar`，连续的空格算一个）。以 `<`、`>`、`>>` 开头的词是重定向（[重定向](#重定向)），其余的第一个词是程序名，所有词（包括程序名）就是它的命令行参数。词是 `line` 里的切片，不复制。
+- 没有引号、没有转义：参数里不能有空格、`|`，也不能以 `<`、`>` 开头。重定向必须在词的开头：`echo three>>/log` 的 `three>>/log` 是一个参数，要写成 `echo three >>/log`。
 - 某一段是空的（`run echo a |`）打印 `run: empty command in the pipeline`；一段超过 16 个词（`abi.max_args`）打印 `run: too many arguments (at most 16)`；超过 4 段打印 `run: too many programs in the pipeline (at most 4)`。
 
 ## 命令
@@ -171,10 +175,10 @@ const cmd = std.meta.stringToEnum(Command, name) orelse { ... "unknown command" 
 | `mem` | 物理页的使用情况（`meminfo`，[page-allocator.md](page-allocator.md)） | `31600 of 31676 pages free (126400 KiB), 4 KiB each` |
 | `disk` | 磁盘的原始区域（文件系统之后的块）有多大（`blockcount`，[disk.md](disk.md#系统调用)）；没有磁盘时打印 `no disk` | `1024 blocks of 4 KiB (4 MiB)` |
 | `cd [DIR]` | 换 shell 的当前目录（`chdir`），之后启动的程序继承它；不给 `DIR` 时回到 `/`。出错时打印 `cd: DIR: NotFound`（或 `NotDir`） | |
-| `run` | 列出 `/bin` 里的程序（`readdir`），按名字排序 | `programs: cat echo fault hello init ls mkdir rm scrub sh spin ticker wc` |
-| `run NAME [ARGS...]` | 在前台运行用户程序 `NAME`（`/bin/NAME`；带 `/` 的按路径找，比如 `run /h`），带上参数，等它结束；Ctrl-C 结束它 | 程序自己的输出 + `[proc] pid 3 (hello) exited with code 0` |
+| `run` | 列出 `/bin` 里的程序（`readdir`），按名字排序 | `programs: cat echo fault hello init ls mkdir mv rm scrub sh spin ticker wc` |
+| `run NAME [ARGS...]`，或者直接 `NAME [ARGS...]` | 在前台运行用户程序 `NAME`（`/bin/NAME`；带 `/` 的按路径找，比如 `run /h`），带上参数，等它结束；Ctrl-C 结束它。下面几行的 `run` 也都可以不写（[命令解析](#命令解析)） | 程序自己的输出 + `[proc] pid 3 (hello) exited with code 0` |
 | `run A \| B \| ...` | 管道（[管道](#管道)） | `run echo one two three \| wc` 打印 `1 3 14` |
-| `run ... > F`、`run ... < F` | 标准输出写进文件 `F`、标准输入从 `F` 读（[重定向](#重定向)） | |
+| `run ... > F`、`run ... >> F`、`run ... < F` | 标准输出写进文件 `F`、追加到 `F` 末尾、标准输入从 `F` 读（[重定向](#重定向)） | |
 | `run ... &` | 在后台运行，马上回到提示符 | `[proc] pid 4 (spin) started in the background` |
 | `ps` | 列出进程（`procinfo`）：pid、父进程、状态、用掉的时钟 tick 数、名字 | 见下文 |
 | `kill PID` | 结束进程 | `[proc] pid 4 (spin) killed: kill()` |
@@ -196,7 +200,7 @@ const cmd = std.meta.stringToEnum(Command, name) orelse { ... "unknown command" 
   `ps` 是 shell 执行的，所以 shell 自己总是 `running`；init 总在 `wait` 里睡着。单核时 shell 占着唯一的 hart，`spin` 只能是 `runnable`；多核时它在别的 hart 上跑，显示 `running`。`TICKS` 是进程在 U 模式运行期间来过的时钟中断数，大致等于它用掉的 CPU 时间（单位 10 ms）。按槽位顺序列出，不一定按 pid 排序。结束了还没被回收的进程显示为 `zombie`。
 - `kill PID`：`PID` 不是数字时打印 `usage: kill PID`，没有这个进程时打印 `kill: no such process: PID`，杀 init 打印 `kill: cannot kill pid 1: permission denied`。`kill` 系统调用只做标记（[process.md](process.md#kill只做标记)），所以 shell 接着 `wait(pid)`：是自己的子进程的话，等它真的结束、回收它，`killed: kill()` 那一行就在下一个提示符之前；不是自己的子进程时 `wait` 立刻返回 `NoChildren`。
 - **列程序**（`listPrograms`）：`readdir` 给的是名字的散列的顺序，shell 把名字收进全局的数组再排序。用的是插入排序：`std.mem.sort` 是块排序，栈上有一个 512 项的缓存（512 个切片，8 KiB），Debug 模式下把 shell 16 KiB 的用户栈撑爆过（`store_page_fault`，`stval` 在保护页里，init 重启了 shell）。
-- 文件操作是普通的用户程序：`run ls [PATH...]`、`run cat [FILE...]`、`run mkdir DIR...`、`run rm PATH...`（[user-programs.md](user-programs.md)）。`cd` 必须是 shell 自己的命令：子进程 `chdir` 改不了父进程的当前目录。
+- 文件操作是普通的用户程序：`ls [PATH...]`、`cat [FILE...]`、`mkdir DIR...`、`rm PATH...`、`mv OLD NEW`、`scrub`（[user-programs.md](user-programs.md)）。`cd` 必须是 shell 自己的命令：子进程 `chdir` 改不了父进程的当前目录。
 - `kill` shell 自己（它的 pid）也可以：shell 结束，init 打印 `init: sh exited, restarting it` 并启动一个新的 shell。
 
 ## 添加命令

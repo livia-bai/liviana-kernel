@@ -97,18 +97,32 @@ pub fn errno(err: anyerror) abi.Errno // 文件系统的错误 → 系统调用�
 
 | 调用 | 做什么 |
 | --- | --- |
-| `open(path, flags)` | `resolve`；没有并且带 `O_CREATE` 时 `create`；是目录并且要写是 `EISDIR`；带 `O_TRUNC` 并且可写时 `truncate`。返回 fd |
+| `open(path, flags)` | `resolve`；没有并且带 `O_CREATE` 时 `create`；是目录并且要写是 `EISDIR`；带 `O_TRUNC` 并且可写时 `truncate`；`O_APPEND` 记在 `File` 里。返回 fd |
 | `mkdir(path)`、`unlink(path)` | `create(.dir)`、`unlink` |
 | `chdir(path)` | `resolve`，不是目录是 `ENOTDIR` |
 | `fstat(fd)` | inode 号、长度、种类；串口和管道也能查（种类是 `console`、`pipe`） |
 | `readdir(fd)` | 目录的下一项：`File.off` 就是 `fs.readdir` 的 cookie，结果写进用户内存成功了才往后挪 |
-| `read`、`write` | 从 `off` 开始读写；读写目录是 `EISDIR` |
+| `read`、`write` | 从 `off` 开始读写；读写目录是 `EISDIR`。`open_append` 打开的，写之前先把 `off` 挪到文件末尾（同一次拿锁里） |
+| `rename(old, new)` | `rename`（[改名](#改名rename)） |
+| `lseek(fd, offset, whence)` | 改 `File.off`，`seek_end` 要先 `stat`（[files.md](files.md#文件表)） |
 | `scrub` | 先作废缓存，再 `check` 整个文件系统（[检查](#检查整个文件系统checkscrub)） |
 | `exec` | 在 `/bin`（或给的路径）里找程序，拿着 `fsys.lock` 把 ELF 直接读进新的用户页（[process.md](process.md#程序从哪来)） |
 
 路径先复制进内核栈上的缓冲区（最长 `abi.max_path` = 256 字节，长了是 `ENAMETOOLONG`）。错误码：`NotFound` → `ENOENT`，`Exists` → `EEXIST`，`NotDir` → `ENOTDIR`，`IsDir` → `EISDIR`，`NotEmpty` → `ENOTEMPTY`，`NameTooLong` → `ENAMETOOLONG`，`InvalidName` → `EINVAL`，`NoSpace` → `ENOSPC`，`FileTooBig` → `EFBIG`，`BadAddress` → `EFAULT`，`Corrupt` 等磁盘上的东西不对 → `EIO`。
 
-**内核栈**：系统调用在 16 KiB 的进程内核栈上运行，B 树的操作走得很深。开发时内核栈被撑爆过一次（Debug 模式用到 54 KiB）：`std.bit_set` 的 `isSet`、`count` 按值接收整个位图，每调用一次在栈上复制 8 KiB；`x.* = y.*` 复制 4 KiB 的块也会先放在栈上。改成自己写的 `Bitmap`（方法接收指针）和 `@memcpy` 之后，实测跑完全部 QEMU 测试（包括 `t_fs`、掉电后重新启动、从文件系统 `exec`），最深 Debug 9944 字节、safe 5840 字节、small 5096 字节（测法见 [process.md](process.md#进程表)）。
+**内核栈**：系统调用在 16 KiB 的进程内核栈上运行，B 树的操作走得很深。开发时内核栈被撑爆过一次（Debug 模式用到 54 KiB）：`std.bit_set` 的 `isSet`、`count` 按值接收整个位图，每调用一次在栈上复制 8 KiB；`x.* = y.*` 复制 4 KiB 的块也会先放在栈上。改成自己写的 `Bitmap`（方法接收指针）和 `@memcpy` 之后，实测跑完全部 QEMU 测试（包括 `t_fs`、掉电后重新启动、从文件系统 `exec`），最深 Debug 10056 字节、safe 5904 字节、small 5192 字节（加了 `rename`、`scrub` 之后重新量的，测法见 [process.md](process.md#进程表)）。
+
+## 改名（`rename`）
+
+`rename(cwd, old, new)` 把 `old` 改名成 `new`，可以换目录。它只改目录项，inode 号不变：打开着它的 fd、以它（或者它下面的目录）为当前目录的进程都照常能用，这一点和 `unlink` 不一样。
+
+1. `resolveParent` 两个路径，在旧目录里找到旧名字的目录项 `e`（没有是 `NotFound`），在新目录里 `scan` 新名字。
+2. 新名字已经有了（`t`）：是同一个 inode（`rename a a`，或者 `a` 和 `//a/`）就什么都不做；目录换文件是 `NotDir`，文件换目录是 `IsDir`。
+3. `e` 是目录的话，从新目录沿着 `parent` 往上走到根目录，路上遇到 `e` 自己就是 `InvalidName`（`-EINVAL`）：挪进自己下面会让这一串和根目录断开、成了环。
+4. 换掉 `t`：和 `unlink` 一样连内容一起删掉（共用的 `remove`），目录不空是 `NotEmpty`。新的目录项就用 `t` 原来的键（名字一样，散列也一样）；没有 `t` 时用 `scan` 给的序号。
+5. 删掉旧的目录项，插入新的；换了目录的话，inode 的 `parent` 改成新目录（`..` 和 `check` 都靠它）。
+
+整个 `rename` 由调用方放在一个事务里（`fs.run(Fs.rename, ...)`），所以**换掉已有的文件是原子的**：掉电之后要么还是旧的文件，要么已经是新的，不会两个都没有、也不会两个名字指着同一个 inode。出错的话（比如第 4 步发现目录不空）前面做了的一起作废。掉电测试里也有随机的 `rename`（[单元测试](#单元测试)）。
 
 ## 检查整个文件系统（`check`、`scrub`）
 
@@ -165,21 +179,21 @@ mkfs <输出文件> <总块数> <文件系统的块数> <文件>...
 - 文件内容：内联的读写、中间补 0；正好 512 字节还是内联，再长一个字节换成数据块、内容不变；跨页的写；洞读出来是 0、不占块；读到末尾之后返回 0；写到一半“用户内存”出错，整个写作废、文件不变；`FileTooBig`；截断之后再写又是内联；删除文件之后空闲块数和创建之前一样。
 - 数据块的校验和：在磁盘上改一个字节，读这一页是 `Corrupt`，别的页照常；重新挂载之后内容还在。
 - `check`：数对文件、目录（含根目录）、数据块（有洞的文件只算有块的页）；在磁盘上改一个数据块、改根节点，缓存里还是好的时 `check` 照样通过，`bio.invalidate` 之后就是 `Corrupt`，改回来又通过。条目之间对不上的 8 种坏法（没有名字的 inode、指向不存在的 inode 的目录项、`parent` 不对、没有 inode 的条目、内容条目超出文件长度、一个 inode 两个名字、两个目录成环、文件里有目录项）在当前事务里直接改 B 树做出来，每一种都是 `Corrupt`，`abort` 之后又通过。验证过它能抓住错误：去掉“每个 inode 正好一个名字”那一项，没有名字的 inode 就查不出来了。
-- **掉电**：一串 25 个随机操作（创建、删除、截断、在随机位置写最多 3 页），每个操作提交一次，完整跑一遍写盘 120 次；对每一个 N，在第 N 次写之后掉电，重新挂载，要求：挂载成功、`check` 通过、所有文件的内容正好是某一个操作做完之后的样子、不早于最后一个做完了的操作。然后接着创建、写一个新文件，再核对一遍旧文件：挂载时漏算了哪个块（当成了空闲块），这里就会被改写。
+- `rename`：同一个目录里改名、换目录（`..` 跟着变）、目录连着下面的东西一起挪；换掉已有的文件（它的块都还回来）、换掉空目录，不空的不行；没有的名字、新目录不存在、目录换文件、文件换目录、挪进自己下面、`/`、`..`、穿过文件的路径、太长的名字都报错，并且事务号不变（什么都没写）；改成自己什么都不做；改成 255 字节的名字。每一步之后 `check`。验证过它能抓住错误：换目录时不改 `parent`，测试失败。
+- **掉电**：一串 25 个随机操作（创建、删除、截断、改名成另一个文件（有的话换掉它）、在随机位置写最多 3 页），每个操作提交一次，完整跑一遍写盘 137 次；对每一个 N，在第 N 次写之后掉电，重新挂载，要求：挂载成功、`check` 通过、所有文件的内容正好是某一个操作做完之后的样子、不早于最后一个做完了的操作。然后接着创建、写一个新文件，再核对一遍旧文件：挂载时漏算了哪个块（当成了空闲块），这里就会被改写。
 
   验证过它能抓住错误：改数据页时直接在旧块上改（不写时复制），掉电测试失败；挂载时不把数据块算作用着的（`dataRefs` 总返回 null），掉电测试失败（这一种是在加了“挂载之后接着写”之后才抓到的）。
 
 ## QEMU 里的测试
 
-`tools/qemu_test.py` 的 `fs` 用例（[testing.md](testing.md)）：shell 里的 `ls`、`cat`、`mkdir`、`rm`、`cd`、`<`、`>`；回归测试 `t_fs` 测系统调用的边界情况和并发；关机之后在同一个镜像上再启动，上一次写的文件还在；然后边写边把 QEMU 杀掉（掉电），再启动一次，`t_fs verify` 检查每个操作要么做完了、要么没做，`scrub` 通过；最后在镜像里改坏一个数据块，第四次启动，`scrub` 发现它（见上面的[检查](#检查整个文件系统checkscrub)）。
+`tools/qemu_test.py` 的 `fs` 用例（[testing.md](testing.md)）：shell 里的 `ls`、`cat`、`mkdir`、`rm`、`mv`、`cd`、`<`、`>`、`>>`；回归测试 `t_fs` 测系统调用的边界情况和并发；关机之后在同一个镜像上再启动，上一次写的文件还在；然后边写边把 QEMU 杀掉（掉电），再启动一次，`t_fs verify` 检查每个操作要么做完了、要么没做，`scrub` 通过；最后在镜像里改坏一个数据块，第四次启动，`scrub` 发现它（见上面的[检查](#检查整个文件系统checkscrub)）。
 
 这个用例在开发时抓到过一个 bug：目录项的头里名字长度是 `u8`，`@sizeOf(DirHeader) + head.name_len` 按 `u8` 算，名字长于 239 字节时溢出（Debug、safe 模式下 panic；fast、small 模式下不检查溢出，是未定义行为）。单元测试原来只建了 255 字节的名字，没有再找它、列它，碰不到这段代码，现在补上了。
 
 ## 限制和以后可以做的
 
-- 只能截成 0；没有 `rename`、硬链接、权限、时间戳。
+- 只能截成 0；没有硬链接、权限、时间戳。
 - 一页一个数据块，没有 btrfs 那种连续多块的 extent；也没有压缩。
 - 每个操作一个事务，每次都写超级块。
 - 删除打开着的文件之后，打开它的人再读写会出错（`ENOENT`）。
 - 一把锁管整个文件系统，读写不同文件的进程也要排队。
-- 没有 `lseek`：读写位置只能从 0 开始往后挪。

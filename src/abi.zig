@@ -62,7 +62,7 @@ pub const Syscall = enum(usize) {
     writeblock = 23,
     /// open(path_ptr, path_len, flags) 打开文件系统里的文件或目录，返回 fd。flags 见 open_*：
     /// 读写方式（open_read、open_write、open_rdwr）加上 open_create（没有就建一个空文件）、
-    /// open_trunc（截成 0 字节）。目录只能只读地打开（用 readdir 列出来）
+    /// open_trunc（截成 0 字节）、open_append（每次写都写在末尾）。目录只能只读地打开（用 readdir 列出来）
     open = 24,
     /// mkdir(path_ptr, path_len) 建一个空目录，返回 0
     mkdir = 25,
@@ -78,6 +78,12 @@ pub const Syscall = enum(usize) {
     /// 条目之间对不对得上（每个 inode 正好一个名字、都连得到根目录等）。都对就把 ScrubInfo 写进用户内存，
     /// 返回 0；不对返回 -EIO。只读不改；检查期间别的进程的文件操作都要等着
     scrub = 30,
+    /// rename(old_ptr, old_len, new_ptr, new_len) 把文件或目录 old 改名成 new（可以换目录），一下子做完，返回 0。
+    /// new 已经有了的话换掉它：文件换掉文件，目录换掉空目录。打开着它的 fd 照常能用
+    rename = 31,
+    /// lseek(fd, offset, whence) 挪文件 fd 的读写位置，返回新的位置。whence 见 seek_*，offset 按有符号数理解。
+    /// 可以挪到文件末尾之后（再写的话中间是洞）。串口、管道是 -ESPIPE；目录只能 lseek(fd, 0, seek_set) 从头再列
+    lseek = 32,
     _,
 };
 
@@ -87,6 +93,13 @@ pub const open_write: usize = 0x001;
 pub const open_rdwr: usize = 0x002;
 pub const open_create: usize = 0x200;
 pub const open_trunc: usize = 0x400;
+/// 每次 write 之前先把读写位置挪到文件末尾（同一个 write 里不会被别的进程插进来）
+pub const open_append: usize = 0x800;
+
+/// lseek 的 whence：从文件开头、当前位置、文件末尾算
+pub const seek_set: usize = 0;
+pub const seek_cur: usize = 1;
+pub const seek_end: usize = 2;
 
 /// 路径最长多少字节
 pub const max_path = 256;
@@ -161,7 +174,8 @@ pub const Errno = enum(usize) {
     nomem = 12,
     /// 指针指向的内存不属于用户空间，或者没有映射
     fault = 14,
-    /// 参数不对；块号超出原始区域（readblock、writeblock）；名字是 "."、".."
+    /// 参数不对；块号超出原始区域（readblock、writeblock）；名字是 "."、".."；
+    /// rename 把目录挪进它自己下面；lseek 挪到负的位置、whence 不对
     inval = 22,
     /// 系统的文件表满了（pipe、fork）
     nfile = 23,
@@ -169,6 +183,8 @@ pub const Errno = enum(usize) {
     mfile = 24,
     /// 管道的读端都关了，写进去没人读（write）
     pipe = 32,
+    /// 不能 lseek 的文件（串口、管道）
+    spipe = 29,
     /// 没有这个系统调用
     nosys = 38,
     _,

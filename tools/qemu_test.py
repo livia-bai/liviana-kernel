@@ -178,9 +178,15 @@ def case_shell(q, c, mode):
     c.contains(q.command("uptime"), r"up \d+\.\d\ds\n", "uptime")
     c.contains(q.command("nope"), r"unknown command: nope", "unknown command")
     # /bin 里的程序按名字排序（测试程序 t_* 也在里面）
-    c.contains(q.command("run"), r"programs: cat echo fault hello init ls mkdir rm scrub sh spin( t_\w+)+ ticker wc\n",
+    c.contains(q.command("run"), r"programs: cat echo fault hello init ls mkdir mv rm scrub sh spin( t_\w+)+ ticker wc\n",
                "run without a name")
     c.contains(q.command("run nope"), r"no such program: nope\nprograms: ", "run nope")
+    # 不写 run，直接写程序名；管道、重定向照样能用。不是内置命令也不是程序的才是 unknown command
+    out = q.command("hello")
+    c.contains(out, r"Hello from U-mode!", "a program without run")
+    exited(c, out, "hello", 0)
+    c.contains(q.command("echo one two|wc"), r"\n1 2 8\n", "a pipeline without run")
+    c.contains(q.command("nope|wc"), r"unknown command: nope \(try 'help'\)\n", "unknown program in a pipeline")
 
 
 def case_interrupts(q, c, mode):
@@ -651,6 +657,21 @@ def case_fs(q, c, mode):
     c.contains(q.command("run echo x > /bin"), r"run: /bin: IsDir\n", "run echo x > /bin")
     c.contains(q.command("run echo x >"), r"run: missing file name after < or >\n", "run echo x >")
     c.contains(q.command("run mkdir /bin"), r"mkdir: /bin: Exists\n", "run mkdir /bin")
+    # >> 追加；mv 改名、挪进目录、换掉已有的文件
+    q.command("echo one > /log")
+    q.command("echo two >> /log")
+    q.command("echo three >>/log")
+    c.contains(q.command("cat /log"), r"\none\ntwo\nthree\n\[proc\]", "echo >> appends")
+    exited(c, q.command("mv /log /log2"), "mv", 0)
+    c.contains(q.command("cat /log2"), r"\none\ntwo\nthree\n", "cat after mv")
+    c.contains(q.command("cat /log"), r"cat: /log: NotFound\n", "old name after mv")
+    q.command("mkdir /m")
+    q.command("echo x > /m/log2")
+    exited(c, q.command("mv /log2 /m"), "mv", 0)  # 挪进目录，换掉里面同名的文件
+    c.contains(q.command("cat /m/log2"), r"\none\ntwo\nthree\n", "mv into a directory replaces the file there")
+    c.contains(q.command("mv /nope /x"), r"mv: /nope -> /x: NotFound\n", "mv a missing file")
+    c.contains(q.command("mv /m /m/sub"), r"mv: /m -> /m/sub: InvalidArgument\n", "mv a directory into itself")
+    exited(c, q.command("rm /m/log2 /m"), "rm", 0)
     # 程序从文件系统加载：复制一个程序、按路径运行它（进程名是文件名）；不是 ELF 的文件、目录不能运行
     q.command("run cat /bin/hello > /h")
     out = q.command("run /h")
@@ -719,7 +740,7 @@ CASES = {
                          "user/tests/t_disk.zig"]),
     "fs": (case_fs, ["src/sleeplock.zig", "src/bio.zig", "src/virtio_disk.zig", "src/btree.zig", "src/ctree.zig",
                      "src/fs.zig", "src/fsys.zig", "src/mkfs.zig", "user/ls.zig", "user/mkdir.zig", "user/rm.zig",
-                     "user/cat.zig", "user/echo.zig", "user/wc.zig", "user/scrub.zig", "user/tests/t_fs.zig"]),
+                     "user/cat.zig", "user/echo.zig", "user/wc.zig", "user/scrub.zig", "user/mv.zig", "user/tests/t_fs.zig"]),
     "smp": (case_smp, ["src/timer.zig", "src/plic.zig", "src/pipe.zig", "user/spin.zig", "user/tests/t_smp.zig"]),
 }
 

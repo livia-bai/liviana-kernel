@@ -145,7 +145,7 @@ var init_proc: ?*Process = null;
 var foreground: std.atomic.Value(usize) = .init(0);
 
 /// 每个进程陷入内核时用的栈，静态分配：页分配器只能一页一页地给，给不出连续的 16 KiB。
-/// 实测 Debug 模式下跑完全部 QEMU 测试，最深用了约 9.7 KiB（文件系统的系统调用，见 docs/process.md）。
+/// 实测 Debug 模式下跑完全部 QEMU 测试，最深用了约 9.8 KiB（文件系统的系统调用，见 docs/process.md）。
 /// 两块栈之间没有保护页，最底下放着金丝雀（canary.zig），allocSlot 写上，sched、回到 U 模式之前检查。
 var kernel_stacks: [max_procs][16 * 1024]u8 align(16) = undefined;
 

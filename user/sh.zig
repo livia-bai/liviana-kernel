@@ -1,6 +1,6 @@
 //! shell：读一行命令，执行，再读下一行。由 init 启动，对应 xv6 的 user/sh.c（简化得多）。
 //!
-//! 它是一个普通的用户程序，内核里的功能都通过系统调用使用：`run` 用 fork + exec 启动程序（带上命令行参数），
+//! 它是一个普通的用户程序，内核里的功能都通过系统调用使用：`run`（或者直接写程序名）用 fork + exec 启动程序（带上命令行参数），
 //! 前台运行时用 setfg 告诉内核按 Ctrl-C 该杀谁，再 wait 它结束；`ps`、`mem` 用 procinfo、meminfo。
 //! `run a | b | c` 用 pipe、dup、close 把前一个程序的标准输出接到后一个程序的标准输入。
 //! 键盘输入用 read 一个字节一个字节地读，回显和退格都由 shell 自己做。
@@ -64,7 +64,10 @@ fn execute(input: []const u8) void {
     // 第一个空格之前是命令名，之后是参数
     const name, const arg = std.mem.cutScalar(u8, trimmed, ' ') orelse .{ trimmed, "" };
     const cmd = std.meta.stringToEnum(Command, name) orelse {
-        sys.print("unknown command: {s} (try 'help')\n", .{name});
+        // 不是内置命令：是程序的话就当作 `run 这一行`。程序名到空格、|、<、>、& 为止（`echo hi|wc` 也行）
+        const prog = trimmed[0 .. std.mem.indexOfAny(u8, trimmed, " |<>&") orelse trimmed.len];
+        if (prog.len > 0 and programExists(prog)) return run(trimmed);
+        sys.print("unknown command: {s} (try 'help')\n", .{if (prog.len > 0) prog else name});
         return;
     };
     switch (cmd) {
@@ -74,11 +77,11 @@ fn execute(input: []const u8) void {
             \\mem         free physical pages
             \\disk        size of the raw disk area (the blocks after the file system)
             \\cd [DIR]    change the current directory (default: /)
-            \\run NAME [ARGS...]
-            \\            run a user program and wait for it (without NAME: list them)
-            \\run A | B   run A and B with A's output piped into B (up to 4 programs)
-            \\run ... > F write the output to file F (< F: read input from F)
-            \\run ... &   run it in the background
+            \\NAME [ARGS...], run NAME [ARGS...]
+            \\            run a user program and wait for it (run alone: list them)
+            \\A | B       run A and B with A's output piped into B (up to 4 programs)
+            \\... > F     write the output to file F (>> F: append to it; < F: read input from F)
+            \\... &       run it in the background
             \\ps          list processes
             \\kill PID    kill a process
             \\shutdown    power off through SBI
@@ -116,12 +119,14 @@ fn execute(input: []const u8) void {
     }
 }
 
-/// 一个要运行的程序：程序名是 args[0]。`< 文件`、`> 文件` 把标准输入、标准输出换成文件。
+/// 一个要运行的程序：程序名是 args[0]。`< 文件`、`> 文件` 把标准输入、标准输出换成文件，`>> 文件` 追加到文件末尾。
 const Stage = struct {
     args: [sys.abi.max_args][]const u8 = undefined,
     argc: usize = 0,
     in: ?[]const u8 = null,
     out: ?[]const u8 = null,
+    /// out 是 `>>` 给的：追加，不截断
+    append: bool = false,
 
     fn name(st: *const Stage) []const u8 {
         return st.args[0];
@@ -131,7 +136,7 @@ const Stage = struct {
 const ParseError = error{ EmptyCommand, TooManyArguments, TooManyStages, MissingFileName };
 
 /// 把 run 的参数拆成用 | 隔开的几段，每段按空格拆成命令行参数。参数是 line 里的切片。
-/// `<`、`>` 后面（可以有空格，也可以没有）是重定向的文件名，不算参数。
+/// `<`、`>`、`>>` 后面（可以有空格，也可以没有）是重定向的文件名，不算参数。
 fn parse(arg: []const u8, stages: *[max_stages]Stage) ParseError![]Stage {
     var n: usize = 0;
     var parts = std.mem.splitScalar(u8, arg, '|');
@@ -142,8 +147,15 @@ fn parse(arg: []const u8, stages: *[max_stages]Stage) ParseError![]Stage {
         var words = std.mem.tokenizeScalar(u8, part, ' ');
         while (words.next()) |w| {
             if (w[0] == '<' or w[0] == '>') {
-                const target = if (w.len > 1) w[1..] else words.next() orelse return error.MissingFileName;
-                if (w[0] == '<') st.in = target else st.out = target;
+                const append = std.mem.startsWith(u8, w, ">>");
+                const op_len: usize = if (append) 2 else 1;
+                const target = if (w.len > op_len) w[op_len..] else words.next() orelse return error.MissingFileName;
+                if (w[0] == '<') {
+                    st.in = target;
+                } else {
+                    st.out = target;
+                    st.append = append;
+                }
                 continue;
             }
             if (st.argc == st.args.len) return error.TooManyArguments;
@@ -209,10 +221,11 @@ fn forkFailed(err: sys.ForkError) void {
     }
 }
 
-/// 在子进程里按 `<`、`>` 换掉标准输入、标准输出（`>` 的文件没有就建，有就截成 0 字节）。打不开就以 1 结束。
+/// 在子进程里按 `<`、`>`、`>>` 换掉标准输入、标准输出（`>`、`>>` 的文件没有就建；`>` 截成 0 字节，
+/// `>>` 每次写都写在末尾）。打不开就以 1 结束。
 fn redirect(st: *const Stage) void {
     if (st.in) |path| replaceFd(sys.stdin, path, .{});
-    if (st.out) |path| replaceFd(sys.stdout, path, .{ .read = false, .write = true, .create = true, .truncate = true });
+    if (st.out) |path| replaceFd(sys.stdout, path, .{ .read = false, .write = true, .create = true, .truncate = !st.append, .append = st.append });
 }
 
 fn replaceFd(target: sys.Fd, path: []const u8, flags: sys.OpenFlags) void {

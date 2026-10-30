@@ -257,7 +257,11 @@ pub const Fs = struct {
     pub fn unlink(fs: *Fs, cwd: u64, path: []const u8) Error!void {
         const dir, const name = try fs.resolveParent(cwd, path);
         const found, _ = try fs.scan(dir, name);
-        const e = found orelse return error.NotFound;
+        try fs.remove(dir, found orelse return error.NotFound);
+    }
+
+    /// 删掉目录 dir 里的目录项 e 和它指向的 inode（unlink、rename 换掉已有的名字）。目录必须是空的。
+    fn remove(fs: *Fs, dir: u64, e: Found) Error!void {
         if (e.kind == .dir) {
             if (try fs.vol.next(Key.init(e.ino, type_dir, 0), null)) |f| {
                 if (f.key.objectid == e.ino and f.key.type == type_dir) return error.NotEmpty;
@@ -269,6 +273,53 @@ pub const Fs = struct {
             try fs.dropItem(f.key);
         }
         try fs.vol.delete(Key.init(dir, type_dir, e.offset));
+    }
+
+    /// 把 old 改名成 new，可以换到别的目录。一个事务做完（调用方用 run），所以要么改好了、要么什么都没变，
+    /// 掉电也一样。inode 号不变：打开着它的 fd、以它（或者它下面的目录）为当前目录的进程都照常。
+    ///
+    /// new 已经有了的话换掉它（和 Unix 的 rename 一样）：文件换掉文件，目录换掉空目录（不空是 NotEmpty）；
+    /// 目录换文件是 NotDir，文件换目录是 IsDir。换掉的那个和 unlink 一样连内容一起删掉。
+    /// old 和 new 是同一个名字时什么都不做。目录不能挪进它自己或者它下面（InvalidName）。
+    pub fn rename(fs: *Fs, cwd: u64, old: []const u8, new: []const u8) Error!void {
+        const odir, const oname = try fs.resolveParent(cwd, old);
+        const found, _ = try fs.scan(odir, oname);
+        const e = found orelse return error.NotFound;
+        const ndir, const nname = try fs.resolveParent(cwd, new);
+        const target, const seq = try fs.scan(ndir, nname);
+        if (target) |t| {
+            if (t.ino == e.ino) return;
+            if (e.kind == .dir and t.kind != .dir) return error.NotDir;
+            if (e.kind != .dir and t.kind == .dir) return error.IsDir;
+        }
+        if (e.kind == .dir) {
+            // 新的父目录和它的祖先里不能有 e 自己，不然这一串就和根目录断开、成了环。
+            // 走的步数比 inode 号还多说明磁盘上已经有环了（check 会报 Corrupt），不能一直走下去
+            var at = ndir;
+            var steps: u64 = 0;
+            while (true) : ({
+                at = (try fs.getInode(at)).parent;
+                steps += 1;
+            }) {
+                if (at == e.ino) return error.InvalidName;
+                if (at == root_ino) break;
+                if (steps >= fs.next_ino) return error.Corrupt;
+            }
+        }
+        // 换掉已有的名字时用它原来的键（名字一样，散列也一样）；否则用 scan 给的序号
+        const offset = if (target) |t| t.offset else nameHash(nname) << 32 | seq;
+        if (target) |t| try fs.remove(ndir, t);
+        try fs.vol.delete(Key.init(odir, type_dir, e.offset));
+        var buf: [@sizeOf(DirHeader) + max_name]u8 = undefined;
+        const head: DirHeader = .{ .ino = e.ino, .kind = e.kind, .name_len = @intCast(nname.len) };
+        @memcpy(buf[0..@sizeOf(DirHeader)], std.mem.asBytes(&head));
+        @memcpy(buf[@sizeOf(DirHeader)..][0..nname.len], nname);
+        try fs.vol.insert(Key.init(ndir, type_dir, offset), buf[0 .. @sizeOf(DirHeader) + nname.len]);
+        if (odir != ndir) {
+            var ind = try fs.getInode(e.ino);
+            ind.parent = ndir;
+            try fs.putInode(e.ino, ind);
+        }
     }
 
     /// 删掉一个条目；是指向数据块的内容条目的话，数据块也释放。
@@ -760,6 +811,76 @@ test "readdir 列出所有名字；名字的散列相同时也分得开" {
     _ = try fs.check();
 }
 
+test "rename：改名、换目录、换掉已有的文件和空目录，各种错误；inode 号不变，失败时什么都不变" {
+    const expectError = std.testing.expectError;
+    const expectEqual = std.testing.expectEqual;
+    var fs = try testSetup(256);
+    defer testFree();
+    const a = try fs.run(Fs.create, .{ root_ino, "/a", Kind.dir });
+    const b = try fs.run(Fs.create, .{ root_ino, "/a/b", Kind.dir });
+    const f = try fs.run(Fs.create, .{ root_ino, "/a/f", Kind.file });
+    try writeAt(&fs, f, 0, "content of f");
+    var buf: [64]u8 = undefined;
+
+    // 同一个目录里改名
+    try fs.run(Fs.rename, .{ root_ino, "/a/f", "/a/g" });
+    try expectError(error.NotFound, fs.resolve(root_ino, "/a/f"));
+    try expectEqual(f, try fs.resolve(root_ino, "/a/g"));
+    // 换到别的目录（相对路径），parent 跟着改：".." 走到新的目录
+    try fs.run(Fs.rename, .{ a, "g", "b/h" });
+    try expectEqual(f, try fs.resolve(root_ino, "/a/b/h"));
+    try expectEqual(b, (try fs.getInode(f)).parent);
+    try std.testing.expectEqualStrings("content of f", try readAll(&fs, "/a/b/h", &buf));
+    // 目录连着下面的东西一起挪
+    try fs.run(Fs.rename, .{ root_ino, "/a/b", "/b2" });
+    try expectEqual(f, try fs.resolve(root_ino, "/b2/h"));
+    try expectEqual(root_ino, try fs.resolve(b, ".."));
+    _ = try fs.check();
+
+    // 换掉已有的文件：旧的那个的内容一起删掉，块都还回来
+    const other = try fs.run(Fs.create, .{ root_ino, "/other", Kind.file });
+    var big: [3 * block_size]u8 = @splat(7);
+    try writeAt(&fs, other, 0, &big);
+    const free_before = fs.vol.free_count;
+    const victim = try fs.run(Fs.create, .{ root_ino, "/victim", Kind.file });
+    try writeAt(&fs, victim, 0, &big);
+    try fs.run(Fs.rename, .{ root_ino, "/other", "/victim" });
+    try expectEqual(other, try fs.resolve(root_ino, "/victim"));
+    try expectError(error.NotFound, fs.resolve(root_ino, "/other"));
+    try expectError(error.NotFound, fs.stat(victim));
+    try expectEqual(free_before, fs.vol.free_count);
+    // 换掉空目录可以，不空的不行
+    _ = try fs.run(Fs.create, .{ root_ino, "/empty", Kind.dir });
+    try fs.run(Fs.rename, .{ root_ino, "/b2", "/empty" });
+    try expectEqual(f, try fs.resolve(root_ino, "/empty/h"));
+    _ = try fs.run(Fs.create, .{ root_ino, "/d2", Kind.dir });
+    try expectError(error.NotEmpty, fs.run(Fs.rename, .{ root_ino, "/d2", "/empty" }));
+    _ = try fs.check();
+
+    // 出错的情况：都不改任何东西
+    const gen = fs.vol.generation;
+    try expectError(error.NotFound, fs.run(Fs.rename, .{ root_ino, "/nope", "/x" }));
+    try expectError(error.NotFound, fs.run(Fs.rename, .{ root_ino, "/victim", "/nope/x" }));
+    try expectError(error.NotDir, fs.run(Fs.rename, .{ root_ino, "/d2", "/victim" })); // 目录换文件
+    try expectError(error.IsDir, fs.run(Fs.rename, .{ root_ino, "/victim", "/d2" })); // 文件换目录
+    try expectError(error.InvalidName, fs.run(Fs.rename, .{ root_ino, "/empty", "/empty/h2" })); // 挪进自己下面
+    try expectError(error.InvalidName, fs.run(Fs.rename, .{ root_ino, "/d2", "/d2/x" }));
+    try expectError(error.InvalidName, fs.run(Fs.rename, .{ root_ino, "/", "/x" }));
+    try expectError(error.InvalidName, fs.run(Fs.rename, .{ root_ino, "/victim", "/" }));
+    try expectError(error.InvalidName, fs.run(Fs.rename, .{ root_ino, "/victim", "/a/.." }));
+    try expectError(error.NotDir, fs.run(Fs.rename, .{ root_ino, "/victim", "/victim/x" }));
+    const long: [max_name + 1]u8 = @splat('x');
+    try expectError(error.NameTooLong, fs.run(Fs.rename, .{ root_ino, "/victim", &long }));
+    try expectEqual(gen, fs.vol.generation);
+    // 改成自己：什么都不做
+    try fs.run(Fs.rename, .{ root_ino, "/victim", "//victim/" });
+    try expectEqual(other, try fs.resolve(root_ino, "/victim"));
+    // 名字最长 255 字节
+    try fs.run(Fs.rename, .{ root_ino, "/victim", long[0..max_name] });
+    try expectEqual(other, try fs.resolve(root_ino, long[0..max_name]));
+    _ = try fs.check();
+}
+
 test "文件内容：内联、长大换成数据块、跨页、洞、覆盖、截断、删除后块都还回来" {
     var fs = try testSetup(512);
     defer testFree();
@@ -1016,7 +1137,8 @@ const FsCrashRun = struct {
     }
 };
 
-/// 对文件 i 做一个随机操作（不存在就创建；否则删除、截断、或者在随机位置写一段），同时改 next。
+/// 对文件 i 做一个随机操作（不存在就创建；否则删除、截断、改名成另一个文件 j（j 有的话换掉它），
+/// 或者在随机位置写一段），同时改 next。
 fn step(fs: *Fs, next: *FsModel, i: usize, path: []const u8, rng: std.Random, step_no: usize, data: []u8) !void {
     if (!next.exists[i]) {
         next.exists[i] = true;
@@ -1025,11 +1147,20 @@ fn step(fs: *Fs, next: *FsModel, i: usize, path: []const u8, rng: std.Random, st
     }
     const ino = try fs.resolve(root_ino, path);
     const f = &next.files[i];
-    switch (rng.uintLessThan(u8, 4)) {
+    switch (rng.uintLessThan(u8, 5)) {
         0 => {
             next.exists[i] = false;
             f.clearRetainingCapacity();
             try fs.run(Fs.unlink, .{ root_ino, path });
+        },
+        4 => {
+            const j = (i + 1 + rng.uintLessThan(usize, next.files.len - 1)) % next.files.len;
+            var jbuf: [16]u8 = undefined;
+            std.mem.swap(std.ArrayListUnmanaged(u8), f, &next.files[j]);
+            f.clearRetainingCapacity();
+            next.exists[i] = false;
+            next.exists[j] = true;
+            try fs.run(Fs.rename, .{ root_ino, path, fsPath(&jbuf, j) });
         },
         1 => {
             f.clearRetainingCapacity();

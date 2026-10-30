@@ -1,4 +1,4 @@
-//! 回归测试：文件系统的系统调用（open、read、write、mkdir、unlink、chdir、fstat、readdir）。
+//! 回归测试：文件系统的系统调用（open、read、write、mkdir、unlink、chdir、fstat、readdir、lseek、rename）。
 //! - `run t_fs`：正常情况和边界情况，失败的项打印 "FAIL: ..."，最后打印检查了几项、失败了几项。
 //!   所有东西建在 /t_fs 下面，结束时删干净（开始时也先删掉上一次留下的）。
 //! - `run t_fs churn &`：掉电测试的写的一方，一直写到被杀（或者 QEMU 被杀）：往 /churn.dat 末尾追加记录，
@@ -384,11 +384,185 @@ pub fn main() u8 {
         }
     }
 
+    testLseek();
+    testAppend();
+    testRename();
+
     removeTree("/t_fs");
     expect(sys.open("/t_fs", .{}) == error.NotFound, "everything removed", .{});
 
     sys.print("{d} checks, {d} failed\n", .{ checks, failures });
     return failures;
+}
+
+/// lseek：三种 whence、挪到末尾之后再写是洞、负的位置和坏的 whence、dup 出来的 fd 共用位置、
+/// 串口和管道不能挪、目录只能挪回 0 重新列。
+fn testLseek() void {
+    var buf: [64]u8 = undefined;
+    const fd = mustOpen("/t_fs/seek", .{ .write = true, .create = true });
+    defer sys.close(fd) catch {};
+    _ = writeAll(fd, "0123456789");
+    expect((sys.lseek(fd, 3, .set) catch 99) == 3, "lseek set", .{});
+    var n = sys.read(fd, buf[0..4]) catch 0;
+    expect(n == 4 and std.mem.eql(u8, buf[0..4], "3456"), "read after lseek set: \"{s}\"", .{buf[0..n]});
+    expect((sys.lseek(fd, -2, .cur) catch 99) == 5, "lseek cur -2", .{});
+    expect((sys.lseek(fd, 0, .cur) catch 99) == 5, "lseek cur 0 tells the position", .{});
+    expect((sys.lseek(fd, -1, .end) catch 99) == 9, "lseek end -1", .{});
+    n = sys.read(fd, &buf) catch 0;
+    expect(n == 1 and buf[0] == '9', "read the last byte", .{});
+    expect((sys.read(fd, &buf) catch 99) == 0, "read at the end", .{});
+    // 挪到末尾之后再写：中间是 0
+    expect((sys.lseek(fd, 5, .end) catch 99) == 15, "lseek past the end", .{});
+    _ = writeAll(fd, "X");
+    expect(sizeOf(fd) == 16, "size after writing past the end: {d}", .{sizeOf(fd)});
+    _ = sys.lseek(fd, 8, .set) catch 0;
+    n = sys.read(fd, &buf) catch 0;
+    expect(n == 8 and std.mem.eql(u8, buf[0..8], "89\x00\x00\x00\x00\x00X"), "the hole reads as zeros", .{});
+    // 出错时位置不变
+    _ = sys.lseek(fd, 4, .set) catch 0;
+    expect(sys.lseek(fd, -5, .cur) == error.InvalidArgument, "lseek to a negative position", .{});
+    expect(sys.lseek(fd, -17, .end) == error.InvalidArgument, "lseek before the start from the end", .{});
+    expect(sys.syscall(.lseek, fd, 0, 3) == sys.abi.fail(.inval), "lseek with a bad whence", .{});
+    expect(sys.lseek(fd, std.math.maxInt(i64), .set) catch 0 == std.math.maxInt(i64), "lseek to the largest position", .{});
+    expect(sys.lseek(fd, 1, .cur) == error.InvalidArgument, "lseek past the largest position", .{});
+    expect(sys.write(fd, "x") == error.FileTooBig, "write at the largest position", .{});
+    _ = sys.lseek(fd, 4, .set) catch 0;
+    // dup 出来的 fd 共用位置
+    const d = sys.dup(fd) catch fd;
+    _ = sys.lseek(d, 2, .set) catch 0;
+    n = sys.read(fd, buf[0..1]) catch 0;
+    expect(n == 1 and buf[0] == '2', "dup shares the position with lseek", .{});
+    if (d != fd) sys.close(d) catch {};
+    // 串口、管道、坏 fd
+    expect(sys.lseek(sys.stdout, 0, .set) == error.NotSeekable, "lseek the console", .{});
+    const p = sys.pipe() catch .{ 0, 0 };
+    expect(sys.lseek(p[0], 0, .set) == error.NotSeekable, "lseek a pipe", .{});
+    sys.close(p[0]) catch {};
+    sys.close(p[1]) catch {};
+    expect(sys.lseek(99, 0, .set) == error.BadFd, "lseek a bad fd", .{});
+    // 目录：lseek(0, set) 从头再列一遍
+    const dir = mustOpen("/t_fs", .{});
+    defer sys.close(dir) catch {};
+    var ent: sys.abi.Dirent = undefined;
+    var first: usize = 0;
+    while (sys.readdir(dir, &ent) catch false) first += 1;
+    expect((sys.lseek(dir, 0, .set) catch 99) == 0, "rewind a directory", .{});
+    var second: usize = 0;
+    while (sys.readdir(dir, &ent) catch false) second += 1;
+    expect(first > 0 and first == second, "readdir after rewinding: {d} then {d}", .{ first, second });
+    expect(sys.lseek(dir, 1, .set) == error.InvalidArgument, "lseek a directory elsewhere", .{});
+    expect(sys.lseek(dir, 0, .end) == error.InvalidArgument, "lseek a directory from the end", .{});
+}
+
+/// O_APPEND：lseek 到开头再写也写在末尾；几个进程各自 open（不共用位置）同时追加，记录不丢、不互相覆盖。
+fn testAppend() void {
+    var buf: [64]u8 = undefined;
+    {
+        const fd = mustOpen("/t_fs/log", .{ .write = true, .create = true, .append = true });
+        defer sys.close(fd) catch {};
+        _ = writeAll(fd, "one ");
+        _ = sys.lseek(fd, 0, .set) catch 0;
+        _ = writeAll(fd, "two ");
+        expect((sys.lseek(fd, 0, .cur) catch 0) == 8, "position after an append is the end", .{});
+        // 别的 fd 把文件写长了，追加的照样接在后面
+        const other = mustOpen("/t_fs/log", .{ .write = true });
+        _ = sys.lseek(other, 0, .end) catch 0;
+        _ = writeAll(other, "three ");
+        sys.close(other) catch {};
+        _ = writeAll(fd, "four");
+        const n = readAll("/t_fs/log", &buf, 64);
+        expect(std.mem.eql(u8, buf[0..n], "one two three four"), "appended: \"{s}\"", .{buf[0..n]});
+        // 不能写的 fd 带着 append 也不能写
+        const ro = mustOpen("/t_fs/log", .{ .append = true });
+        expect(sys.write(ro, "x") == error.BadFd, "append on a read-only fd", .{});
+        sys.close(ro) catch {};
+    }
+    // 4 个进程各自打开同一个文件追加：没有 append 的话各自从 0 开始写，会互相覆盖
+    const procs = 4;
+    const records = 25;
+    const rec = 50;
+    var pids: [procs]usize = undefined;
+    for (&pids, 0..) |*pid, k| {
+        pid.* = fork();
+        if (pid.* != 0) continue;
+        const fd = sys.open("/t_fs/appends", .{ .write = true, .create = true, .append = true }) catch sys.exit(1);
+        var r: [rec]u8 = @splat(@intCast('a' + k));
+        for (0..records) |j| {
+            r[1] = @intCast(j);
+            if (!writeAll(fd, &r)) sys.exit(2);
+            if (j % 5 == 0) sys.yield();
+        }
+        sys.exit(0);
+    }
+    var ok = true;
+    for (pids) |pid| ok = ok and waitStatus(pid) == 0;
+    expect(ok, "appenders exited with 0", .{});
+    const n = readAll("/t_fs/appends", &read_buf, read_buf.len);
+    var next: [procs]u8 = @splat(0);
+    var bad: usize = 0;
+    var i: usize = 0;
+    while (i + rec <= n) : (i += rec) {
+        const r = read_buf[i..][0..rec];
+        const k = r[0] -% 'a';
+        if (k >= procs or r[1] != next[k] or !std.mem.allEqual(u8, r[2..], r[0])) {
+            bad += 1;
+            continue;
+        }
+        next[k] += 1;
+    }
+    expect(n == procs * records * rec and bad == 0, "appended records: {d} bytes, {d} bad", .{ n, bad });
+}
+
+/// rename：改名、换目录、换掉已有的文件；打开着的 fd、当前目录在改名之后照常；各种错误。
+fn testRename() void {
+    var buf: [64]u8 = undefined;
+    sys.mkdir("/t_fs/r") catch {};
+    sys.mkdir("/t_fs/r/sub") catch {};
+    {
+        const fd = mustOpen("/t_fs/r/a", .{ .write = true, .create = true });
+        _ = writeAll(fd, "aaa");
+        sys.close(fd) catch {};
+    }
+    expect(sys.rename("/t_fs/r/a", "/t_fs/r/b") != error.NotFound, "rename in the same directory", .{});
+    expect(sys.open("/t_fs/r/a", .{}) == error.NotFound, "old name is gone", .{});
+    expect(readAll("/t_fs/r/b", &buf, 64) == 3, "new name has the content", .{});
+    // 打开着的 fd 改名之后照常读写
+    const fd = mustOpen("/t_fs/r/b", .{ .read = true, .write = true });
+    expect(sys.rename("/t_fs/r/b", "/t_fs/r/sub/c") != error.NotFound, "rename into another directory", .{});
+    _ = sys.lseek(fd, 0, .end) catch 0;
+    expect(writeAll(fd, "+fd"), "write through an fd after rename", .{});
+    sys.close(fd) catch {};
+    var n = readAll("/t_fs/r/sub/c", &buf, 64);
+    expect(std.mem.eql(u8, buf[0..n], "aaa+fd"), "content after rename: \"{s}\"", .{buf[0..n]});
+    // 当前目录的上一级被改名：当前目录照常，.. 走到新名字
+    sys.chdir("/t_fs/r/sub") catch {};
+    expect(sys.rename("/t_fs/r", "/t_fs/r2") != error.NotFound, "rename the parent of the cwd", .{});
+    expect(readAll("c", &buf, 64) == 6, "relative path after the parent was renamed", .{});
+    expect(readAll("../sub/c", &buf, 64) == 6, ".. after the parent was renamed", .{});
+    sys.chdir("/") catch {};
+    // 换掉已有的文件
+    {
+        const f = mustOpen("/t_fs/r2/old", .{ .write = true, .create = true });
+        _ = writeAll(f, "old");
+        sys.close(f) catch {};
+    }
+    expect(sys.rename("/t_fs/r2/sub/c", "/t_fs/r2/old") != error.NotFound, "rename over an existing file", .{});
+    n = readAll("/t_fs/r2/old", &buf, 64);
+    expect(std.mem.eql(u8, buf[0..n], "aaa+fd"), "replaced file: \"{s}\"", .{buf[0..n]});
+    // 错误
+    sys.mkdir("/t_fs/r2/d") catch {};
+    expect(sys.rename("/t_fs/r2/nope", "/t_fs/r2/x") == error.NotFound, "rename a missing file", .{});
+    expect(sys.rename("/t_fs/r2", "/t_fs/r2/sub/r2") == error.InvalidArgument, "rename a directory into itself", .{});
+    expect(sys.rename("/t_fs/r2/old", "/t_fs/r2/d") == error.IsDir, "rename a file over a directory", .{});
+    expect(sys.rename("/t_fs/r2/d", "/t_fs/r2/old") == error.NotDir, "rename a directory over a file", .{});
+    expect(sys.rename("/t_fs/r2/sub", "/t_fs") == error.NotEmpty, "rename over a non-empty directory", .{});
+    expect(sys.rename("/t_fs/r2/old", "/") == error.InvalidArgument, "rename to /", .{});
+    expect(sys.rename(@as([*]const u8, @ptrFromInt(0x8020_0000))[0..4], "/x") == error.BadAddress, "rename from a kernel pointer", .{});
+    const long: [sys.abi.max_path + 1]u8 = @splat('x');
+    expect(sys.rename("/t_fs/r2/old", &long) == error.NameTooLong, "rename to a 257-byte path", .{});
+    // sub 里的 c 已经挪走了，是空的：目录可以换掉它
+    expect(if (sys.rename("/t_fs/r2/d", "/t_fs/r2/sub")) |_| true else |_| false, "rename a directory over an empty one", .{});
+    expect(sys.open("/t_fs/r2/d", .{}) == error.NotFound, "old name of the directory is gone", .{});
 }
 
 // ---- 掉电测试 ----

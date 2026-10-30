@@ -36,22 +36,26 @@ pub const File = struct {
     pipe: *pipe.Pipe = undefined,
     ino: u64 = 0,                // .inode：文件系统里的 inode 号
     off: u64 = 0,                // .inode：下一次读写的位置（fsys.lock 保护）
+    append: bool = false,        // .inode：open_append，每次写之前先把 off 挪到文件末尾
 };
 
 pub fn openConsole() error{TooManyFiles}!*File
 pub fn openPipe() error{ TooManyFiles, OutOfMemory }![2]*File   // { 读端, 写端 }
-pub fn openInode(ino: u64, readable: bool, writable: bool) error{TooManyFiles}!*File
+pub fn openInode(ino: u64, readable: bool, writable: bool, append: bool) error{TooManyFiles}!*File
 pub fn dup(f: *File) *File
 pub fn close(f: *File) void
 pub fn read(f: *File, space: *vm.PageTable, ptr: usize, len: usize) Error!usize
 pub fn write(f: *File, space: *vm.PageTable, ptr: usize, len: usize) Error!usize
+pub fn seek(f: *File, offset: i64, whence: usize) Error!u64
 ```
 
 - 文件表由 `file.lock` 保护：分配槽位（`alloc`）、改引用数（`dup`、`close`）都要拿它。`File` 的其他字段分配出来之后就不变了，读写时不用拿锁；只有 `off` 会变，由文件系统的锁 `fsys.lock` 保护（读写文件的整个过程都拿着它）。
 - **`close` 先放开文件表的锁，再去关管道**：管道有自己的锁，这样两把锁不会嵌套，就不用规定加锁顺序。最后一个引用关掉时，先把槽位清空（别的进程马上就能用），再关底下的东西。
 - `openPipe` 先分配两个 `File`，再分配 `Pipe`；任何一步失败，`errdefer` 把已经分配的还回去。
 - `read`/`write` 先检查方向（`readable`/`writable`，不对是 `NotReadable`/`NotWritable`，系统调用返回 `-EBADF`），再按 `kind` 分给串口、管道或文件系统。`Error` 包含文件系统的错误（`fs.Error`），系统调用用 `fsys.errno` 换成错误码。
-- **文件的读写**（`inodeRead`、`inodeWrite`）：拿 `fsys.lock`，从 `off` 开始 `fs.read` 或 `fs.run(Fs.write, ...)`，数据直接在缓冲区和用户内存之间复制；成功了 `off` 加上读写的字节数。一次 `write` 是一个事务：中途用户内存读不出来、磁盘满了，什么都不写、`off` 不动（串口、管道是写出多少算多少）。读到文件末尾返回 0。读写目录是 `IsDir`（列目录用 `readdir` 系统调用）。打开着的文件被别人删了，之后读写是 `NotFound`（[fs.md](fs.md#目录)）。
+- **文件的读写**（`inodeRead`、`inodeWrite`）：拿 `fsys.lock`，从 `off` 开始 `fs.read` 或 `fs.run(Fs.write, ...)`，数据直接在缓冲区和用户内存之间复制；成功了 `off` 加上读写的字节数。一次 `write` 是一个事务：中途用户内存读不出来、磁盘满了，什么都不写、`off` 不动（串口、管道是写出多少算多少）。读到文件末尾返回 0。读写目录是 `IsDir`（列目录用 `readdir` 系统调用）。打开着的文件被别人删了，之后读写是 `NotFound`（[fs.md](fs.md#目录)）；被改名了照常（inode 号不变）。
+- **追加**（`open_append`）：`inodeWrite` 在同一次 `fsys.lock` 里先 `stat` 出文件长度、从那里写，写完 `off` 挪到新的末尾；写失败 `off` 不动。查长度和写之间别人插不进来，所以几个进程各自 `open` 同一个文件追加，记录不会互相覆盖（不带 `open_append` 的话各自从 0 写起，会互相覆盖）。`t_fs` 用 4 个进程测过。
+- **挪位置**（`seek`，`lseek` 系统调用）：拿着 `fsys.lock` 改 `off`（`dup`、`fork` 共用的 `File` 一起变）。`whence` 是 `seek_set`/`seek_cur`/`seek_end`（从 0、当前位置、文件长度算），`offset` 是有符号的；新位置是负的、超过 `maxInt(i64)`（返回值要能当成非负的有符号数，不会和错误码混淆）、`whence` 不对，都是 `InvalidArgument`（`-EINVAL`），位置不变。可以挪到文件末尾之后：读是 0 字节，写的话中间是洞（读出来是 0）。串口、管道没有位置，是 `NotSeekable`（`-ESPIPE`）。目录的 `off` 是 `readdir` 的 cookie，不是字节位置，只允许 `lseek(fd, 0, seek_set)`，从头再列一遍。
 
 **谁打开、谁关掉**：
 
@@ -158,7 +162,7 @@ pub fn close(p: *Pipe, writable: bool) void {
 
 ## 限制和以后可以做的
 
-- 没有 `lseek`、`pread`：文件的读写位置只能从 0 往后挪。
+- 没有 `pread`/`pwrite`：要在某个位置读写得先 `lseek`。
 - 没有 `dup2`，重定向靠“`close` 再 `dup`，拿到编号最小的空闲 fd”。
 - 没有非阻塞读写，没有 `poll`/`select`。
 - 没有信号：写一个读端已经关了的管道只返回 `-EPIPE`，程序自己决定怎么办。

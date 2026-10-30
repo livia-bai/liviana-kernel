@@ -19,6 +19,7 @@ const proc = @import("proc.zig");
 const pipe = @import("pipe.zig");
 const fsys = @import("fsys.zig");
 const fs = @import("fs.zig");
+const abi = @import("abi.zig");
 const Spinlock = @import("spinlock.zig").Spinlock;
 
 /// 整个系统最多同时有多少个打开的文件。每个进程最多 abi.max_fds 个 fd，但它们大多指向同一个串口。
@@ -36,12 +37,14 @@ pub const File = struct {
     /// kind 为 inode 时：文件系统里的 inode 号，和下一次读写的位置（fsys.lock）
     ino: u64 = 0,
     off: u64 = 0,
+    /// open_append：每次写之前先把 off 挪到文件末尾
+    append: bool = false,
 };
 
 var lock: Spinlock = .init("file");
 var table: [max_files]File = @splat(.{});
 
-pub const Error = error{ NotReadable, NotWritable, BadAddress, BrokenPipe } || fs.Error;
+pub const Error = error{ NotReadable, NotWritable, BadAddress, BrokenPipe, NotSeekable, InvalidArgument } || fs.Error;
 
 /// 分配一个空的 File（ref = 1），由调用方填好其他字段。
 fn alloc() error{TooManyFiles}!*File {
@@ -78,12 +81,13 @@ pub fn openPipe() error{ TooManyFiles, OutOfMemory }![2]*File {
 }
 
 /// 打开文件系统里的 inode ino，读写位置从 0 开始。
-pub fn openInode(ino: u64, readable: bool, writable: bool) error{TooManyFiles}!*File {
+pub fn openInode(ino: u64, readable: bool, writable: bool, append: bool) error{TooManyFiles}!*File {
     const f = try alloc();
     f.kind = .inode;
     f.ino = ino;
     f.readable = readable;
     f.writable = writable;
+    f.append = append;
     return f;
 }
 
@@ -163,13 +167,44 @@ fn inodeRead(f: *File, space: *vm.PageTable, ptr: usize, len: usize) Error!usize
     return n;
 }
 
-/// 写到文件当前的位置，位置往后挪。整个写是一个事务：用户内存中途读不出来、磁盘满了，什么都不写。
+/// 写到文件当前的位置（open_append 的是文件末尾），位置挪到写完的地方。整个写是一个事务：
+/// 用户内存中途读不出来、磁盘满了，什么都不写，位置也不动。
+/// 查文件末尾和写拿着同一次 fsys.lock，几个进程同时往末尾追加不会写到同一个位置上。
 fn inodeWrite(f: *File, space: *vm.PageTable, ptr: usize, len: usize) Error!usize {
     const root = try fsys.get();
     defer fsys.unlock();
-    const n = try root.run(fsys.Fs.write, .{ f.ino, f.off, len, fsys.UserIn{ .space = space, .ptr = ptr } });
-    f.off += n;
+    const off = if (f.append) (try root.stat(f.ino)).size else f.off;
+    const n = try root.run(fsys.Fs.write, .{ f.ino, off, len, fsys.UserIn{ .space = space, .ptr = ptr } });
+    f.off = off + n;
     return n;
+}
+
+/// 挪文件的读写位置（lseek）：whence 是 abi.seek_*，offset 是有符号的。返回新的位置。
+/// 串口、管道没有位置（NotSeekable）；目录的位置是 readdir 的 cookie，只能挪回 0（从头再列）。
+/// 新的位置不能是负的，可以在文件末尾之后。
+pub fn seek(f: *File, offset: i64, whence: usize) Error!u64 {
+    if (f.kind != .inode) return error.NotSeekable;
+    const root = try fsys.get();
+    defer fsys.unlock();
+    const st = try root.stat(f.ino);
+    if (st.kind == .dir) {
+        if (whence != abi.seek_set or offset != 0) return error.InvalidArgument;
+        f.off = 0;
+        return 0;
+    }
+    const base: u64 = switch (whence) {
+        abi.seek_set => 0,
+        abi.seek_cur => f.off,
+        abi.seek_end => st.size,
+        else => return error.InvalidArgument,
+    };
+    const new = if (offset >= 0)
+        std.math.add(u64, base, @intCast(offset)) catch return error.InvalidArgument
+    else
+        std.math.sub(u64, base, @abs(offset)) catch return error.InvalidArgument;
+    if (new > std.math.maxInt(i64)) return error.InvalidArgument; // 返回值要能当成非负的有符号数
+    f.off = new;
+    return new;
 }
 
 /// Ctrl-D：在串口上表示“输入结束”，和 Unix 终端一样。

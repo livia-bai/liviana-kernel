@@ -68,7 +68,7 @@ liviana-kernel 的详细文档，按功能组织，讲这个用 Zig 写的 RISC-
 | `user/sh.zig` | [shell.md](shell.md) | [user-programs.md](user-programs.md#init-和-sh) |
 | `user/hello.zig`、`user/fault.zig`、`user/spin.zig`、`user/ticker.zig` | [user-programs.md](user-programs.md#示例程序) | |
 | `user/echo.zig`、`user/cat.zig`、`user/wc.zig` | [user-programs.md](user-programs.md#echocatwc) | [shell.md](shell.md#管道) |
-| `user/ls.zig`、`user/mkdir.zig`、`user/rm.zig` | [user-programs.md](user-programs.md#lsmkdirrm) | [fs.md](fs.md) |
+| `user/ls.zig`、`user/mkdir.zig`、`user/rm.zig`、`user/mv.zig` | [user-programs.md](user-programs.md#lsmkdirrmmv) | [fs.md](fs.md) |
 | `user/scrub.zig` | [user-programs.md](user-programs.md#scrub) | [fs.md](fs.md#检查整个文件系统checkscrub) |
 | `user/tests/*.zig`、`user/tests/noperm.ld` | [testing.md](testing.md#回归测试程序) | [build.md](build.md#用户程序) |
 | `src/tests.zig` | [testing.md](testing.md#单元测试zig-build-test) | [build.md](build.md#单元测试) |

@@ -27,7 +27,7 @@ pub const Syscall = enum(usize) {
     close = 17, dup = 18, pipe = 19, sbrk = 20,
     blockcount = 21, readblock = 22, writeblock = 23,
     open = 24, mkdir = 25, unlink = 26, chdir = 27, fstat = 28, readdir = 29,
-    scrub = 30,
+    scrub = 30, rename = 31, lseek = 32,
     _,
 };
 
@@ -51,9 +51,11 @@ pub const Errno = enum(usize) {
     again = 11,   // EAGAIN：进程表满了（fork）
     nomem = 12,   // ENOMEM：物理内存不够（fork、exec、pipe），或者堆不能再长了（sbrk）
     fault = 14,   // EFAULT：指针指向的内存不属于用户空间、没有映射，或者要写的页不可写
-    inval = 22,   // EINVAL：参数不对（wait 的 options，sbrk 缩到堆的起点下面，块号超出原始区域，open 的 flags，名字是 "."、".."）
+    inval = 22,   // EINVAL：参数不对（wait 的 options，sbrk 缩到堆的起点下面，块号超出原始区域，open 的 flags，名字是 "."、".."，
+                  //         rename 把目录挪进它自己下面，lseek 到负的位置、坏的 whence）
     nfile = 23,   // ENFILE：系统的文件表满了（pipe）
     mfile = 24,   // EMFILE：进程的 fd 表满了（dup、pipe）
+    spipe = 29,   // ESPIPE：lseek 串口、管道
     pipe = 32,    // EPIPE：管道的读端都关了（write）
     nosys = 38,   // ENOSYS：没有这个系统调用
     _,
@@ -119,13 +121,15 @@ pub fn errnoOf(ret: usize) ?Errno      // 返回值在 [-4095, -1] 内时取出�
 | 21 | `blockcount` | 无 | 磁盘的原始区域（文件系统之后的块）有多少块，没有磁盘时是 0 | 每块 `abi.block_size` = 4096 字节（[disk.md](disk.md#系统调用)） |
 | 22 | `readblock` | `a0` = 块号，`a1` = 缓冲区地址 | 0；`-EINVAL`（块号超出原始区域）、`-ENODEV`、`-EFAULT` | 经过缓冲区缓存读原始区域的一块，4096 字节写进缓冲区 |
 | 23 | `writeblock` | `a0` = 块号，`a1` = 缓冲区地址 | 0；`-EINVAL`、`-ENODEV`、`-EFAULT` | 缓冲区的 4096 字节写到原始区域的这一块，写完才返回 |
-| 24 | `open` | `a0` = 路径地址，`a1` = 路径长度，`a2` = flags | 新的 fd；`-ENOENT`、`-ENOTDIR`、`-EISDIR`、`-EEXIST`、`-ENAMETOOLONG`、`-EINVAL`、`-ENOSPC`、`-EIO`、`-ENODEV`、`-EFAULT`、`-ENFILE`、`-EMFILE` | 打开文件或目录（[fs.md](fs.md#接进内核fsyszig)）。flags：`open_read`/`open_write`/`open_rdwr` 加上 `open_create`（没有就建一个空文件）、`open_trunc`（可写时截成 0 字节）；别的位、读写方式是 3 都是 `-EINVAL`。目录只能只读地打开。相对路径从当前目录开始 |
+| 24 | `open` | `a0` = 路径地址，`a1` = 路径长度，`a2` = flags | 新的 fd；`-ENOENT`、`-ENOTDIR`、`-EISDIR`、`-EEXIST`、`-ENAMETOOLONG`、`-EINVAL`、`-ENOSPC`、`-EIO`、`-ENODEV`、`-EFAULT`、`-ENFILE`、`-EMFILE` | 打开文件或目录（[fs.md](fs.md#接进内核fsyszig)）。flags：`open_read`/`open_write`/`open_rdwr` 加上 `open_create`（没有就建一个空文件）、`open_trunc`（可写时截成 0 字节）、`open_append`（0x800，每次写都写在末尾）；别的位、读写方式是 3 都是 `-EINVAL`。目录只能只读地打开。相对路径从当前目录开始 |
 | 25 | `mkdir` | `a0` = 路径地址，`a1` = 路径长度 | 0；`-EEXIST`、`-ENOENT`、`-ENOTDIR`、`-EINVAL`、`-ENAMETOOLONG`、`-ENOSPC` 等 | 建一个空目录 |
 | 26 | `unlink` | 同上 | 0；`-ENOENT`、`-ENOTEMPTY`、`-EINVAL` 等 | 删掉一个文件或空目录。打开着它的 fd 之后读写是 `-ENOENT` |
 | 27 | `chdir` | 同上 | 0；`-ENOENT`、`-ENOTDIR` 等 | 换当前目录（`Process.cwd`，`fork` 继承） |
 | 28 | `fstat` | `a0` = fd，`a1` = `Stat` 的地址 | 0；`-EBADF`、`-EFAULT`、`-ENOENT` | inode 号、长度、种类。串口、管道的 inode 号和长度是 0 |
 | 29 | `readdir` | `a0` = fd，`a1` = `Dirent` 的地址 | 1；列完了是 0；`-EBADF`、`-ENOTDIR`、`-EFAULT` | 目录的下一项（不含 `.`、`..`），按名字的散列排序。读写位置就是 `fs.readdir` 的 cookie，结果写进用户内存成功了才往后挪 |
 | 30 | `scrub` | `a0` = `ScrubInfo` 的地址 | 0；`-EIO`（文件系统坏了）、`-ENODEV`、`-EFAULT` | 检查整个文件系统：作废缓冲区缓存，B 树、每个数据块的校验和、条目之间的关系都核对一遍，只读不改（[fs.md](fs.md#检查整个文件系统checkscrub)）。统计（文件数、目录数、数据块数、B 树的节点数、条目数、层数、空闲块数、总块数、事务号）写进 `a0` 指向的地方 |
+| 31 | `rename` | `a0`、`a1` = 旧路径的地址、长度，`a2`、`a3` = 新路径的地址、长度 | 0；`-ENOENT`、`-ENOTDIR`、`-EISDIR`、`-ENOTEMPTY`、`-EINVAL`、`-ENAMETOOLONG`、`-ENOSPC`、`-EIO`、`-ENODEV`、`-EFAULT` | 改名，可以换目录，一个事务做完（[fs.md](fs.md#改名rename)）。新名字已经有了的话换掉它：文件换掉文件，目录换掉空目录（不空是 `-ENOTEMPTY`）；目录换文件是 `-ENOTDIR`，文件换目录是 `-EISDIR`；目录挪进它自己下面是 `-EINVAL`。打开着的 fd、当前目录照常能用 |
+| 32 | `lseek` | `a0` = fd，`a1` = 偏移（有符号），`a2` = whence（`seek_set`、`seek_cur`、`seek_end`） | 新的位置；`-EBADF`、`-ESPIPE`（串口、管道）、`-EINVAL`（负的位置、坏的 whence、目录挪到 0 以外）、`-ENOENT` | 挪文件的读写位置（[files.md](files.md#文件表)），可以挪到末尾之后。`lseek(fd, 0, seek_cur)` 查当前位置；目录只能 `lseek(fd, 0, seek_set)` 从头再列 |
 | 其他 | | | `-ENOSYS` | |
 
 ### 分发
@@ -285,15 +289,18 @@ pub fn uptime() u64
 pub fn yield() void
 pub fn sleep(ms: u64) void
 pub fn read(fd: Fd, buf: []u8) error{ BadAddress, BadFd, IsDir, IoError, NotFound, Unexpected }!usize
-pub fn open(path: []const u8, flags: OpenFlags) FsError!Fd   // OpenFlags{ read = true, write, create, truncate }
+pub fn open(path: []const u8, flags: OpenFlags) FsError!Fd   // OpenFlags{ read = true, write, create, truncate, append }
 pub fn mkdir(path: []const u8) FsError!void
 pub fn unlink(path: []const u8) FsError!void
 pub fn chdir(path: []const u8) FsError!void
 pub fn fstat(fd: Fd) FsError!abi.Stat
 pub fn readdir(fd: Fd, ent: *abi.Dirent) FsError!bool        // 列完了是 false
 pub fn scrub() FsError!abi.ScrubInfo                         // 坏了是 IoError
+pub fn rename(old: []const u8, new: []const u8) FsError!void
+pub fn lseek(fd: Fd, offset: i64, whence: Whence) FsError!u64 // Whence = enum { set, cur, end }；串口、管道是 NotSeekable
 // FsError = error{ NotFound, Exists, NotDir, IsDir, NotEmpty, NameTooLong, InvalidArgument, NoSpace,
-//                  FileTooBig, IoError, NoDevice, BadAddress, BadFd, TooManyOpenFiles, SystemFdQuotaExceeded, Unexpected }
+//                  FileTooBig, IoError, NoDevice, BadAddress, BadFd, TooManyOpenFiles, SystemFdQuotaExceeded,
+//                  NotSeekable, Unexpected }
 pub fn close(fd: Fd) error{ BadFd, Unexpected }!void
 pub fn dup(fd: Fd) error{ BadFd, TooManyOpenFiles, Unexpected }!Fd
 pub fn pipe() error{ TooManyOpenFiles, SystemFdQuotaExceeded, OutOfMemory, Unexpected }![2]Fd   // { 读端, 写端 }

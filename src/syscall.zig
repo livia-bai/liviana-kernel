@@ -54,6 +54,8 @@ pub fn dispatch(frame: *TrapFrame) usize {
         .fstat => fstat(args[0], args[1]),
         .readdir => readdir(args[0], args[1]),
         .scrub => scrub(args[0]),
+        .rename => rename(args[0], args[1], args[2], args[3]),
+        .lseek => lseek(args[0], args[1], args[2]),
         _ => abi.fail(.nosys),
     };
 }
@@ -101,6 +103,8 @@ fn fileError(err: file.Error) usize {
     return abi.fail(switch (err) {
         error.NotReadable, error.NotWritable => .badf,
         error.BrokenPipe => .pipe,
+        error.NotSeekable => .spipe,
+        error.InvalidArgument => .inval,
         else => fsys.errno(err), // 文件系统里的文件：磁盘满了、读到坏块等
     });
 }
@@ -215,7 +219,7 @@ fn userPath(ptr: usize, len: usize, buf: *[abi.max_path]u8) error{ NameTooLong, 
 /// 打开路径 path，返回 fd（见 abi.Syscall.open）。
 fn open(path_ptr: usize, path_len: usize, flags: usize) usize {
     const access = flags & 3;
-    if (access == 3 or flags & ~(3 | abi.open_create | abi.open_trunc) != 0) return abi.fail(.inval);
+    if (access == 3 or flags & ~(3 | abi.open_create | abi.open_trunc | abi.open_append) != 0) return abi.fail(.inval);
     const readable = access != abi.open_write;
     const writable = access != abi.open_read;
     var buf: [abi.max_path]u8 = undefined;
@@ -226,7 +230,7 @@ fn open(path_ptr: usize, path_len: usize, flags: usize) usize {
         return abi.fail(fsys.errno(err));
     };
     fsys.unlock();
-    const f = file.openInode(ino, readable, writable) catch return abi.fail(.nfile);
+    const f = file.openInode(ino, readable, writable, flags & abi.open_append != 0) catch return abi.fail(.nfile);
     return installFd(f) orelse {
         file.close(f);
         return abi.fail(.mfile);
@@ -264,6 +268,23 @@ fn pathOp(path_ptr: usize, path_len: usize, op: PathOp) usize {
         },
     }
     return 0;
+}
+
+/// 两个路径都先复制进内核，再拿着 fsys.lock 一个事务改名（fs.Fs.rename）。
+fn rename(old_ptr: usize, old_len: usize, new_ptr: usize, new_len: usize) usize {
+    var old_buf: [abi.max_path]u8 = undefined;
+    var new_buf: [abi.max_path]u8 = undefined;
+    const old = userPath(old_ptr, old_len, &old_buf) catch |err| return abi.fail(fsys.errno(err));
+    const new = userPath(new_ptr, new_len, &new_buf) catch |err| return abi.fail(fsys.errno(err));
+    const root = fsys.get() catch return abi.fail(.nodev);
+    defer fsys.unlock();
+    root.run(Fs.rename, .{ proc.current().?.cwd, old, new }) catch |err| return abi.fail(fsys.errno(err));
+    return 0;
+}
+
+fn lseek(fd: usize, offset: usize, whence: usize) usize {
+    const f = fileOf(fd) orelse return abi.fail(.badf);
+    return file.seek(f, @bitCast(offset), whence) catch |err| fileError(err);
 }
 
 fn fstat(fd: usize, ptr: usize) usize {

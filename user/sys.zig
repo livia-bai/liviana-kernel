@@ -126,6 +126,8 @@ pub const FsError = error{
     BadFd,
     TooManyOpenFiles,
     SystemFdQuotaExceeded,
+    /// lseek 串口、管道
+    NotSeekable,
     Unexpected,
 };
 
@@ -147,6 +149,7 @@ fn fsResult(ret: usize) FsError!usize {
         .badf => error.BadFd,
         .mfile => error.TooManyOpenFiles,
         .nfile => error.SystemFdQuotaExceeded,
+        .spipe => error.NotSeekable,
         else => error.Unexpected,
     };
 }
@@ -158,11 +161,14 @@ pub const OpenFlags = struct {
     create: bool = false,
     /// 截成 0 字节（要能写）
     truncate: bool = false,
+    /// 每次写都写在文件末尾
+    append: bool = false,
 
     fn bits(f: OpenFlags) usize {
         var b: usize = if (f.read and f.write) abi.open_rdwr else if (f.write) abi.open_write else abi.open_read;
         if (f.create) b |= abi.open_create;
         if (f.truncate) b |= abi.open_trunc;
+        if (f.append) b |= abi.open_append;
         return b;
     }
 };
@@ -191,6 +197,18 @@ pub fn fstat(fd: Fd) FsError!abi.Stat {
     var st: abi.Stat = undefined;
     _ = try fsResult(syscall(.fstat, fd, @intFromPtr(&st), 0));
     return st;
+}
+
+/// 把 old 改名成 new（见 abi.Syscall.rename）。
+pub fn rename(old: []const u8, new: []const u8) FsError!void {
+    _ = try fsResult(syscall4(.rename, @intFromPtr(old.ptr), old.len, @intFromPtr(new.ptr), new.len));
+}
+
+pub const Whence = enum(usize) { set = abi.seek_set, cur = abi.seek_cur, end = abi.seek_end };
+
+/// 挪 fd 的读写位置，返回新的位置（见 abi.Syscall.lseek）。
+pub fn lseek(fd: Fd, offset: i64, whence: Whence) FsError!u64 {
+    return fsResult(syscall(.lseek, fd, @bitCast(offset), @backingInt(whence)));
 }
 
 /// 检查整个文件系统（见 abi.Syscall.scrub）。坏了是 IoError。
