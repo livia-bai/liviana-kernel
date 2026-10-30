@@ -75,7 +75,7 @@ python3 tools/qemu_test.py --list      # 列出 QEMU 测试的用例和它们覆
 - 自旋锁（`src/spinlock.zig`）只在关中断时拿；调用 `proc.sched` 时只能拿着这个进程自己的锁，回到 U 模式时不能拿着任何锁（`sched`、`handleTrap`、`forkretC` 会检查）。嵌套加锁按固定顺序：`wait_lock` → 进程锁 → 页分配器、文件表、串口输出这些叶子锁；`timer.lock`、管道锁、`uart.rx_lock`、`virtio_disk.lock`、`bio.lock`、睡眠锁里的自旋锁 → 进程锁；睡眠锁之间 `fsys.lock` → 缓冲区的睡眠锁。新加的嵌套要先对照这个顺序（[docs/process.md](docs/process.md#锁)）。
 - 睡眠锁（`src/sleeplock.zig`：文件系统的 `fsys.lock`、缓冲区缓存的每一块）只有进程能拿，拿它之前不能拿着自旋锁，拿着它可以睡觉；回到 U 模式时不能拿着（`proc.assertNoLocksHeld` 检查）。磁盘只能由进程读写：`virtio_disk.rw` 要睡着等中断，`kmain`、调度器、中断处理程序都不能读盘（[docs/disk.md](docs/disk.md)），所以文件系统由第一个进程在 `forkretC` 里挂载。
 - 文件系统的每个系统调用拿着 `fsys.lock` 做完，每个改动是一个事务（`fs.Fs.run`：成功提交、出错作废）；`readblock`/`writeblock` 只能碰文件系统之后的原始区域（`fsys.raw_base` 起）（[docs/fs.md](docs/fs.md#接进内核fsyszig)）。
-- 内核栈只有 16 KiB，B 树的操作已经用掉近 10 KiB（Debug）：不要按值传、按值复制大的结构体（`std.bit_set` 的方法按值接收整个位图，`x.* = y.*` 复制一整块都会先放到栈上），用指针和 `@memcpy`；改了文件系统要重新量一次栈（[docs/process.md](docs/process.md#进程表)）。
+- 内核栈只有 16 KiB，B 树的操作已经用掉近 10 KiB（Debug）：不要按值传、按值复制大的结构体（`std.bit_set` 的方法按值接收整个位图，`x.* = y.*` 复制一整块都会先放到栈上），用指针和 `@memcpy`；改了文件系统要重新量一次栈（[docs/process.md](docs/process.md#进程表)）。内核栈和启动栈最底下 256 字节是金丝雀（`src/canary.zig`），不能挪作他用；看到 `kernel stack overflow` 的 panic 就是栈用超了。
 - 进程结束时（`proc.finish`）关掉它所有的 fd，不能留给 `wait`：管道的写端不关，读的进程读不到结尾（[docs/process.md](docs/process.md#结束进程)）。
 - 用户地址空间只能用 Sv39 根页表的第 1 项（`vm.user_base..vm.user_end`），内核映射不能放进这个范围（[docs/paging.md](docs/paging.md#用户地址空间)）。内核页表启动后不再改，所有 hart 共用；一个用户地址空间同一时刻只在一个 hart 上用，改了它只刷当前 hart 的 TLB。
 - 内核碰用户内存只能通过 `vm.copyFromUser` 这类先查页表的函数，不要打开 `sstatus.SUM` 直接解引用用户指针（[docs/syscalls.md](docs/syscalls.md#访问用户内存)）。

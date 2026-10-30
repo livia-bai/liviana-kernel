@@ -214,6 +214,7 @@ dtc -I dtb -O dts virt.dtb
 | 内核 panic 停机后 QEMU 仍然占满一个 CPU 核 | `wfi` 被一直挂着的中断反复唤醒：停机前没有把 `sie` 清零 | 看 `kernelPanic` |
 | `uptime` 比实际时间越走越慢 | 下一次时钟中断按“处理时的 `time` + 周期”预约，每个 tick 都丢掉了处理延迟 | 看 `timer.arm` |
 | 改了代码，运行结果却和改之前一样（或者出现早已修复的问题） | 这次构建失败了，手动运行的 QEMU 跑的是上一次的内核 | 看构建输出；手动运行时用 `zig build && qemu-system-riscv64 ...`，或者直接用 `qemu_test.py` |
+| `KERNEL PANIC on hart N: kernel stack overflow: pid N (name)` 或 `... boot stack of hart N` | 内核栈（16 KiB）或启动栈（32 KiB）用到了最底下的金丝雀：栈上放了大数组、按值传了大结构体，或者递归太深。Debug 模式下栈帧最大，最容易出现 | 看那个进程刚才在做哪个系统调用；`-Doptimize=debug` 下最容易复现。别的模式不出现不代表没问题 |
 | `KERNEL PANIC on hart N: sched: 2 spinlocks held` | 拿着别的锁调用了 `sleep`/`yield`/`exit`（`sched` 只允许拿着进程自己的锁） | 看 panic 前在做什么；要拿着锁等待就用 `sleep(chan, lock)` |
 | `KERNEL PANIC on hart N: acquire: lock X is already held by this hart` | 同一个 hart 重复拿同一把锁：比如拿着 `uart.lockOutput()` 又 `print`，或者 `wakeup` 时调用方拿着某个进程的锁 | 看 `X` 是哪把锁，对照 [process.md](process.md#锁) 的加锁顺序 |
 | 多核时卡住不动，单核正常 | 推测是死锁：两个 hart 按相反的顺序拿两把锁（没有实际遇到过） | 对照 [process.md](process.md#锁) 的加锁顺序；GDB 看每个 hart 停在哪个 `acquire` 里 |

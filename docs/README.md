@@ -55,6 +55,7 @@ liviana-kernel 的详细文档，按功能组织，讲这个用 Zig 写的 RISC-
 | `src/page.zig` | [page-allocator.md](page-allocator.md) | |
 | `src/vm.zig` | [paging.md](paging.md) | [syscalls.md](syscalls.md#访问用户内存) |
 | `src/proc.zig` | [process.md](process.md) | |
+| `src/canary.zig` | [process.md](process.md#进程表) | [boot.md](boot.md#每个-hart-的启动栈) |
 | `src/spinlock.zig` | [process.md](process.md#锁) | [boot.md](boot.md#panic) |
 | `src/file.zig` | [files.md](files.md) | [syscalls.md](syscalls.md#closeduppipe) |
 | `src/pipe.zig` | [files.md](files.md#管道) | |

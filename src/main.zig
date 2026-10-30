@@ -17,6 +17,7 @@ const hart = @import("hart.zig");
 const ipi = @import("ipi.zig");
 const virtio_disk = @import("virtio_disk.zig");
 const bio = @import("bio.zig");
+const canary = @import("canary.zig");
 
 /// 替换标准库默认的 panic 处理。@panic、std.debug.panic 以及
 /// Debug 模式下的安全检查失败（整数溢出、数组越界等）都会走到这里。
@@ -33,6 +34,7 @@ fn kernelPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
 }
 
 /// 每个 hart 的启动栈（32 KiB），按 hart 编号下标。kmain / kmainSecondary 在上面运行，之后归这个 hart 的调度器用。
+/// 最底下放着金丝雀（canary.zig），kmain / kmainSecondary 一开始写上，调度器每一轮检查。
 /// 实测 Debug 模式下跑完全部 QEMU 测试，启动 hart 最深用了约 17 KiB（kmain 那一串初始化），
 /// 其他 hart 不到 2 KiB；safe 模式下分别约 3.6 KiB 和 0.8 KiB。
 const boot_stack_shift = 15;
@@ -90,6 +92,9 @@ fn secondaryEntry() callconv(.naked) noreturn {
 }
 
 fn kmain(hartid: usize, dtb_addr: usize) callconv(.c) noreturn {
+    // 启动栈最底下的金丝雀（canary.zig）：kmain 那一串初始化是启动栈用得最深的地方，越早写上越好，
+    // 之后调度器每一轮检查一次
+    canary.set(&boot_stacks[hartid]);
     // OpenSBI 交过来时 FS 是 Dirty，浮点单元开着。这个内核不支持浮点（陷阱处理不保存浮点寄存器），
     // 关掉它：否则用户程序能直接用浮点寄存器，里面的值还会留给下一个进程
     riscv.clear(.sstatus, riscv.sstatus_fs);
@@ -139,7 +144,7 @@ fn kmain(hartid: usize, dtb_addr: usize) callconv(.c) noreturn {
     // 全局的中断开关 sstatus.SIE 这里不开：内核代码都关着中断运行（拿锁时也要求这样，见 spinlock.zig），
     // 调度器每一轮开头才开一下。
     proc.userinit() catch |err| std.debug.panic("cannot start init: {s}", .{@errorName(err)});
-    proc.scheduler();
+    proc.scheduler(&boot_stacks[hartid]);
 }
 
 /// 做完了自己那份初始化、进了调度器的 hart 数（不算启动 hart）。
@@ -176,6 +181,7 @@ fn startHarts(self: usize, ids: []const u32, timebase_hz: u64) void {
 
 /// 其他 hart 的初始化（kmain 的每个 hart 一份的部分），然后进入调度器。全局的东西启动 hart 都已经做好了。
 fn kmainSecondary() callconv(.c) noreturn {
+    canary.set(&boot_stacks[hart.id()]); // 见 kmain
     riscv.clear(.sstatus, riscv.sstatus_fs); // 见 kmain
     trap.init();
     vm.initHart();
@@ -183,5 +189,5 @@ fn kmainSecondary() callconv(.c) noreturn {
     timer.initHart();
     ipi.initHart();
     _ = harts_online.fetchAdd(1, .release);
-    proc.scheduler();
+    proc.scheduler(&boot_stacks[hart.id()]);
 }

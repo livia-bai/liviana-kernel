@@ -183,7 +183,7 @@ const from_user = frame.sstatus & riscv.sstatus_spp == 0;
 | 来自 U 模式的其他异常 | `proc.killCurrent("<异常名> at <sepc>, stval=<stval>")`（`killForFault`）：结束进程，内核照常运行 |
 | 来自 S 模式的异常 3（`ebreak`） | 打印 `[trap] breakpoint at ...`，`frame.sepc += instructionLength(frame.sepc)` 跳过它 |
 | 来自 S 模式的其他异常 | `std.debug.panic("unhandled exception: ...")`：内核自己的错，停机 |
-| 最后，`from_user` 时 | `proc.checkKilled()`：被 kill 了就在这里结束，不再回到 U 模式（[process.md](process.md#结束进程)）；`proc.assertNoLocksHeld()`：没有拿着自旋锁，当前进程也没有拿着睡眠锁 |
+| 最后，`from_user` 时 | `proc.checkStack()`：内核栈底的金丝雀还在（[process.md](process.md#进程表)）；`proc.checkKilled()`：被 kill 了就在这里结束，不再回到 U 模式（[process.md](process.md#结束进程)）；`proc.assertNoLocksHeld()`：没有拿着自旋锁，当前进程也没有拿着睡眠锁 |
 
 和 xv6 的 `usertrap` 末尾一样：先处理陷阱，只在时钟中断时 `yield`，回到用户态之前检查 `killed`。
 

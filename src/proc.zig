@@ -45,6 +45,7 @@ const ipi = @import("ipi.zig");
 const spinlock = @import("spinlock.zig");
 const fs = @import("fs.zig");
 const fsys = @import("fsys.zig");
+const canary = @import("canary.zig");
 const Spinlock = spinlock.Spinlock;
 
 /// 内核里只嵌着 init（见 build.zig）：第一个进程要在挂载文件系统之前加载。别的程序都从文件系统的 /bin 加载（exec）。
@@ -144,7 +145,8 @@ var init_proc: ?*Process = null;
 var foreground: std.atomic.Value(usize) = .init(0);
 
 /// 每个进程陷入内核时用的栈，静态分配：页分配器只能一页一页地给，给不出连续的 16 KiB。
-/// 实测 Debug 模式下跑完全部 QEMU 测试，最深用了约 8.2 KiB。
+/// 实测 Debug 模式下跑完全部 QEMU 测试，最深用了约 9.7 KiB（文件系统的系统调用，见 docs/process.md）。
+/// 两块栈之间没有保护页，最底下放着金丝雀（canary.zig），allocSlot 写上，sched、回到 U 模式之前检查。
 var kernel_stacks: [max_procs][16 * 1024]u8 align(16) = undefined;
 
 /// 切换时保存的内核上下文。按 C 调用约定，跨函数调用需要保持不变的只有
@@ -156,10 +158,14 @@ const Context = extern struct {
 };
 
 /// 找一个空槽位，拿着它的锁返回（对应 xv6 的 allocproc）。拿着锁，别的 hart 就看不到它半填好的样子。
+/// 槽位空着，它的内核栈没人用，顺便重新写上金丝雀。
 fn allocSlot() error{TooManyProcesses}!*Process {
     for (&table) |*p| {
         p.lock.acquire();
-        if (p.state == .unused) return p;
+        if (p.state == .unused) {
+            canary.set(stackOf(p));
+            return p;
+        }
         p.lock.release();
     }
     return error.TooManyProcesses;
@@ -176,9 +182,21 @@ fn fill(p: *Process, new: Process) void {
 /// 进程从 U 模式陷入时的 TrapFrame，总在它的内核栈最顶端（trapEntry 从 sscratch = 栈顶开始压栈，
 /// trapExit 回到 U 模式时也按这个位置设置 sscratch）。
 fn frameOf(p: *Process) *trap.TrapFrame {
-    const slot = (@intFromPtr(p) - @intFromPtr(&table)) / @sizeOf(Process);
-    const stack = &kernel_stacks[slot];
+    const stack = stackOf(p);
     return @ptrCast(@alignCast(stack[stack.len - @sizeOf(trap.TrapFrame) ..]));
+}
+
+/// 进程 p 的内核栈（槽位 i 用 kernel_stacks[i]）。
+fn stackOf(p: *Process) *[16 * 1024]u8 {
+    const slot = (@intFromPtr(p) - @intFromPtr(&table)) / @sizeOf(Process);
+    return &kernel_stacks[slot];
+}
+
+/// 当前进程的内核栈溢出了（金丝雀被改了）就 panic。切回调度器（sched）、回到 U 模式之前调用：
+/// 这时栈已经退回去了，但溢出时踩坏的东西（相邻进程的 TrapFrame）还没被用到。
+pub fn checkStack() void {
+    const p = current().?;
+    canary.check(stackOf(p), "pid {d} ({s})", .{ p.pid, p.name.slice() });
 }
 
 /// 从程序入口开始运行的 TrapFrame：a0 = argc，a1 = sp = 栈上 Arg 数组的地址（见 pushArgs），
@@ -435,6 +453,7 @@ fn forkretC() callconv(.c) void {
     p.lock.release();
     // 第一个进程第一次运行：挂载文件系统（要读盘、睡着等，kmain 做不了）。之后创建的进程都在这之后
     if (p == init_proc) fsys.init();
+    checkStack();
     checkKilled();
     assertNoLocksHeld();
 }
@@ -453,12 +472,13 @@ pub fn countSleeplock(delta: i2) void {
     if (delta > 0) p.sleeplocks += 1 else p.sleeplocks -= 1;
 }
 
-/// 调度器（对应 xv6 的 scheduler()）。每个 hart 初始化完之后调用，在这个 hart 的启动栈上永远循环：
+/// 调度器（对应 xv6 的 scheduler()）。每个 hart 初始化完之后调用，在这个 hart 的启动栈 boot_stack 上永远循环
+/// （每一轮检查一次它最底下的金丝雀，main.zig 一开始就写好了；打断调度器的中断也用这块栈）：
 /// 依次扫描进程表，遇到 runnable 的就切过去运行，等它调用 sched() 切回来，再接着往下扫。
 /// 所以每个 runnable 的进程每一圈运行一次，自然就是轮转。几个 hart 的调度器同时扫同一张进程表，
 /// 靠进程锁保证一个进程同一时刻只在一个 hart 上运行：拿着锁检查 runnable、改成 running，
 /// 一直拿到进程切回来为止（锁在中间由进程那一边放开、再拿上，见 sched 的调用方）。
-pub fn scheduler() noreturn {
+pub fn scheduler(boot_stack: []u8) noreturn {
     const c = &cpus[hart.id()];
     while (true) {
         // 进程和调度器都是关着中断运行的，中断只在这里打开一下：处理挂起的中断（它们可能叫醒进程），
@@ -468,6 +488,7 @@ pub fn scheduler() noreturn {
         riscv.enableInterrupts();
         riscv.disableInterrupts();
         hart.checkPanic();
+        canary.check(boot_stack, "boot stack of hart {d}", .{hart.id()});
         ipi.setIdle(true);
         var found = false;
         for (&table) |*p| {
@@ -502,6 +523,7 @@ fn sched() void {
     if (spinlock.heldCount() != 1) std.debug.panic("sched: {d} spinlocks held", .{spinlock.heldCount()});
     std.debug.assert(p.state != .running);
     std.debug.assert(riscv.read(.sstatus) & riscv.sstatus_sie == 0);
+    checkStack();
     // 不能缓存 cpus[hart.id()]：切回来时可能已经在另一个 hart 上了
     switchContext(&p.context, &cpus[hart.id()].context);
 }

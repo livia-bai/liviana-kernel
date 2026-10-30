@@ -17,4 +17,5 @@ test {
     _ = @import("btree.zig");
     _ = @import("ctree.zig");
     _ = @import("fs.zig");
+    _ = @import("canary.zig");
 }

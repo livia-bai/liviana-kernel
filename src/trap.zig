@@ -214,8 +214,10 @@ fn handleTrap(frame: *TrapFrame) callconv(.c) void {
             }),
         }
     }
-    // 回到 U 模式之前：被 kill 了（比如在 yield、sleep 里等着的时候，或者刚才的串口中断是 Ctrl-C）就在这里结束
+    // 回到 U 模式之前：先看内核栈溢出了没有（溢出会踩坏相邻进程的 TrapFrame，见 canary.zig）。
+    // 被 kill 了（比如在 yield、sleep 里等着的时候，或者刚才的串口中断是 Ctrl-C）就在这里结束
     if (from_user) {
+        proc.checkStack();
         proc.checkKilled();
         proc.assertNoLocksHeld();
     }

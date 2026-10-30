@@ -113,7 +113,8 @@ export var boot_stacks: [hart.max][1 << boot_stack_shift]u8 align(16) = undefine
 ```
 
 - 每个 hart 一块，按 hart 编号下标：hart `i` 的栈顶是 `boot_stacks + (i + 1) * 32 KiB`（`enter_asm` 用移位算乘法）。`kmain`、`kmainSecondary` 在上面运行，之后归这个 hart 的调度器用（[process.md](process.md#栈的变化)）。
-- **大小是实测出来的**：Debug 模式下跑完全部 QEMU 测试，启动 hart 最深用了 17432 字节（`kmain` 那一串初始化，Debug 模式下栈帧很大），其他 hart 约 2.2 KiB；safe 模式下分别是 3616 和 800 字节（加了磁盘之后重新量的）。测法和进程内核栈一样（`.bss` 清零，`shutdown` 时从栈底找第一个不为 0 的字节，临时代码）。最早给的是 16 KiB，Debug 模式下启动 hart 的栈溢出了 1 KiB 左右，踩进了紧挨着的 `proc.cpus`，所以改成 32 KiB。栈两侧没有保护页，溢出不会被发现。
+- **大小是实测出来的**：Debug 模式下跑完全部 QEMU 测试，启动 hart 最深用了 17432 字节（`kmain` 那一串初始化，Debug 模式下栈帧很大），其他 hart 约 2.2 KiB；safe 模式下分别是 3616 和 800 字节（加了磁盘之后重新量的）。测法和进程内核栈一样（`.bss` 清零，`shutdown` 时从栈底找第一个不为 0 的字节，临时代码）。最早给的是 16 KiB，Debug 模式下启动 hart 的栈溢出了 1 KiB 左右，踩进了紧挨着的 `proc.cpus`，所以改成 32 KiB。栈两侧没有保护页，溢出不会触发缺页。
+- **栈底的金丝雀**（`src/canary.zig`，和进程内核栈的一样，[process.md](process.md#进程表)）：`kmain`、`kmainSecondary` 第一件事是在自己启动栈最底下的 256 字节写上固定的图案，调度器（`proc.scheduler` 收到这块栈）每一轮检查一次，被改了就 panic：`kernel stack overflow: boot stack of hart N`。打断调度器的中断也在这块栈上处理，下一轮就能查到。临时在 hart 2 的 `kmainSecondary` 里放一个将近 32 KiB 的数组实测过。
 - `boot_stacks` 用 `export` 导出成符号，汇编里直接 `la sp, boot_stacks`。用 `"X"` 约束把 `&boot_stacks` 传进去不行：编译器会先把这个地址算进一个寄存器再代入，实测它挑了 `a0`，把 hart 编号覆盖了（函数指针 `&kmain` 用 `"X"` 就没问题，代入的是符号名）。
 - `tp` 从这里开始就是 hart 编号，内核里 `hart.id()` 直接读它（[trap.md](trap.md#tp-约定)）。之后第一次拿锁（`uart.init` 之后的打印）就要用到它。
 

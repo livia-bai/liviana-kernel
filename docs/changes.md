@@ -2,6 +2,11 @@
 
 每次改了内核（`src/`、`user/`、`build.zig`、链接脚本），在最上面加几行：新增了什么功能，修了什么 bug。最新的在前面。
 
+## 2026-10-30 内核栈底的金丝雀
+
+- 新增：`src/canary.zig`。每块进程内核栈和每个 hart 的启动栈最底下 256 字节写着固定的图案：进程的在分配槽位时写，启动栈在 `kmain`、`kmainSecondary` 一开始写。切回调度器、回到 U 模式之前检查当前进程的，调度器每一轮检查自己 hart 的启动栈，图案被改了就 panic（`kernel stack overflow: pid N (name)`、`kernel stack overflow: boot stack of hart N`）。以前内核栈溢出不会被发现，会悄悄改坏相邻进程的 `TrapFrame`。
+- 改动：`proc.scheduler` 多了一个参数，是这个 hart 的启动栈。
+
 ## 2026-10-29 程序从文件系统加载
 
 - 改动：`exec` 从文件系统加载程序：名字里没有 `/` 的在 `/bin` 里找，有的按路径找（相对路径从当前目录开始），加载期间拿着 `fsys.lock`，ELF 的内容直接读进新的用户页。内核里只嵌着 init（第一个进程要在挂载之前加载），内核镜像小了约 1.1 MiB。ELF 加载器改成通过 `Source`（嵌着的字节或者文件系统里的文件）读。
