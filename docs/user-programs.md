@@ -1,6 +1,6 @@
 # 用户程序
 
-涉及文件：`user/start.zig`、`user/sys.zig`、`user/linker.ld`、`user/init.zig`、`user/sh.zig`、`user/hello.zig`、`user/fault.zig`、`user/spin.zig`、`user/ticker.zig`、`user/echo.zig`、`user/cat.zig`、`user/wc.zig`、`user/ls.zig`、`user/mkdir.zig`、`user/rm.zig`、`user/mv.zig`、`user/scrub.zig`
+涉及文件：`user/start.zig`、`user/sys.zig`、`user/linker.ld`、`user/init.zig`、`user/sh.zig`、`user/hello.zig`、`user/fault.zig`、`user/spin.zig`、`user/ticker.zig`、`user/echo.zig`、`user/cat.zig`、`user/wc.zig`、`user/ls.zig`、`user/mkdir.zig`、`user/rm.zig`、`user/mv.zig`、`user/ln.zig`、`user/scrub.zig`
 
 用户程序运行在 U 模式，只能访问自己地址空间里的页，要输出文字、读键盘、用管道、创建进程、退出都要通过系统调用（[syscalls.md](syscalls.md)）。它们在构建时编译成独立的 ELF，由 `mkfs` 装进磁盘镜像的 `/bin`；只有 `init` 嵌在内核里（[build.md](build.md#用户程序)、[process.md](process.md#程序从哪来)）。内核启动时只加载 `init`，其他程序都是由已有的进程 `fork` 再 `exec` 出来的（[process.md](process.md#创建进程)）：init 启动 shell（`sh`），shell 的 `run` 命令再启动别的程序。
 
@@ -251,32 +251,34 @@ pub fn main() u8 {
 
 最后一行 `(sh)` 是 shell 为管道 fork 出来的“组长”（[shell.md](shell.md#管道)）。
 
-### ls、mkdir、rm、mv
+### ls、mkdir、rm、mv、ln
 
 文件系统的几个小命令（[fs.md](fs.md)），出错时都打印 `程序名: 路径: 错误名`（比如 `rm: /d: NotEmpty`），接着处理下一个参数，最后以 1 结束：
 
-- `ls`（`user/ls.zig`）：`ls [路径...]`，不给路径时是当前目录。目录的每一项一行：种类（`file`、`dir`）、字节数、名字；给的是文件的话只列它自己。目录项里没有长度，每个文件要再 `open`、`fstat` 一次。顺序是名字的散列的顺序，不是字母顺序。
+- `ls`（`user/ls.zig`）：`ls [路径...]`，不给路径时是当前目录。目录的每一项一行：种类（`file`、`dir`、`dev`）、链接数、字节数（设备文件是设备号）、名字；给的是文件的话只列它自己。目录项里没有长度、链接数，每一项要再 `open`、`fstat` 一次（打不开的，比如内核不认识的设备，记成 0）。顺序是名字的散列的顺序，不是字母顺序。
 - `mkdir`（`user/mkdir.zig`）：`mkdir 目录...`，按顺序建，所以 `mkdir /a /a/b` 可以。
-- `rm`（`user/rm.zig`）：`rm 路径...`，删文件或空目录。
+- `rm`（`user/rm.zig`）：`rm 路径...`，删文件、设备文件或空目录（删掉一个名字；文件还有别的硬链接的话照常在）。
 - `mv`（`user/mv.zig`）：`mv 旧 新` 改名（`rename` 系统调用，可以换目录；新名字已经有了就换掉它）；最后一个参数是已有的目录时，前面的都挪进去、名字不变（`mv a b /d` 是 `/d/a`、`/d/b`），和 Unix 的 `mv` 一样。给了两个以上的源、最后一个却不是目录，打印 `mv: DIR: not a directory`。出错打印 `mv: 旧 -> 新: 错误名`（比如把目录挪进自己下面：`mv: /m -> /m/sub: InvalidArgument`）。
+- `ln`（`user/ln.zig`）：`ln 旧 新` 建硬链接（`link` 系统调用）；最后一个参数是已有的目录时，在里面建同名的链接。用法和出错的格式都和 `mv` 一样；目录不能链接（`ln: /bin -> /b2: PermissionDenied`）。
 
 ```
 > run ls /bin
 ...
-file   131824 sh
+file  1   144112 sh
 ...
-file   107248 ls
+file  1   107248 ls
 ...
-[proc] pid 3 (ls) exited with code 0
-> run mkdir /d /d/e
-[proc] pid 4 (mkdir) exited with code 0
-> cd /d
-> run ls
-dir         0 e
-[proc] pid 5 (ls) exited with code 0
+> run ls /dev
+dev   1        2 null
+dev   1        3 zero
+dev   1        1 console
+> run ln /hello.txt /docs/hi.txt
+> run ls /docs
+file  1        7 count.txt
+file  2       13 hi.txt
 ```
 
-（Debug 构建，`/bin` 只摘了两行。）
+（Debug 构建，`/bin` 只摘了两行，`[proc] ... exited` 的行略去了。）
 
 ### scrub
 
@@ -284,9 +286,9 @@ dir         0 e
 
 ```
 > run scrub
-scrub: ok: 33 files, 2 dirs, 197 data blocks verified
-scrub: tree of 8 nodes, 267 items, height 2; 6961 of 7168 blocks free, generation 723
-[proc] pid 4 (scrub) exited with code 0
+scrub: ok: 35 files, 3 dirs, 3 devices, 987 data blocks verified
+scrub: tree of 30 nodes, 1068 items, height 2; 6149 of 7168 blocks free, generation 1114
+[proc] pid 494 (scrub) exited with code 0
 ```
 
 ## 写一个新程序

@@ -52,7 +52,7 @@ fn check() u8 {
     const empty = [_]abi.Arg{ .of("t_args"), .{ .ptr = 0, .len = 0 } };
     expectOutput(&empty, "argc=2\nargv[0]=\"t_args\"\nargv[1]=\"\"\ntotal 6 bytes\n", 2);
 
-    // 正好 max_args 个参数、max_arg_bytes 字节：t_args 加 14 个 64 字节的，最后一个凑满（122 字节）
+    // 正好 max_args 个参数、max_arg_bytes 字节：t_args 加 max_args - 2 个 64 字节的，最后一个凑满（122 字节）
     {
         var args: [abi.max_args][]const u8 = undefined;
         const filler: [128]u8 = @splat('z');
@@ -61,7 +61,7 @@ fn check() u8 {
         args[args.len - 1] = filler[0 .. abi.max_arg_bytes - 6 - 64 * (abi.max_args - 2)];
         var a: [abi.max_args]abi.Arg = undefined;
         for (args, &a) |s, *x| x.* = .of(s);
-        var expected: [2048]u8 = undefined;
+        var expected: [4096]u8 = undefined;
         var w: std.Io.Writer = .fixed(&expected);
         w.print("argc={d}\n", .{abi.max_args}) catch unreachable;
         for (args, 0..) |s, i| w.print("argv[{d}]=\"{s}\"\n", .{ i, s }) catch unreachable;
@@ -93,7 +93,7 @@ fn expectOutput(args: []const abi.Arg, expected: []const u8, code: u32) void {
         sys.exit(200);
     }
     sys.close(fds[1]) catch {};
-    var buf: [2048]u8 = undefined;
+    var buf: [4096]u8 = undefined;
     var len: usize = 0;
     while (len < buf.len) {
         const n = sys.read(fds[0], buf[len..]) catch break;

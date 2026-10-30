@@ -56,6 +56,8 @@ pub fn dispatch(frame: *TrapFrame) usize {
         .scrub => scrub(args[0]),
         .rename => rename(args[0], args[1], args[2], args[3]),
         .lseek => lseek(args[0], args[1], args[2]),
+        .link => link(args[0], args[1], args[2], args[3]),
+        .mknod => mknod(args[0], args[1], args[2]),
         _ => abi.fail(.nosys),
     };
 }
@@ -227,7 +229,7 @@ fn open(path_ptr: usize, path_len: usize, flags: usize) usize {
     const cwd = proc.current().?.cwd;
     // 可能要建文件、截断的才拿写锁，只是打开已有的文件在快照上找
     const modifies = flags & abi.open_create != 0 or (flags & abi.open_trunc != 0 and writable);
-    const ino = if (modifies) blk: {
+    const result = if (modifies) blk: {
         const root = fsys.writer() catch return abi.fail(.nodev);
         defer fsys.unlock();
         break :blk openPath(root, cwd, path, flags, writable);
@@ -236,23 +238,32 @@ fn open(path_ptr: usize, path_len: usize, flags: usize) usize {
         defer r.end();
         break :blk openPath(&r.fs, cwd, path, flags, writable);
     };
-    const f = file.openInode(ino catch |err| return abi.fail(fsys.errno(err)), readable, writable, flags & abi.open_append != 0) catch return abi.fail(.nfile);
+    const st = result catch |err| return abi.fail(fsys.errno(err));
+    // 设备文件：读写交给设备，文件系统里只有它的 inode
+    const opened = if (st.kind == .device)
+        file.openDevice(st.ino, @fromBackingInt(st.major), readable, writable)
+    else
+        file.openInode(st.ino, readable, writable, flags & abi.open_append != 0);
+    const f = opened catch |err| return abi.fail(switch (err) {
+        error.TooManyFiles => .nfile,
+        error.NoSuchDevice => .nxio,
+    });
     return installFd(f) orelse {
         file.close(f);
         return abi.fail(.mfile);
     };
 }
 
-/// root 是读者的话 flags 里不会有要改文件系统的（见 open）。
-fn openPath(root: *Fs, cwd: u64, path: []const u8, flags: usize, writable: bool) @import("fs.zig").Error!u64 {
+/// 找到（或者建好、截断）要打开的 inode，返回它的 Stat。root 是读者的话 flags 里不会有要改文件系统的（见 open）。
+fn openPath(root: *Fs, cwd: u64, path: []const u8, flags: usize, writable: bool) @import("fs.zig").Error!@import("fs.zig").Stat {
     const ino = root.resolve(cwd, path) catch |err| switch (err) {
-        error.NotFound => if (flags & abi.open_create != 0) return root.run(Fs.create, .{ cwd, path, .file }) else return err,
+        error.NotFound => if (flags & abi.open_create != 0) return root.stat(try root.run(Fs.create, .{ cwd, path, .file })) else return err,
         else => return err,
     };
     const st = try root.stat(ino);
     if (st.kind == .dir and writable) return error.IsDir;
-    if (flags & abi.open_trunc != 0 and writable and st.size > 0) try root.run(Fs.truncate, .{ino});
-    return ino;
+    if (flags & abi.open_trunc != 0 and writable and st.size > 0) try root.run(Fs.truncate, .{ino}); // 设备、目录的 size 是 0
+    return st;
 }
 
 const PathOp = enum { mkdir, unlink, chdir };
@@ -296,6 +307,29 @@ fn rename(old_ptr: usize, old_len: usize, new_ptr: usize, new_len: usize) usize 
     return 0;
 }
 
+/// 硬链接：两个路径都先复制进内核，再拿着写锁一个事务做完（fs.Fs.link）。
+fn link(old_ptr: usize, old_len: usize, new_ptr: usize, new_len: usize) usize {
+    var old_buf: [abi.max_path]u8 = undefined;
+    var new_buf: [abi.max_path]u8 = undefined;
+    const old = userPath(old_ptr, old_len, &old_buf) catch |err| return abi.fail(fsys.errno(err));
+    const new = userPath(new_ptr, new_len, &new_buf) catch |err| return abi.fail(fsys.errno(err));
+    const root = fsys.writer() catch return abi.fail(.nodev);
+    defer fsys.unlock();
+    root.run(Fs.link, .{ proc.current().?.cwd, old, new }) catch |err| return abi.fail(fsys.errno(err));
+    return 0;
+}
+
+/// 建设备文件。设备号是 u16、不能是 0；不认识的设备号也能建（打开时才报 ENXIO，和 Unix 一样）。
+fn mknod(path_ptr: usize, path_len: usize, major: usize) usize {
+    if (major == 0 or major > std.math.maxInt(u16)) return abi.fail(.inval);
+    var buf: [abi.max_path]u8 = undefined;
+    const path = userPath(path_ptr, path_len, &buf) catch |err| return abi.fail(fsys.errno(err));
+    const root = fsys.writer() catch return abi.fail(.nodev);
+    defer fsys.unlock();
+    _ = root.run(Fs.mknod, .{ proc.current().?.cwd, path, @as(u16, @intCast(major)) }) catch |err| return abi.fail(fsys.errno(err));
+    return 0;
+}
+
 fn lseek(fd: usize, offset: usize, whence: usize) usize {
     const f = fileOf(fd) orelse return abi.fail(.badf);
     return file.seek(f, @bitCast(offset), whence) catch |err| fileError(err);
@@ -308,11 +342,11 @@ fn fstat(fd: usize, ptr: usize) usize {
         .none => unreachable,
         .console => {},
         .pipe => st.kind = .pipe,
-        .inode => {
+        .inode, .device => {
             var r = fsys.reader() catch return abi.fail(.nodev);
             defer r.end();
             const s = r.fs.stat(f.ino) catch |err| return abi.fail(fsys.errno(err));
-            st = .{ .ino = s.ino, .size = s.size, .kind = @fromBackingInt(@backingInt(s.kind)) };
+            st = .{ .ino = s.ino, .size = s.size, .kind = @fromBackingInt(@backingInt(s.kind)), .major = s.major, .nlink = s.nlink };
         },
     }
     vm.copyToUser(space(), ptr, std.mem.asBytes(&st)) catch return abi.fail(.fault);
@@ -351,6 +385,7 @@ fn scrub(ptr: usize) usize {
     const st = root.check() catch |err| return abi.fail(fsys.errno(err));
     const info: abi.ScrubInfo = .{
         .files = st.files,
+        .devices = st.devices,
         .dirs = st.dirs,
         .data_blocks = st.data_blocks,
         .nodes = st.tree.nodes,

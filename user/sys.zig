@@ -126,8 +126,14 @@ pub const FsError = error{
     BadFd,
     TooManyOpenFiles,
     SystemFdQuotaExceeded,
-    /// lseek 串口、管道
+    /// lseek 串口、管道、设备
     NotSeekable,
+    /// 给目录建硬链接
+    PermissionDenied,
+    /// 链接数到上限了
+    TooManyLinks,
+    /// 打开的设备文件的设备号内核不认识
+    NoSuchDevice,
     Unexpected,
 };
 
@@ -150,6 +156,9 @@ fn fsResult(ret: usize) FsError!usize {
         .mfile => error.TooManyOpenFiles,
         .nfile => error.SystemFdQuotaExceeded,
         .spipe => error.NotSeekable,
+        .perm => error.PermissionDenied,
+        .mlink => error.TooManyLinks,
+        .nxio => error.NoSuchDevice,
         else => error.Unexpected,
     };
 }
@@ -202,6 +211,16 @@ pub fn fstat(fd: Fd) FsError!abi.Stat {
 /// 把 old 改名成 new（见 abi.Syscall.rename）。
 pub fn rename(old: []const u8, new: []const u8) FsError!void {
     _ = try fsResult(syscall4(.rename, @intFromPtr(old.ptr), old.len, @intFromPtr(new.ptr), new.len));
+}
+
+/// 硬链接：给文件 old 再起一个名字 new（见 abi.Syscall.link）。
+pub fn link(old: []const u8, new: []const u8) FsError!void {
+    _ = try fsResult(syscall4(.link, @intFromPtr(old.ptr), old.len, @intFromPtr(new.ptr), new.len));
+}
+
+/// 建一个设备文件（见 abi.Syscall.mknod）。
+pub fn mknod(path: []const u8, major: abi.Major) FsError!void {
+    _ = try fsResult(syscall(.mknod, @intFromPtr(path.ptr), path.len, @backingInt(major)));
 }
 
 pub const Whence = enum(usize) { set = abi.seek_set, cur = abi.seek_cur, end = abi.seek_end };

@@ -2,7 +2,7 @@
 
 涉及文件：`src/proc.zig`（以及 `src/trap.zig` 的 `trapExit`、`src/vm.zig` 的用户地址空间函数、`src/spinlock.zig`、`src/hart.zig`、`src/ipi.zig`；调用方：`src/main.zig`、`src/trap.zig`、`src/syscall.zig`、`src/file.zig`、`src/pipe.zig`、`src/timer.zig`）
 
-进程表里最多同时有 16 个进程，在所有 hart 上按时间片轮转（round-robin）抢占式调度。进程的创建、调度、结束和加锁都照搬 [xv6](https://github.com/mit-pdos/xv6-riscv)（`kernel/proc.c`）的结构：
+进程表里最多同时有 64 个进程，在所有 hart 上按时间片轮转（round-robin）抢占式调度。进程的创建、调度、结束和加锁都照搬 [xv6](https://github.com/mit-pdos/xv6-riscv)（`kernel/proc.c`）的结构：
 
 - **第一个进程 init 由内核创建**（`userinit`），pid 1。之后的进程都是 `fork` 出来的：init 用 `fork` + `exec` 启动 shell，shell 再用同样的办法运行程序（[user-programs.md](user-programs.md#init-和-sh)）。
 - **每个 hart 有自己的调度器 `proc.scheduler()`，只管调度**。每个 hart 初始化完之后调用它，它在这个 hart 的启动栈上永远循环：依次扫描（所有 hart 共用的）进程表，遇到 `runnable` 的进程就切过去，等它切回来再接着往下扫。进程不绑定 hart，这次在哪个 hart 上让出 CPU，下次可能在另一个 hart 上接着运行。
@@ -33,7 +33,7 @@ const Source = union(enum) {
 ## 进程表
 
 ```zig
-pub const max_procs = abi.max_procs;   // 16，shell 也要知道，所以放在 abi.zig
+pub const max_procs = abi.max_procs;   // 64（xv6 的 NPROC），shell 也要知道，所以放在 abi.zig
 pub const State = abi.ProcState;       // procinfo 原样交给用户程序
 
 pub const ProcState = enum(u8) { unused, runnable, running, sleeping, zombie };   // abi.zig
@@ -88,7 +88,7 @@ pub fn current() ?*Process              // cpus[hart.id()].proc
 
 所有的状态变化都拿着这个进程的锁。
 
-- **每个进程一块 16 KiB 的内核栈**，静态分配在 `.bss` 里（16 块共 256 KiB）。不从页分配器要：它一次只给一页，给不出连续的 16 KiB。实测 Debug 模式下跑完全部 QEMU 测试（单核和 4 核，包括文件系统的 `t_fs` 和掉电后重新启动），最深用了 10488 字节，safe 模式下 6128 字节，small 模式下 5592 字节（文件系统改成读者在快照上读之后重新量的），最深的是文件系统的系统调用（B 树的操作，[fs.md](fs.md#接进内核fsyszig)）。测法：`.bss` 启动时清零，`shutdown` 时从每块栈的底部找第一个不为 0 的字节，取最大值（临时加的代码，没有留在仓库里；最底下 256 字节的金丝雀不算）。内核栈两侧没有保护页：内核内存是用大页恒等映射的，要在中间挖出不映射的页得拆大页，现在没做。
+- **每个进程一块 16 KiB 的内核栈**，静态分配在 `.bss` 里（64 块共 1 MiB）。不从页分配器要：它一次只给一页，给不出连续的 16 KiB。实测 Debug 模式下跑完全部 QEMU 测试（单核和 4 核，包括文件系统的 `t_fs` 和掉电后重新启动），最深用了 11624 字节，safe 模式下 7616 字节，small 模式下 7256 字节（加了硬链接、设备文件，`exec` 的参数上限调到 32 个、2048 字节之后重新量的），最深的是文件系统的系统调用（B 树的操作，[fs.md](fs.md#接进内核fsyszig)）；这一次比上一次多出来的 1 KiB 多，推测来自 `exec`：它在栈上放着参数（2048 字节加两个 32 项的数组），再从文件系统读程序（没有逐个调用量过）。测法：`.bss` 启动时清零，`shutdown` 时从每块栈的底部找第一个不为 0 的字节，取最大值（临时加的代码，没有留在仓库里；最底下 256 字节的金丝雀不算）。内核栈两侧没有保护页：内核内存是用大页恒等映射的，要在中间挖出不映射的页得拆大页，现在没做。
 - **栈底的金丝雀**（`src/canary.zig`）：没有保护页，进程 i 的内核栈往下溢出时不会缺页，而是正好写进进程 i-1 内核栈的最顶上，也就是它的 `TrapFrame`，那个进程回到 U 模式时寄存器就乱了，很难查。所以每块内核栈最底下的 256 字节写着固定的图案（`allocSlot` 拿到空槽位时写，这时这块栈没人用），切回调度器（`sched`）、回到 U 模式之前（`handleTrap` 末尾、`forkretC`）由 `proc.checkStack` 检查，图案被改了就 panic：`kernel stack overflow: pid N (name)`。这是尽力而为的检查：一个很大、只写了一部分的栈帧可能整个跨过 256 字节而不碰它。临时在 `getpid` 里放一个 15.5 KiB 的数组实测过，shell 一调用 `getpid` 就 panic。启动栈也有一份（[boot.md](boot.md#每个-hart-的启动栈)）。
 - init 和 shell 一直占着两个槽位，所以同时最多运行 14 个别的程序。
 - `current()` 返回当前 hart 上正在运行的进程：`cpus[hart.id()].proc`，只在 `scheduler` 切到进程前设置、切回来后清回 `null`。系统调用和陷阱处理程序用 `current().?` 取当前进程，Debug/safe 模式下没有进程时会 panic。它不用加锁：只有这个 hart 自己读写自己那一项，而且内核关着中断运行，读到之后到开中断之前，这个 hart 不会换进程（xv6 的 `myproc` 为此要 `push_off`）。
@@ -291,8 +291,8 @@ pub fn exec(path: []const u8, args: []const []const u8) ExecError!void {
 fn pushArgs(space: *vm.PageTable, args: []const []const u8) usize   // 返回栈上 Arg 数组的地址
 
 pub const Arg = extern struct { ptr: usize, len: usize };            // abi.zig
-pub const max_args = 16;
-pub const max_arg_bytes = 1024;
+pub const max_args = 32;
+pub const max_arg_bytes = 2048;
 ```
 
 `exec` 把参数复制到新地址空间的栈顶，布局是：
@@ -306,7 +306,7 @@ Arg 数组          argc 个 { ptr, len }，ptr 是上面那些字节的用户�
 
 - 新程序的 `sp` 就从 `Arg` 数组的地址开始，往下才是真正的栈。`Arg` 数组的地址按 16 字节对齐（RISC-V 调用约定要求 `sp` 16 字节对齐）。
 - 和 C 不一样，参数不以 0 结尾、`argv` 数组后面也没有 `NULL`：Zig 用切片，长度和指针一起传，`user/start.zig` 直接把它变成 `[]const abi.Arg`（[user-programs.md](user-programs.md#startzig)）。
-- 最多 16 个参数、加起来最多 1024 字节，所以整块不到 1.3 KiB，栈最顶上那一页一定放得下，`copyToUser` 不会失败（写成 `unreachable`）；剩下的 14 KiB 多给程序当栈用。上限由 `exec` 系统调用检查，超出返回 `-E2BIG`。
+- 最多 32 个参数、加起来最多 2048 字节，所以整块不到 2.6 KiB（2048 + 32 × 16 字节的 `Arg`，再加对齐），栈最顶上那一页一定放得下，`copyToUser` 不会失败（写成 `unreachable`）；剩下的 13 KiB 多给程序当栈用。上限由 `exec` 系统调用检查，超出返回 `-E2BIG`。
 - 用 `loadImage(&hello, &.{ "hello", "", "world!" })` 的单元测试检查了布局：16 字节对齐，每个 `Arg` 指向栈上正确的字节，没有参数时 `sp` 就是栈顶。
 
 ### sbrk：堆
@@ -696,7 +696,7 @@ Ctrl-C 结束的是**前台进程和它的所有子孙**：shell 用 `fork` 启�
 
 - 内核代码不可抢占：进程在内核里关着中断运行，直到自己调用 `sched`。xv6 在内核里也开着中断，内核代码被时钟中断打断时也会 `yield`。这里内核里没有长时间的计算，不需要。
 - 进程之间没有优先级，也不考虑在哪个 hart 上运行过（没有亲和性）。
-- 进程表固定 16 项，内核栈和启动栈是静态的，两侧没有保护页：溢出时会踩坏相邻的数据，所以栈的大小按实测用量留了余量；栈底的金丝雀能在被踩坏的数据被用到之前发现大多数溢出（[进程表](#进程表)）。
+- 进程表固定 64 项，内核栈和启动栈是静态的，两侧没有保护页：溢出时会踩坏相邻的数据，所以栈的大小按实测用量留了余量；栈底的金丝雀能在被踩坏的数据被用到之前发现大多数溢出（[进程表](#进程表)）。
 - `fork` 写时复制，但页表还是整个复制的；内存用完时写共用的页只能结束进程（没有换页、没有 OOM killer 挑别的进程）。
 - `exec` 没有 `PATH`、没有 `#!` 脚本，也不检查执行权限（文件系统没有权限位）：`/bin` 之外的程序要写路径，任何文件都可以拿去试着运行，不是 ELF 的得到 `ENOEXEC`。
 - 只有一个前台进程，没有进程组和信号：Ctrl-C 杀前台进程和它的子孙；前台进程的子孙被交给 init 之后（父进程先结束了）就不算了。

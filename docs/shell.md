@@ -36,7 +36,7 @@ pub fn main() u8 {
 | --- | --- |
 | `\r` 或 `\n` | 换行，返回这一行 |
 | `0x08`（Backspace）或 `0x7f`（Delete） | 行不为空时删掉最后一个字符，并输出 `\x08 \x08`（光标左移、用空格盖掉、再左移） |
-| 可打印字符 `' '..'~'` | 行没满（128 字节）时追加并回显；满了就忽略 |
+| 可打印字符 `' '..'~'` | 行没满（512 字节）时追加并回显；满了就忽略 |
 | 其他（包括方向键产生的转义序列、Tab、Ctrl-D） | 忽略。Ctrl-D 单独按时 `read` 返回 0，也忽略 |
 
 - 终端（QEMU `-nographic` 下就是你的终端）处于原始模式，按回车发送的是 `\r`。
@@ -74,7 +74,7 @@ fn run(input: []const u8) void {
 
 ## 管道
 
-`run A | B | C`：A 的标准输出接到 B 的标准输入，B 的接到 C 的，最多 4 个程序（`max_stages`：init、shell、组长占三个槽位，进程表原来只有 8 个槽位时定下的，现在有 16 个，没有改）。和 xv6 的 `sh` 一样，shell 自己不建管道，而是 fork 一个子进程当**组长**（`runPipeline`），由它来建：
+`run A | B | C`：A 的标准输出接到 B 的标准输入，B 的接到 C 的，最多 8 个程序（`max_stages`；进程表有 64 个槽位，init、shell、组长占三个）。和 xv6 的 `sh` 一样，shell 自己不建管道，而是 fork 一个子进程当**组长**（`runPipeline`），由它来建：
 
 ```zig
 for (stages, 0..) |*st, i| {
@@ -164,7 +164,7 @@ const cmd = std.meta.stringToEnum(Command, name) orelse {
 - 末尾的 `&` 表示后台运行，`&` 前面有没有空格都行（`run spin&` 也可以）。
 - 剩下的按 `|` 拆成几段（`std.mem.splitScalar`），每段按空格拆成词（`std.mem.tokenizeScalar`，连续的空格算一个）。以 `<`、`>`、`>>` 开头的词是重定向（[重定向](#重定向)），其余的第一个词是程序名，所有词（包括程序名）就是它的命令行参数。词是 `line` 里的切片，不复制。
 - 没有引号、没有转义：参数里不能有空格、`|`，也不能以 `<`、`>` 开头。重定向必须在词的开头：`echo three>>/log` 的 `three>>/log` 是一个参数，要写成 `echo three >>/log`。
-- 某一段是空的（`run echo a |`）打印 `run: empty command in the pipeline`；一段超过 16 个词（`abi.max_args`）打印 `run: too many arguments (at most 16)`；超过 4 段打印 `run: too many programs in the pipeline (at most 4)`。
+- 某一段是空的（`run echo a |`）打印 `run: empty command in the pipeline`；一段超过 32 个词（`abi.max_args`）打印 `run: too many arguments (at most 32)`；超过 8 段打印 `run: too many programs in the pipeline (at most 8)`。
 
 ## 命令
 
@@ -187,7 +187,7 @@ const cmd = std.meta.stringToEnum(Command, name) orelse {
 说明：
 
 - `uptime` 显示 `ms / 1000` 秒和 `ms % 1000 / 10` 百分之一秒（补零到两位），所以 `up 3.05s` 不会显示成 `3.5s`。内核按 tick 计时，百分之一秒正好是 tick 数。
-- 进程表满了打印 `run: too many processes (at most 16)`（`fork` 返回 `TooManyProcesses`；16 是 `abi.max_procs`，其中 init 和 shell 占两个），ELF 加载失败打印 `run: cannot load NAME: BadElf`（或 `OutOfMemory`）。
+- 进程表满了打印 `run: too many processes (at most 64)`（`fork` 返回 `TooManyProcesses`；64 是 `abi.max_procs`，其中 init 和 shell 占两个），ELF 加载失败打印 `run: cannot load NAME: BadElf`（或 `OutOfMemory`）。
 - `ps` 的输出（单核，一个后台的 `spin` 在死循环）：
 
   ```

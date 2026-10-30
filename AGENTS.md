@@ -52,7 +52,7 @@ python3 tools/qemu_test.py --list      # 列出 QEMU 测试的用例和它们覆
 - `trap.TrapFrame` 的布局（大小是 16 的倍数，含 `kernel_tp`） ↔ `trap.trapEntry`、`trap.trapExit` 的汇编 ↔ `proc.startFrame` 构造初始 `TrapFrame`（`a0`/`a1`/`sp` 传命令行参数） ↔ `syscall.dispatch` 读参数的下标（[docs/trap.md](docs/trap.md#trapframe)）。
 - `proc.Context` ↔ `proc.contextAsm`（[docs/process.md](docs/process.md#保存的上下文)）。
 - `linker.ld` 里各段的 4 KiB 对齐和 `__text_start`、`__rodata_start`、`__data_start`、`__kernel_end` ↔ `vm.init` 设置的页权限（[docs/boot.md](docs/boot.md#链接脚本)）。
-- `hart.max` ↔ `main.zig` 的启动栈（`boot_stacks`、`_start` 里的编号检查） ↔ 各处按 hart 编号下标的数组（`proc.cpus`、`spinlock.held`、`timer.deadline`）。启动栈的大小是实测的，改了 `kmain` 的初始化要重新量（[docs/boot.md](docs/boot.md#每个-hart-的启动栈)）。
+- `hart.max` ↔ `main.zig` 的启动栈（`boot_stacks`、`_start` 里的编号检查） ↔ 各处按 hart 编号下标的数组（`proc.cpus`、`spinlock.held`、`timer.deadline`、`page.pools`）。启动栈的大小是实测的，改了 `kmain` 的初始化要重新量（[docs/boot.md](docs/boot.md#每个-hart-的启动栈)）。
 - 全局的初始化（启动 hart 的 `kmain`） ↔ 每个 hart 一份的初始化（`kmainSecondary`：`trap.init`、`vm.initHart`、`plic.initHart`、`timer.initHart`、`ipi.initHart`，以及清 `sstatus.FS`）：新加的每个 hart 的 CSR 设置两边都要做（[docs/boot.md](docs/boot.md#启动其他-hart)）。
 - `user/linker.ld` 的页对齐、可读的段 ↔ `proc.loadSegment` 的检查。
 - virtio-mmio 的地址和槽位数（`virtio_disk.mmio_base`、`mmio_size`）↔ `vm.init` 的映射；磁盘的中断号（`virtio_disk.irq`，运行时找到的）↔ `plic.init` 的参数、`trap.handleExternal` 的分发（[docs/disk.md](docs/disk.md)）。

@@ -3,12 +3,15 @@
 //!
 //! 条目（键是 (objectid, type, offset)，objectid 都是 inode 号，所以一个文件的所有条目在树里挨在一起）：
 //!
-//!   (ino, inode,  0)                  Inode：种类、长度、父目录
+//!   (ino, inode,  0)                  Inode：种类、链接数、设备号、长度、父目录
 //!   (目录 ino, dir, 名字的散列 << 32 | 序号)   目录项：子 inode 号、种类、名字。散列相同的名字序号不同
 //!   (ino, extent, 页号 * 4096)        文件第几页的内容：内联（数据直接放在条目里）或者指向一个数据块
 //!
 //! - 根目录的 inode 号是 1，新 inode 号是树里最大的 objectid + 1（挂载时算出来，之后递增）。
-//! - 目录不存 "." 和 ".."：路径里遇到它们时直接用自己、Inode.parent。没有硬链接，一个 inode 只有一个名字。
+//! - 目录不存 "." 和 ".."：路径里遇到它们时直接用自己、Inode.parent。
+//! - 硬链接：文件和设备可以有几个名字（link），Inode.nlink 记着有几个，最后一个名字删掉才删 inode。
+//!   目录只有一个名字（它的 parent 才有意义）。
+//! - 设备文件（mknod）：只有 inode，没有内容，Inode.major 说是哪个设备，打开它的读写交给内核的设备（file.zig）。
 //! - 文件按 4 KiB 一页存。不超过 inline_max 字节的文件整个内联在第 0 页的条目里（btrfs 的 inline extent），
 //!   省一个数据块；长大之后换成数据块。没有条目的页是“洞”，读出来是 0。长度之外的字节总是 0。
 //! - 数据块也写时复制：改一页就分配一个新块、写好，再改条目指向它，旧块交给 Volume.freeData
@@ -36,13 +39,18 @@ const type_inode: u8 = 1;
 const type_dir: u8 = 2;
 const type_extent: u8 = 3;
 
-pub const Kind = enum(u8) { file = 1, dir = 2, _ };
+/// inode 的种类。数值和 abi.FileKind 一样（3、4 是串口、管道，不在文件系统里）
+pub const Kind = enum(u8) { file = 1, dir = 2, device = 5, _ };
 
 pub const Inode = extern struct {
     kind: Kind,
-    _pad: [7]u8 = @splat(0),
+    _pad: u8 = 0,
+    /// 设备文件是哪个设备（abi.Major），别的种类是 0
+    major: u16 = 0,
+    /// 有几个目录项指着它（硬链接）。目录总是 1
+    nlink: u32 = 1,
     size: u64,
-    /// 所在的目录（根目录是它自己）。路径里的 ".." 用它
+    /// 所在的目录（根目录是它自己）。路径里的 ".." 用它；只对目录有意义，文件可能有几个名字
     parent: u64,
 };
 
@@ -89,12 +97,18 @@ pub const Error = ctree.Error || error{
     /// 读写的用户内存不对（out.put、in.get 返回的）
     BadAddress,
     FileTooBig,
+    /// 给目录建硬链接
+    IsDirLink,
+    /// 链接数到上限了
+    TooManyLinks,
 };
 
 pub const Stat = struct {
     ino: u64,
     kind: Kind,
     size: u64,
+    nlink: u32,
+    major: u16,
 };
 
 pub const Dirent = struct {
@@ -187,7 +201,7 @@ pub const Fs = struct {
 
     pub fn stat(fs: *Fs, ino: u64) Error!Stat {
         const ind = try fs.getInode(ino);
-        return .{ .ino = ino, .kind = ind.kind, .size = ind.size };
+        return .{ .ino = ino, .kind = ind.kind, .size = ind.size, .nlink = ind.nlink, .major = ind.major };
     }
 
     // ---- 目录 ----
@@ -252,33 +266,71 @@ pub const Fs = struct {
 
     /// 新建一个空文件或空目录，返回它的 inode 号。已经有这个名字时返回 Exists。
     pub fn create(fs: *Fs, cwd: u64, path: []const u8, kind: Kind) Error!u64 {
+        std.debug.assert(kind == .file or kind == .dir);
+        return fs.makeNode(cwd, path, kind, 0);
+    }
+
+    /// 新建一个设备文件，返回它的 inode 号（mknod）。major 是哪个设备，文件系统不管它是不是真有这个设备。
+    pub fn mknod(fs: *Fs, cwd: u64, path: []const u8, major: u16) Error!u64 {
+        return fs.makeNode(cwd, path, .device, major);
+    }
+
+    fn makeNode(fs: *Fs, cwd: u64, path: []const u8, kind: Kind, major: u16) Error!u64 {
         const dir, const name = try fs.resolveParent(cwd, path);
         const found, const seq = try fs.scan(dir, name);
         if (found != null) return error.Exists;
         const ino = fs.next_ino;
         fs.next_ino += 1;
-        try fs.vol.insert(Key.init(ino, type_inode, 0), std.mem.asBytes(&Inode{ .kind = kind, .size = 0, .parent = dir }));
+        try fs.vol.insert(Key.init(ino, type_inode, 0), std.mem.asBytes(&Inode{ .kind = kind, .major = major, .size = 0, .parent = dir }));
+        try fs.addEntry(dir, nameHash(name) << 32 | seq, ino, kind, name);
+        return ino;
+    }
+
+    /// 在目录 dir 里插一个目录项：键的 offset 是 offset，指向 ino。
+    fn addEntry(fs: *Fs, dir: u64, offset: u64, ino: u64, kind: Kind, name: []const u8) Error!void {
         var buf: [@sizeOf(DirHeader) + max_name]u8 = undefined;
         const head: DirHeader = .{ .ino = ino, .kind = kind, .name_len = @intCast(name.len) };
         @memcpy(buf[0..@sizeOf(DirHeader)], std.mem.asBytes(&head));
         @memcpy(buf[@sizeOf(DirHeader)..][0..name.len], name);
-        try fs.vol.insert(Key.init(dir, type_dir, nameHash(name) << 32 | seq), buf[0 .. @sizeOf(DirHeader) + name.len]);
-        return ino;
+        try fs.vol.insert(Key.init(dir, type_dir, offset), buf[0 .. @sizeOf(DirHeader) + name.len]);
     }
 
-    /// 删掉一个名字和它的 inode（文件的内容一起释放）。目录必须是空的。
-    /// 还打开着它的文件、以它为当前目录的进程之后再用它会得到 NotFound（没有 Unix 那样“关掉才真正删除”）。
+    /// 硬链接：给 old 指着的文件（或设备）再起一个名字 new，链接数加 1。目录不行（IsDirLink），
+    /// new 已经有了是 Exists。两个名字是同一个 inode：改了内容两边都看得到，删掉一个另一个照常。
+    pub fn link(fs: *Fs, cwd: u64, old: []const u8, new: []const u8) Error!void {
+        const ino = try fs.resolve(cwd, old);
+        var ind = try fs.getInode(ino);
+        if (ind.kind == .dir) return error.IsDirLink;
+        if (ind.nlink == std.math.maxInt(u32)) return error.TooManyLinks;
+        const dir, const name = try fs.resolveParent(cwd, new);
+        const found, const seq = try fs.scan(dir, name);
+        if (found != null) return error.Exists;
+        try fs.addEntry(dir, nameHash(name) << 32 | seq, ino, ind.kind, name);
+        ind.nlink += 1;
+        try fs.putInode(ino, ind);
+    }
+
+    /// 删掉一个名字。是 inode 的最后一个名字的话，inode 也删掉（文件的内容一起释放）。目录必须是空的。
+    /// 还打开着被删掉的 inode 的文件、以它为当前目录的进程之后再用它会得到 NotFound（没有 Unix 那样“关掉才真正删除”）。
     pub fn unlink(fs: *Fs, cwd: u64, path: []const u8) Error!void {
         const dir, const name = try fs.resolveParent(cwd, path);
         const found, _ = try fs.scan(dir, name);
         try fs.remove(dir, found orelse return error.NotFound);
     }
 
-    /// 删掉目录 dir 里的目录项 e 和它指向的 inode（unlink、rename 换掉已有的名字）。目录必须是空的。
+    /// 删掉目录 dir 里的目录项 e（unlink、rename 换掉已有的名字）。e 指向的 inode 还有别的名字的话
+    /// 只把链接数减 1，否则 inode 也删掉。目录必须是空的。
     fn remove(fs: *Fs, dir: u64, e: Found) Error!void {
         if (e.kind == .dir) {
             if (try fs.next(Key.init(e.ino, type_dir, 0), null)) |f| {
                 if (f.key.objectid == e.ino and f.key.type == type_dir) return error.NotEmpty;
+            }
+        } else {
+            var ind = try fs.getInode(e.ino);
+            if (ind.nlink > 1) {
+                ind.nlink -= 1;
+                try fs.putInode(e.ino, ind);
+                return fs.vol.delete(Key.init(dir, type_dir, e.offset));
             }
         }
         // inode 号为 e.ino 的所有条目：inode 和文件内容
@@ -293,8 +345,9 @@ pub const Fs = struct {
     /// 掉电也一样。inode 号不变：打开着它的 fd、以它（或者它下面的目录）为当前目录的进程都照常。
     ///
     /// new 已经有了的话换掉它（和 Unix 的 rename 一样）：文件换掉文件，目录换掉空目录（不空是 NotEmpty）；
-    /// 目录换文件是 NotDir，文件换目录是 IsDir。换掉的那个和 unlink 一样连内容一起删掉。
-    /// old 和 new 是同一个名字时什么都不做。目录不能挪进它自己或者它下面（InvalidName）。
+    /// 目录换文件是 NotDir，文件换目录是 IsDir。换掉的那个和 unlink 一样处理（最后一个名字才连内容一起删掉）。
+    /// old 和 new 是同一个 inode（同一个名字，或者同一个文件的两个硬链接）时什么都不做。
+    /// 目录不能挪进它自己或者它下面（InvalidName）。
     pub fn rename(fs: *Fs, cwd: u64, old: []const u8, new: []const u8) Error!void {
         const odir, const oname = try fs.resolveParent(cwd, old);
         const found, _ = try fs.scan(odir, oname);
@@ -324,11 +377,7 @@ pub const Fs = struct {
         const offset = if (target) |t| t.offset else nameHash(nname) << 32 | seq;
         if (target) |t| try fs.remove(ndir, t);
         try fs.vol.delete(Key.init(odir, type_dir, e.offset));
-        var buf: [@sizeOf(DirHeader) + max_name]u8 = undefined;
-        const head: DirHeader = .{ .ino = e.ino, .kind = e.kind, .name_len = @intCast(nname.len) };
-        @memcpy(buf[0..@sizeOf(DirHeader)], std.mem.asBytes(&head));
-        @memcpy(buf[@sizeOf(DirHeader)..][0..nname.len], nname);
-        try fs.vol.insert(Key.init(ndir, type_dir, offset), buf[0 .. @sizeOf(DirHeader) + nname.len]);
+        try fs.addEntry(ndir, offset, e.ino, e.kind, nname);
         if (odir != ndir) {
             var ind = try fs.getInode(e.ino);
             ind.parent = ndir;
@@ -534,6 +583,7 @@ pub const Fs = struct {
         tree: ctree.Volume.Stats,
         files: u64 = 0,
         dirs: u64 = 0,
+        devices: u64 = 0,
         /// 读过、校验和对得上的数据块
         data_blocks: u64 = 0,
     };
@@ -547,8 +597,10 @@ pub const Fs = struct {
     ///   目录项的名字合法、散列对得上，指向的 inode 存在、种类相同、parent 就是这个目录；
     ///   内容条目在文件长度之内，内联的只能是第 0 页、长度就是文件长度、后面没有别的内容条目；
     ///   根目录的 parent 是自己，别的目录沿着 parent 能走到根目录（没有和根目录断开的环）。
-    /// - 除了根目录，每个 inode 正好有一个目录项指着它：目录项的个数、指向的 inode 号之和、
-    ///   之和的散列版本都和 inode 的一样（一个 inode 两个名字、另一个没有名字，这三个同时对上的概率可以忽略）。
+    /// - 除了根目录，每个 inode 正好有 nlink 个目录项指着它（目录正好一个，parent 就是那个目录）：
+    ///   目录项的个数、指向的 inode 号之和、之和的散列版本，都和每个 inode 按 nlink 次算的一样
+    ///   （一个 inode 多一个名字、另一个少一个，这三个同时对上的概率可以忽略）。
+    /// - 设备文件没有内容、长度是 0；只有设备文件的 major 不是 0。
     pub fn check(fs: *Fs) Error!CheckStats {
         var stats: CheckStats = .{ .tree = try fs.vol.check() };
         var buf: [btree.max_data]u8 = undefined;
@@ -567,18 +619,24 @@ pub const Fs = struct {
                 type_inode => {
                     if (f.key.offset != 0 or data.len != @sizeOf(Inode)) return error.Corrupt;
                     const ind = std.mem.bytesToValue(Inode, data);
+                    if (ind.nlink == 0 or (ind.kind != .device and ind.major != 0) or ind._pad != 0) return error.Corrupt;
                     switch (ind.kind) {
                         .file => stats.files += 1,
                         .dir => {
+                            if (ind.nlink != 1) return error.Corrupt;
                             stats.dirs += 1;
                             try fs.checkReachesRoot(ino, ind);
+                        },
+                        .device => {
+                            if (ind.size != 0) return error.Corrupt;
+                            stats.devices += 1;
                         },
                         _ => return error.Corrupt,
                     }
                     if (ino == root_ino) {
                         if (ind.kind != .dir) return error.Corrupt;
                     } else {
-                        inodes.add(ino);
+                        inodes.addTimes(ino, ind.nlink);
                     }
                     cur = ind;
                     cur_ino = ino;
@@ -592,7 +650,7 @@ pub const Fs = struct {
                     checkName(name) catch return error.Corrupt;
                     if (head.ino == root_ino) return error.Corrupt;
                     const child = fs.getInode(head.ino) catch |err| return if (err == error.NotFound) error.Corrupt else err;
-                    if (child.kind != head.kind or child.parent != ino) return error.Corrupt;
+                    if (child.kind != head.kind or (child.kind == .dir and child.parent != ino)) return error.Corrupt;
                     names.add(head.ino);
                 },
                 type_extent => {
@@ -643,13 +701,18 @@ pub const Fs = struct {
         mixed: u64 = 0,
 
         fn add(t: *Tally, ino: u64) void {
-            t.count += 1;
-            t.sum +%= ino;
+            t.addTimes(ino, 1);
+        }
+
+        /// 记 n 次 ino（坏的 nlink 可能很大，不能一次一次地加）
+        fn addTimes(t: *Tally, ino: u64, n: u64) void {
+            t.count +%= n;
+            t.sum +%= ino *% n;
             // splitmix64 的最后一步：把 ino 的每一位搅到所有位上
             var z = ino +% 0x9e37_79b9_7f4a_7c15;
             z = (z ^ (z >> 30)) *% 0xbf58_476d_1ce4_e5b9;
             z = (z ^ (z >> 27)) *% 0x94d0_49bb_1331_11eb;
-            t.mixed +%= z ^ (z >> 31);
+            t.mixed +%= (z ^ (z >> 31)) *% n;
         }
     };
 };
@@ -1019,19 +1082,118 @@ test "check：数清文件、目录、数据块；磁盘上的数据块坏了，
     _ = try fs.check();
 }
 
+test "硬链接：几个名字一个 inode，删到最后一个才删内容；设备文件只有 inode" {
+    const expectEqual = std.testing.expectEqual;
+    var fs = try testSetup(256);
+    defer testFree();
+    const d = try fs.run(Fs.create, .{ root_ino, "/d", Kind.dir });
+    const a = try fs.run(Fs.create, .{ root_ino, "/a", Kind.file });
+    var data: [3 * block_size]u8 = undefined;
+    for (&data, 0..) |*c, i| c.* = @truncate(i * 7);
+    try writeAt(&fs, a, 0, &data);
+    const free_with_one = fs.vol.free_count;
+
+    // 链接到另一个目录里：同一个 inode，链接数 2，内容一样，改了两边都看得到
+    try fs.run(Fs.link, .{ root_ino, "/a", "/d/b" });
+    try expectEqual(a, try fs.resolve(root_ino, "/d/b"));
+    try expectEqual(2, (try fs.stat(a)).nlink);
+    try writeAt(&fs, a, 5, "XY");
+    var buf: [4 * block_size]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, "XY", (try readAll(&fs, "/d/b", &buf))[5..7]);
+    try expectEqual(free_with_one, fs.vol.free_count); // 链接不复制内容
+    _ = try fs.check();
+
+    // 错误：目录不能链接，新名字已经有了，旧名字没有，新名字的目录没有
+    try std.testing.expectError(error.IsDirLink, fs.run(Fs.link, .{ root_ino, "/d", "/d2" }));
+    try std.testing.expectError(error.Exists, fs.run(Fs.link, .{ root_ino, "/a", "/d/b" }));
+    try std.testing.expectError(error.NotFound, fs.run(Fs.link, .{ root_ino, "/nope", "/x" }));
+    try std.testing.expectError(error.NotFound, fs.run(Fs.link, .{ root_ino, "/a", "/nope/x" }));
+    try std.testing.expectError(error.InvalidName, fs.run(Fs.link, .{ root_ino, "/a", "/d/.." }));
+
+    // rename 到同一个 inode 的另一个名字：什么都不做（和 Unix 一样）
+    try fs.run(Fs.rename, .{ root_ino, "/a", "/d/b" });
+    try expectEqual(a, try fs.resolve(root_ino, "/a"));
+    try expectEqual(2, (try fs.stat(a)).nlink);
+
+    // 删掉一个名字，另一个照常，内容不动
+    try fs.run(Fs.unlink, .{ root_ino, "/a" });
+    try std.testing.expectError(error.NotFound, fs.resolve(root_ino, "/a"));
+    try expectEqual(1, (try fs.stat(a)).nlink);
+    try expectEqual(data.len, (try readAll(&fs, "/d/b", &buf)).len);
+    _ = try fs.check();
+
+    // rename 换掉一个有两个名字的文件：被换掉的只少一个名字
+    const c = try fs.run(Fs.create, .{ root_ino, "/c", Kind.file });
+    try fs.run(Fs.link, .{ root_ino, "/d/b", "/e" });
+    try fs.run(Fs.rename, .{ root_ino, "/c", "/d/b" });
+    try expectEqual(c, try fs.resolve(root_ino, "/d/b"));
+    try expectEqual(a, try fs.resolve(root_ino, "/e"));
+    try expectEqual(1, (try fs.stat(a)).nlink);
+    _ = try fs.check();
+
+    // 最后一个名字删掉：inode 和数据块都没了
+    try fs.run(Fs.unlink, .{ root_ino, "/e" });
+    try std.testing.expectError(error.NotFound, fs.stat(a));
+    try std.testing.expect(fs.vol.free_count > free_with_one); // 数据块在 pending 里，提交之后空出来了
+    _ = try fs.check();
+
+    // 设备文件：只有 inode，长度 0，可以链接、改名、删除
+    const dev = try fs.run(Fs.mknod, .{ root_ino, "/d/null", 2 });
+    const st = try fs.stat(dev);
+    try expectEqual(Kind.device, st.kind);
+    try expectEqual(2, st.major);
+    try expectEqual(0, st.size);
+    try expectEqual(1, st.nlink);
+    try std.testing.expectError(error.Exists, fs.run(Fs.mknod, .{ root_ino, "/d/null", 3 }));
+    try std.testing.expectError(error.IsDir, fs.read(dev, 0, 1, SliceOut{ .buf = &buf })); // 读写设备由内核做，不经过文件系统
+    try fs.run(Fs.link, .{ root_ino, "/d/null", "/null2" });
+    try expectEqual(2, (try fs.stat(dev)).nlink);
+    _ = try fs.check();
+    try fs.run(Fs.unlink, .{ root_ino, "/d/null" });
+    try fs.run(Fs.unlink, .{ root_ino, "/null2" });
+    try std.testing.expectError(error.NotFound, fs.stat(dev));
+    _ = try fs.check();
+    try expectEqual(d, try fs.resolve(root_ino, "/d"));
+
+    // 链接数在重新挂载之后还在
+    _ = try fs.run(Fs.create, .{ root_ino, "/p", Kind.file });
+    try fs.run(Fs.link, .{ root_ino, "/p", "/q" });
+    testReboot();
+    fs = try Fs.mount(&test_vol);
+    try expectEqual(2, (try fs.stat(try fs.resolve(root_ino, "/q"))).nlink);
+    _ = try fs.check();
+}
+
 test "check：条目之间对不上的都是 Corrupt" {
     var fs = try testSetup(256);
     defer testFree();
     const d = try fs.run(Fs.create, .{ root_ino, "/d", Kind.dir });
     const f = try fs.run(Fs.create, .{ root_ino, "/d/f", Kind.file });
+    const e = try fs.run(Fs.create, .{ root_ino, "/d/e", Kind.dir });
+    const dev = try fs.run(Fs.mknod, .{ root_ino, "/d/dev", 2 });
     try writeAt(&fs, f, 0, "hello");
+    try fs.run(Fs.link, .{ root_ino, "/d/f", "/f2" });
     _ = try fs.check();
     const v = fs.vol;
     const n = fs.next_ino;
     fs.next_ino += 10;
 
     // 每一种坏法：在当前事务里改，check 报 Corrupt，再 abort 退回好的状态
-    const Bad = enum { orphan_inode, dangling_entry, wrong_parent, stray_item, extent_past_end, two_names, cycle, entry_in_file };
+    const Bad = enum {
+        orphan_inode,
+        dangling_entry,
+        wrong_parent,
+        stray_item,
+        extent_past_end,
+        two_names,
+        missing_link,
+        dir_two_links,
+        zero_links,
+        device_content,
+        file_major,
+        cycle,
+        entry_in_file,
+    };
     for (std.enums.values(Bad)) |bad| {
         var entry: [@sizeOf(DirHeader) + 1]u8 = undefined;
         const dirEntry = struct {
@@ -1047,14 +1209,27 @@ test "check：条目之间对不上的都是 Corrupt" {
             .orphan_inode => try v.insert(Key.init(n, type_inode, 0), std.mem.asBytes(&Inode{ .kind = .file, .size = 0, .parent = d })),
             // 目录项指向不存在的 inode
             .dangling_entry => try v.insert(x_key, dirEntry(&entry, n, .file)),
-            // inode 的 parent 不是装着它的目录
-            .wrong_parent => try v.update(Key.init(f, type_inode, 0), std.mem.asBytes(&Inode{ .kind = .file, .size = 5, .parent = root_ino })),
+            // 目录的 parent 不是装着它的目录（文件的 parent 不核对：它可能有几个名字）
+            .wrong_parent => try v.update(Key.init(e, type_inode, 0), std.mem.asBytes(&Inode{ .kind = .dir, .size = 0, .parent = root_ino })),
             // 没有 inode 的条目
             .stray_item => try v.insert(Fs.extentKey(n, 0), std.mem.asBytes(&ExtentHeader{ .kind = .inline_data })),
             // 内容条目在文件长度之外
-            .extent_past_end => try v.update(Key.init(f, type_inode, 0), std.mem.asBytes(&Inode{ .kind = .file, .size = 0, .parent = d })),
-            // 一个 inode 两个名字
+            .extent_past_end => try v.update(Key.init(f, type_inode, 0), std.mem.asBytes(&Inode{ .kind = .file, .nlink = 2, .size = 0, .parent = d })),
+            // 名字比链接数多：f 有两个名字，再加一个
             .two_names => try v.insert(x_key, dirEntry(&entry, f, .file)),
+            // 名字比链接数少：f 的链接数改成 3
+            .missing_link => try v.update(Key.init(f, type_inode, 0), std.mem.asBytes(&Inode{ .kind = .file, .nlink = 3, .size = 5, .parent = d })),
+            // 目录有两个名字（链接数和名字对得上也不行）
+            .dir_two_links => {
+                try v.update(Key.init(e, type_inode, 0), std.mem.asBytes(&Inode{ .kind = .dir, .nlink = 2, .size = 0, .parent = d }));
+                try v.insert(Key.init(root_ino, type_dir, nameHash("x") << 32), dirEntry(&entry, e, .dir));
+            },
+            // 链接数是 0
+            .zero_links => try v.update(Key.init(dev, type_inode, 0), std.mem.asBytes(&Inode{ .kind = .device, .major = 2, .nlink = 0, .size = 0, .parent = d })),
+            // 设备文件有内容
+            .device_content => try v.insert(Fs.extentKey(dev, 0), std.mem.asBytes(&ExtentHeader{ .kind = .inline_data })),
+            // 普通文件带着设备号
+            .file_major => try v.update(Key.init(f, type_inode, 0), std.mem.asBytes(&Inode{ .kind = .file, .major = 1, .nlink = 2, .size = 5, .parent = d })),
             // 两个目录互为 parent，和根目录断开
             .cycle => {
                 try v.insert(Key.init(n, type_inode, 0), std.mem.asBytes(&Inode{ .kind = .dir, .size = 0, .parent = n + 1 }));
@@ -1076,18 +1251,27 @@ test "check：条目之间对不上的都是 Corrupt" {
 
 /// 掉电测试：一串随机的文件系统操作（每个操作提交一次），在每一次写盘之后掉电，重新挂载后
 /// 检查通过，所有文件的内容正好是某一个操作做完之后的样子，并且不早于最后一个做完了的操作。
+/// 有硬链接，几个名字可能是同一个文件：names[i] 是名字 i 指着的文件（files 的下标），没有这个名字是 null。
 const FsModel = struct {
     files: [5]std.ArrayListUnmanaged(u8) = @splat(.empty),
-    exists: [5]bool = @splat(false),
+    names: [5]?usize = @splat(null),
 
     fn deinit(m: *FsModel) void {
         for (&m.files) |*f| f.deinit(std.testing.allocator);
     }
 
     fn clone(m: *const FsModel) !FsModel {
-        var c: FsModel = .{ .exists = m.exists };
+        var c: FsModel = .{ .names = m.names };
         for (&c.files, m.files) |*d, s| d.* = try s.clone(std.testing.allocator);
         return c;
+    }
+
+    /// 没有名字指着的文件槽位（名字只有 5 个，一定有）
+    fn freeFile(m: *const FsModel) usize {
+        for (0..m.files.len) |k| {
+            if (std.mem.indexOfScalar(?usize, &m.names, k) == null) return k;
+        }
+        unreachable;
     }
 };
 
@@ -1116,7 +1300,7 @@ const FsCrashRun = struct {
         try r.snapshots.append(std.testing.allocator, try model.clone());
         r.completed = fs.vol.generation;
         test_budget = budget;
-        var prng = std.Random.DefaultPrng.init(7);
+        var prng = std.Random.DefaultPrng.init(9);
         const rng = prng.random();
         var data: [3 * block_size]u8 = undefined;
         for (0..25) |step_no| {
@@ -1151,30 +1335,35 @@ const FsCrashRun = struct {
     }
 };
 
-/// 对文件 i 做一个随机操作（不存在就创建；否则删除、截断、改名成另一个文件 j（j 有的话换掉它），
-/// 或者在随机位置写一段），同时改 next。
+/// 对名字 i 做一个随机操作（不存在就创建；否则删除、截断、改名成另一个名字 j（j 有的话换掉它）、
+/// 给它建一个硬链接（链接到一个还没有的名字），或者在随机位置写一段），同时改 next。
 fn step(fs: *Fs, next: *FsModel, i: usize, path: []const u8, rng: std.Random, step_no: usize, data: []u8) !void {
-    if (!next.exists[i]) {
-        next.exists[i] = true;
+    const k = next.names[i] orelse {
+        const free = next.freeFile();
+        next.files[free].clearRetainingCapacity();
+        next.names[i] = free;
         _ = try fs.run(Fs.create, .{ root_ino, path, Kind.file });
         return;
-    }
+    };
     const ino = try fs.resolve(root_ino, path);
-    const f = &next.files[i];
-    switch (rng.uintLessThan(u8, 5)) {
+    const f = &next.files[k];
+    const j = (i + 1 + rng.uintLessThan(usize, next.names.len - 1)) % next.names.len;
+    var jbuf: [16]u8 = undefined;
+    switch (rng.uintLessThan(u8, 6)) {
         0 => {
-            next.exists[i] = false;
-            f.clearRetainingCapacity();
+            next.names[i] = null;
             try fs.run(Fs.unlink, .{ root_ino, path });
         },
         4 => {
-            const j = (i + 1 + rng.uintLessThan(usize, next.files.len - 1)) % next.files.len;
-            var jbuf: [16]u8 = undefined;
-            std.mem.swap(std.ArrayListUnmanaged(u8), f, &next.files[j]);
-            f.clearRetainingCapacity();
-            next.exists[i] = false;
-            next.exists[j] = true;
+            next.names[j] = k;
+            next.names[i] = null;
             try fs.run(Fs.rename, .{ root_ino, path, fsPath(&jbuf, j) });
+        },
+        5 => {
+            // 链接到一个还没有的名字（都有了就什么都不做）
+            const free = std.mem.indexOfScalar(?usize, &next.names, null) orelse return;
+            next.names[free] = k;
+            try fs.run(Fs.link, .{ root_ino, path, fsPath(&jbuf, free) });
         },
         1 => {
             f.clearRetainingCapacity();
@@ -1183,7 +1372,7 @@ fn step(fs: *Fs, next: *FsModel, i: usize, path: []const u8, rng: std.Random, st
         else => {
             const off = rng.uintAtMost(usize, 2 * block_size);
             const len = 1 + rng.uintLessThan(usize, data.len);
-            for (data[0..len], 0..) |*c, j| c.* = @truncate(step_no * 31 + j);
+            for (data[0..len], 0..) |*c, x| c.* = @truncate(step_no * 31 + x);
             if (f.items.len < off + len) {
                 const old = f.items.len;
                 try f.resize(std.testing.allocator, off + len);
@@ -1195,16 +1384,24 @@ fn step(fs: *Fs, next: *FsModel, i: usize, path: []const u8, rng: std.Random, st
     }
 }
 
+/// 每个名字的内容和 model 一样；指着同一个文件的名字是同一个 inode，链接数就是名字的个数。
 fn fsExpect(fs: *Fs, m: *const FsModel) !void {
     var buf: [6 * block_size]u8 = undefined;
-    for (m.files, m.exists, 0..) |f, ex, i| {
+    for (m.names, 0..) |name, i| {
         var pbuf: [16]u8 = undefined;
         const path = fsPath(&pbuf, i);
-        if (!ex) {
+        const k = name orelse {
             try std.testing.expectError(error.NotFound, fs.resolve(root_ino, path));
             continue;
+        };
+        try std.testing.expectEqualSlices(u8, m.files[k].items, try readAll(fs, path, &buf));
+        const st = try fs.stat(try fs.resolve(root_ino, path));
+        try std.testing.expectEqual(std.mem.count(?usize, &m.names, &.{k}), st.nlink);
+        for (m.names, 0..) |other, x| {
+            if (other != k) continue;
+            var obuf: [16]u8 = undefined;
+            try std.testing.expectEqual(st.ino, try fs.resolve(root_ino, fsPath(&obuf, x)));
         }
-        try std.testing.expectEqualSlices(u8, f.items, try readAll(fs, path, &buf));
     }
 }
 

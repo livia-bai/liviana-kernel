@@ -28,9 +28,10 @@ const Spinlock = @import("spinlock.zig").Spinlock;
 const Sleeplock = @import("sleeplock.zig").Sleeplock;
 
 /// 整个系统最多同时有多少个打开的文件。每个进程最多 abi.max_fds 个 fd，但它们大多指向同一个串口。
-pub const max_files = 32;
+pub const max_files = 128;
 
-pub const Kind = enum { none, console, pipe, inode };
+/// console 是 init 打开的串口；device 是打开文件系统里的设备文件得到的（读写交给 major 指的设备）
+pub const Kind = enum { none, console, pipe, inode, device };
 
 pub const File = struct {
     /// 保护 ref
@@ -41,8 +42,10 @@ pub const File = struct {
     readable: bool = false,
     writable: bool = false,
     pipe: *pipe.Pipe = undefined,
-    /// kind 为 inode 时：文件系统里的 inode 号，和下一次读写的位置（pos_lock）
+    /// kind 为 inode、device 时：文件系统里的 inode 号；inode 的还有下一次读写的位置（pos_lock）
     ino: u64 = 0,
+    /// kind 为 device 时：哪个设备
+    major: abi.Major = .console,
     off: u64 = 0,
     /// open_append：每次写之前先把 off 挪到文件末尾
     append: bool = false,
@@ -57,6 +60,7 @@ pub const File = struct {
         f.writable = false;
         f.pipe = undefined;
         f.ino = 0;
+        f.major = .console;
         f.off = 0;
         f.append = false;
     }
@@ -116,6 +120,21 @@ pub fn openInode(ino: u64, readable: bool, writable: bool, append: bool) error{T
     return f;
 }
 
+/// 打开文件系统里的设备文件 ino（设备号 major）。内核没有这个设备是 NoSuchDevice。
+pub fn openDevice(ino: u64, major: abi.Major, readable: bool, writable: bool) error{ TooManyFiles, NoSuchDevice }!*File {
+    switch (major) {
+        .console, .null, .zero => {},
+        _ => return error.NoSuchDevice,
+    }
+    const f = try alloc();
+    f.kind = .device;
+    f.ino = ino;
+    f.major = major;
+    f.readable = readable;
+    f.writable = writable;
+    return f;
+}
+
 /// 多一个引用（dup、fork），返回同一个 File。
 pub fn dup(f: *File) *File {
     f.lock.acquire();
@@ -152,6 +171,12 @@ pub fn read(f: *File, space: *vm.PageTable, ptr: usize, len: usize) Error!usize 
         .console => consoleRead(space, ptr, len),
         .pipe => pipe.read(f.pipe, space, ptr, len),
         .inode => inodeRead(f, space, ptr, len),
+        .device => switch (f.major) {
+            .console => consoleRead(space, ptr, len),
+            .null => 0,
+            .zero => zeroRead(space, ptr, len),
+            _ => unreachable, // openDevice 不会打开不认识的设备
+        },
     };
 }
 
@@ -164,7 +189,26 @@ pub fn write(f: *File, space: *vm.PageTable, ptr: usize, len: usize) Error!usize
         .console => consoleWrite(space, ptr, len),
         .pipe => pipe.write(f.pipe, space, ptr, len),
         .inode => inodeWrite(f, space, ptr, len),
+        .device => switch (f.major) {
+            .console => consoleWrite(space, ptr, len),
+            // 写什么都丢掉，也不看用户内存（和 Linux 的 /dev/null 一样）
+            .null, .zero => len,
+            _ => unreachable,
+        },
     };
+}
+
+const zero_page: [page.size]u8 = @splat(0);
+
+/// /dev/zero：把 len 个 0 写进用户内存。调用方先检查过目标可写。
+fn zeroRead(space: *vm.PageTable, ptr: usize, len: usize) Error!usize {
+    var done: usize = 0;
+    while (done < len) {
+        const n = @min(zero_page.len, len - done);
+        vm.copyToUser(space, ptr + done, zero_page[0..n]) catch unreachable;
+        done += n;
+    }
+    return len;
 }
 
 /// 用户内存先分块复制到内核缓冲区再输出，每块都经过 vm.copyFromUser 检查。

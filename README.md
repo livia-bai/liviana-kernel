@@ -10,11 +10,11 @@
 - 物理页分配器，Sv39 分页，内核按段设置权限（代码只读可执行，数据不可执行）
 - U 模式用户程序：独立编译的 ELF 装在文件系统的 `/bin` 里，`exec` 时由内核从磁盘加载（只有 init 嵌在内核里）；用户程序出错或按 Ctrl-C 只结束进程，内核照常运行
 - 多核：启动 hart 用 SBI 的 HSM 扩展启动设备树里的其他 hart（QEMU 默认 4 个，最多用 8 个），每个 hart 跑自己的调度器；核间中断叫醒空闲的 hart、打断运行着被杀进程的 hart
-- 多进程，照 xv6 的结构：时间片轮转调度（每个 hart 一个调度器循环、`sleep`/`wakeup`、`kill` 只做标记）；`fork`/`exec`/`wait`、父子进程、zombie 和孤儿回收；最多 16 个进程
+- 多进程，照 xv6 的结构：时间片轮转调度（每个 hart 一个调度器循环、`sleep`/`wakeup`、`kill` 只做标记）；`fork`/`exec`/`wait`、父子进程、zombie 和孤儿回收；最多 64 个进程，每个最多 32 个 fd，整个系统最多 128 个打开的文件
 - 写时复制的 `fork`：父子进程共用物理页（页分配器记引用数），谁先写哪一页谁在缺页异常里复制一份
 - 磁盘：virtio 块设备驱动（DMA + 中断，等磁盘时进程睡着），睡眠锁，照 xv6 的缓冲区缓存（LRU）
-- 文件系统，类似 btrfs：所有东西（inode、目录项、文件内容）都是一棵写时复制 B 树里的条目，每个操作一个事务，掉电后总是某个操作做完的样子；小文件内联在树里，数据块带校验和；构建时由主机上的 `mkfs` 生成磁盘镜像，用户程序装在 `/bin`
-- 32 个系统调用：文件描述符（`read`/`write`/`close`/`dup`）和管道（`pipe`），文件系统（`open`（含 `O_APPEND`）/`lseek`/`rename`/`mkdir`/`unlink`/`chdir`/`fstat`/`readdir`，检查整个文件系统的 `scrub`），命令行参数（`exec` 带 `argv`），堆（`sbrk`），读写磁盘的原始区域（`readblock`/`writeblock`）
+- 文件系统，类似 btrfs：所有东西（inode、目录项、文件内容）都是一棵写时复制 B 树里的条目，每个操作一个事务，掉电后总是某个操作做完的样子；小文件内联在树里，数据块带校验和；硬链接；设备文件（`/dev/console`、`/dev/null`、`/dev/zero`）；构建时由主机上的 `mkfs` 生成磁盘镜像，用户程序装在 `/bin`
+- 34 个系统调用：文件描述符（`read`/`write`/`close`/`dup`）和管道（`pipe`），文件系统（`open`（含 `O_APPEND`）/`lseek`/`rename`/`link`/`mknod`/`mkdir`/`unlink`/`chdir`/`fstat`/`readdir`，检查整个文件系统的 `scrub`），命令行参数（`exec` 带 `argv`，最多 32 个），堆（`sbrk`），读写磁盘的原始区域（`readblock`/`writeblock`）
 - 用户态的 init 和 shell：init 启动 shell，shell 用 `fork` + `exec` 运行程序（直接写程序名，或者 `run 程序名`），可以带参数、在后台运行、用 `|` 接成管道、用 `<`、`>`、`>>` 重定向到文件，`cd` 换当前目录
 - 照 xv6 加锁，并且尽量细：每个进程、每个管道、每个打开的文件一把锁；页分配器每个 hart 一条空闲链表；缓冲区缓存按块号分桶；文件系统的读者在已提交的树的快照上读、不拿锁，修改之间才排队
 
@@ -22,19 +22,19 @@
 Hello from a Zig kernel on RISC-V!
 SBI: OpenSBI, spec v1.0 | hart 0 | device tree at 0x87e00000
 [ok] trap vector installed
-[trap] breakpoint at 0x80216878, skipping it
+[trap] breakpoint at 0x802168b6, skipping it
 [ok] device tree: 128 MiB RAM at 0x80000000, timebase 10000000 Hz
-[ok] page allocator: 31901 free pages (127604 KiB)
+[ok] page allocator: 31655 free pages (126620 KiB)
 [ok] Sv39 paging enabled: kernel mapped 1:1, text r-x, rodata r--, data rw-
 [ok] virtio disk: 8192 blocks of 4 KiB (32 MiB), irq 1
 [ok] interrupt sources enabled: timer at 100 Hz, keyboard via UART + PLIC, IPIs, disk
 [ok] 4 harts running, booted on hart 0
-[ok] file system: 6840 of 7168 blocks free, generation 27
+[ok] file system: 6756 of 7168 blocks free, generation 37
 Type 'help' for commands.
 > run
-programs: cat echo fault hello init ls mkdir mv rm scrub sh spin ticker wc
+programs: cat echo fault hello init ln ls mkdir mv rm scrub sh spin ticker wc
 > run hello
-Hello from U-mode! I am pid 3, the kernel has been up for 280 ms.
+Hello from U-mode! I am pid 3, the kernel has been up for 140 ms.
 write() refused a kernel pointer: BadAddress
 [proc] pid 3 (hello) exited with code 0
 > run echo hello, world > /hello.txt
@@ -52,27 +52,38 @@ hello, world
 > cd /docs
 > run wc < /hello.txt > count.txt
 [proc] pid 10 (wc) exited with code 0
+> run ln /hello.txt hi.txt
+[proc] pid 11 (ln) exited with code 0
 > run ls /docs /
 /docs:
-file        7 count.txt
+file  1        7 count.txt
+file  2       13 hi.txt
 /:
-file       13 hello.txt
-dir         0 bin
-dir         0 docs
-[proc] pid 11 (ls) exited with code 0
+file  2       13 hello.txt
+dir   1        0 dev
+dir   1        0 bin
+dir   1        0 docs
+[proc] pid 12 (ls) exited with code 0
+> run ls /dev
+dev   1        2 null
+dev   1        3 zero
+dev   1        1 console
+[proc] pid 13 (ls) exited with code 0
+> run echo gone > /dev/null
+[proc] pid 14 (echo) exited with code 0
 > cd
 > run spin &
-[proc] pid 12 (spin) started in the background
-> pid 12 spinning in U-mode without making syscalls
+[proc] pid 15 (spin) started in the background
+> pid 15 spinning in U-mode without making syscalls
 ps
   PID  PPID STATE     TICKS NAME
-    1     0 sleeping      1 init
-    2     1 running       3 sh
-   12     2 running      48 spin
+    1     0 sleeping      0 init
+    2     1 running       5 sh
+   15     2 running      48 spin
 > run spin
-pid 13 spinning in U-mode without making syscalls
+pid 16 spinning in U-mode without making syscalls
 ^C
-[proc] pid 13 (spin) killed: interrupted by Ctrl-C
+[proc] pid 16 (spin) killed: interrupted by Ctrl-C
 ```
 
 ## 运行
@@ -108,8 +119,8 @@ shell 是用户程序（`user/sh.zig`），由 init 启动。
 | `mem` | 物理页的使用情况 |
 | `disk` | 磁盘的原始区域（文件系统之后的块）有多大 |
 | `cd [DIR]` | 换当前目录，不给时回到 `/` |
-| `NAME [ARGS...]` 或 `run NAME [ARGS...]` | 用 `fork` + `exec` 运行用户程序 `NAME`（`hello`、`fault`、`spin`、`ticker`、`echo`、`cat`、`wc`、`ls`、`mkdir`、`rm`、`mv`、`scrub`），带上参数，等它结束，Ctrl-C 结束它；只写 `run` 时列出所有程序。下面几行的 `run` 也都可以不写 |
-| `run A \| B \| ...` | 管道：A 的输出接到 B 的输入，最多 4 个程序；Ctrl-C 结束整条管道 |
+| `NAME [ARGS...]` 或 `run NAME [ARGS...]` | 用 `fork` + `exec` 运行用户程序 `NAME`（`hello`、`fault`、`spin`、`ticker`、`echo`、`cat`、`wc`、`ls`、`mkdir`、`rm`、`mv`、`ln`、`scrub`），带上参数，等它结束，Ctrl-C 结束它；只写 `run` 时列出所有程序。下面几行的 `run` 也都可以不写 |
+| `run A \| B \| ...` | 管道：A 的输出接到 B 的输入，最多 8 个程序；Ctrl-C 结束整条管道 |
 | `run ... > F`、`run ... >> F`、`run ... < F` | 标准输出写进文件 `F`（没有就建，有就清空）、追加到 `F` 末尾、标准输入从 `F` 读 |
 | `run ... &` | 在后台运行，马上回到提示符 |
 | `ps` | 列出进程：pid、父进程、状态、用掉的时钟 tick 数 |

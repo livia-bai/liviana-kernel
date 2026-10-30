@@ -27,14 +27,17 @@ pub const Syscall = enum(usize) {
     close = 17, dup = 18, pipe = 19, sbrk = 20,
     blockcount = 21, readblock = 22, writeblock = 23,
     open = 24, mkdir = 25, unlink = 26, chdir = 27, fstat = 28, readdir = 29,
-    scrub = 30, rename = 31, lseek = 32,
+    scrub = 30, rename = 31, lseek = 32, link = 33, mknod = 34,
     _,
 };
+pub const Major = enum(u16) { console = 1, null = 2, zero = 3, _ };   // 设备文件的设备号
 
 pub const Errno = enum(usize) {
-    perm = 1,     // EPERM：杀 init
+    perm = 1,     // EPERM：杀 init；给目录建硬链接（link）
     noent = 2,    // ENOENT：没有这个程序（exec），没有这个文件或目录
     srch = 3,     // ESRCH：没有这个进程（kill、setfg）
+    nxio = 6,     // ENXIO：打开的设备文件的设备号内核不认识（open）
+    mlink = 31,   // EMLINK：链接数到上限了（link）
     io = 5,       // EIO：磁盘上的数据不对（校验和、结构）
     nodev = 19,   // ENODEV：没有磁盘，或者磁盘上没有文件系统
     exist = 17,   // EEXIST：已经有这个名字了（mkdir；open 带 O_CREATE 时不算错）
@@ -61,11 +64,11 @@ pub const Errno = enum(usize) {
     _,
 };
 
-pub const max_procs = 16;
-pub const max_fds = 16;                  // 每个进程的 fd 表大小
+pub const max_procs = 64;                // xv6 的 NPROC 也是 64
+pub const max_fds = 32;                  // 每个进程的 fd 表大小（xv6 的 NOFILE 是 16）
 pub const stdin = 0, stdout = 1, stderr = 2;
-pub const max_args = 16;                 // exec 最多传几个参数
-pub const max_arg_bytes = 1024;          // 参数加起来最多多少字节
+pub const max_args = 32;                 // exec 最多传几个参数（xv6 的 MAXARG 也是 32）
+pub const max_arg_bytes = 2048;          // 参数加起来最多多少字节
 pub const block_size = 4096;             // 磁盘块的大小，正好一页
 pub const max_path = 256;                // 路径最长多少字节
 pub const max_name = 255;                // 名字（路径的一段）最长多少字节
@@ -79,8 +82,8 @@ pub const killed_status: u32 = 0x100; // wait 拿到的“被杀”状态（正�
 pub const ProcState = enum(u8) { unused, runnable, running, sleeping, zombie };
 pub const ProcInfo = extern struct { pid: u64, ppid: u64, ticks: u64, state: ProcState, name_len: u8, name: [16]u8 };
 pub const MemInfo = extern struct { free_pages: u64, total_pages: u64, page_size: u64 };
-pub const FileKind = enum(u8) { file = 1, dir = 2, console = 3, pipe = 4, _ };
-pub const Stat = extern struct { ino: u64, size: u64, kind: FileKind, _pad: [7]u8 };
+pub const FileKind = enum(u8) { file = 1, dir = 2, console = 3, pipe = 4, device = 5, _ };
+pub const Stat = extern struct { ino: u64, size: u64, kind: FileKind, _pad: u8, major: u16, nlink: u32 };
 pub const Dirent = extern struct { ino: u64, kind: FileKind, name_len: u8, _pad: [6]u8, name: [max_name]u8 };
 
 pub fn fail(e: Errno) usize            // 把错误码编码成返回值：0 -% e
@@ -121,15 +124,17 @@ pub fn errnoOf(ret: usize) ?Errno      // 返回值在 [-4095, -1] 内时取出�
 | 21 | `blockcount` | 无 | 磁盘的原始区域（文件系统之后的块）有多少块，没有磁盘时是 0 | 每块 `abi.block_size` = 4096 字节（[disk.md](disk.md#系统调用)） |
 | 22 | `readblock` | `a0` = 块号，`a1` = 缓冲区地址 | 0；`-EINVAL`（块号超出原始区域）、`-ENODEV`、`-EFAULT` | 经过缓冲区缓存读原始区域的一块，4096 字节写进缓冲区 |
 | 23 | `writeblock` | `a0` = 块号，`a1` = 缓冲区地址 | 0；`-EINVAL`、`-ENODEV`、`-EFAULT` | 缓冲区的 4096 字节写到原始区域的这一块，写完才返回 |
-| 24 | `open` | `a0` = 路径地址，`a1` = 路径长度，`a2` = flags | 新的 fd；`-ENOENT`、`-ENOTDIR`、`-EISDIR`、`-EEXIST`、`-ENAMETOOLONG`、`-EINVAL`、`-ENOSPC`、`-EIO`、`-ENODEV`、`-EFAULT`、`-ENFILE`、`-EMFILE` | 打开文件或目录（[fs.md](fs.md#接进内核fsyszig)）。flags：`open_read`/`open_write`/`open_rdwr` 加上 `open_create`（没有就建一个空文件）、`open_trunc`（可写时截成 0 字节）、`open_append`（0x800，每次写都写在末尾）；别的位、读写方式是 3 都是 `-EINVAL`。目录只能只读地打开。相对路径从当前目录开始 |
+| 24 | `open` | `a0` = 路径地址，`a1` = 路径长度，`a2` = flags | 新的 fd；`-ENOENT`、`-ENOTDIR`、`-EISDIR`、`-EEXIST`、`-ENAMETOOLONG`、`-EINVAL`、`-ENOSPC`、`-EIO`、`-ENODEV`、`-EFAULT`、`-ENFILE`、`-EMFILE`、`-ENXIO`（不认识的设备） | 打开文件、目录或设备文件（[fs.md](fs.md#接进内核fsyszig)，设备见 [files.md](files.md#设备文件)）。flags：`open_read`/`open_write`/`open_rdwr` 加上 `open_create`（没有就建一个空文件）、`open_trunc`（可写时截成 0 字节）、`open_append`（0x800，每次写都写在末尾）；别的位、读写方式是 3 都是 `-EINVAL`。目录只能只读地打开。相对路径从当前目录开始 |
 | 25 | `mkdir` | `a0` = 路径地址，`a1` = 路径长度 | 0；`-EEXIST`、`-ENOENT`、`-ENOTDIR`、`-EINVAL`、`-ENAMETOOLONG`、`-ENOSPC` 等 | 建一个空目录 |
-| 26 | `unlink` | 同上 | 0；`-ENOENT`、`-ENOTEMPTY`、`-EINVAL` 等 | 删掉一个文件或空目录。打开着它的 fd 之后读写是 `-ENOENT` |
+| 26 | `unlink` | 同上 | 0；`-ENOENT`、`-ENOTEMPTY`、`-EINVAL` 等 | 删掉一个名字（文件、设备文件或空目录）。是最后一个名字的话文件也删掉，打开着它的 fd 之后读写是 `-ENOENT` |
 | 27 | `chdir` | 同上 | 0；`-ENOENT`、`-ENOTDIR` 等 | 换当前目录（`Process.cwd`，`fork` 继承） |
-| 28 | `fstat` | `a0` = fd，`a1` = `Stat` 的地址 | 0；`-EBADF`、`-EFAULT`、`-ENOENT` | inode 号、长度、种类。串口、管道的 inode 号和长度是 0 |
+| 28 | `fstat` | `a0` = fd，`a1` = `Stat` 的地址 | 0；`-EBADF`、`-EFAULT`、`-ENOENT` | inode 号、长度、种类、设备号、链接数。串口、管道的 inode 号、长度、链接数是 0 |
 | 29 | `readdir` | `a0` = fd，`a1` = `Dirent` 的地址 | 1；列完了是 0；`-EBADF`、`-ENOTDIR`、`-EFAULT` | 目录的下一项（不含 `.`、`..`），按名字的散列排序。读写位置就是 `fs.readdir` 的 cookie，结果写进用户内存成功了才往后挪 |
-| 30 | `scrub` | `a0` = `ScrubInfo` 的地址 | 0；`-EIO`（文件系统坏了）、`-ENODEV`、`-EFAULT` | 检查整个文件系统：作废缓冲区缓存，B 树、每个数据块的校验和、条目之间的关系都核对一遍，只读不改（[fs.md](fs.md#检查整个文件系统checkscrub)）。统计（文件数、目录数、数据块数、B 树的节点数、条目数、层数、空闲块数、总块数、事务号）写进 `a0` 指向的地方 |
+| 30 | `scrub` | `a0` = `ScrubInfo` 的地址 | 0；`-EIO`（文件系统坏了）、`-ENODEV`、`-EFAULT` | 检查整个文件系统：作废缓冲区缓存，B 树、每个数据块的校验和、条目之间的关系都核对一遍，只读不改（[fs.md](fs.md#检查整个文件系统checkscrub)）。统计（文件数、目录数、设备文件数、数据块数、B 树的节点数、条目数、层数、空闲块数、总块数、事务号）写进 `a0` 指向的地方 |
 | 31 | `rename` | `a0`、`a1` = 旧路径的地址、长度，`a2`、`a3` = 新路径的地址、长度 | 0；`-ENOENT`、`-ENOTDIR`、`-EISDIR`、`-ENOTEMPTY`、`-EINVAL`、`-ENAMETOOLONG`、`-ENOSPC`、`-EIO`、`-ENODEV`、`-EFAULT` | 改名，可以换目录，一个事务做完（[fs.md](fs.md#改名rename)）。新名字已经有了的话换掉它：文件换掉文件，目录换掉空目录（不空是 `-ENOTEMPTY`）；目录换文件是 `-ENOTDIR`，文件换目录是 `-EISDIR`；目录挪进它自己下面是 `-EINVAL`。打开着的 fd、当前目录照常能用 |
-| 32 | `lseek` | `a0` = fd，`a1` = 偏移（有符号），`a2` = whence（`seek_set`、`seek_cur`、`seek_end`） | 新的位置；`-EBADF`、`-ESPIPE`（串口、管道）、`-EINVAL`（负的位置、坏的 whence、目录挪到 0 以外）、`-ENOENT` | 挪文件的读写位置（[files.md](files.md#文件表)），可以挪到末尾之后。`lseek(fd, 0, seek_cur)` 查当前位置；目录只能 `lseek(fd, 0, seek_set)` 从头再列 |
+| 32 | `lseek` | `a0` = fd，`a1` = 偏移（有符号），`a2` = whence（`seek_set`、`seek_cur`、`seek_end`） | 新的位置；`-EBADF`、`-ESPIPE`（串口、管道、设备）、`-EINVAL`（负的位置、坏的 whence、目录挪到 0 以外）、`-ENOENT` | 挪文件的读写位置（[files.md](files.md#文件表)），可以挪到末尾之后。`lseek(fd, 0, seek_cur)` 查当前位置；目录只能 `lseek(fd, 0, seek_set)` 从头再列 |
+| 33 | `link` | `a0`、`a1` = 旧路径的地址、长度，`a2`、`a3` = 新路径的地址、长度 | 0；`-ENOENT`、`-EEXIST`、`-EPERM`（目录）、`-ENOTDIR`、`-EINVAL`、`-ENAMETOOLONG`、`-EMLINK`、`-ENOSPC`、`-EIO`、`-ENODEV`、`-EFAULT` | 硬链接：给文件（或设备文件）再起一个名字，两个名字是同一个文件，一个事务做完（[fs.md](fs.md#硬链接和设备文件)） |
+| 34 | `mknod` | `a0` = 路径地址，`a1` = 路径长度，`a2` = 设备号 | 0；`-EINVAL`（设备号是 0 或者超过 `u16`、名字是 `.`、`..`）、`-EEXIST`、`-ENOENT`、`-ENOTDIR`、`-ENAMETOOLONG`、`-ENOSPC`、`-EIO`、`-ENODEV`、`-EFAULT` | 建一个设备文件。不认识的设备号也能建，打开时才是 `-ENXIO` |
 | 其他 | | | `-ENOSYS` | |
 
 ### 分发
@@ -202,7 +207,7 @@ fn exec(path_ptr: usize, path_len: usize, argv_ptr: usize, argc: usize) usize
 ```
 
 1. 路径复制进内核（和 `open` 一样最长 256 字节，长了是 `-ENAMETOOLONG`）。
-2. `argc > max_args` 返回 `-E2BIG`。从 `argv_ptr` 复制 `argc` 个 `Arg`（每个 16 字节，`{ ptr, len }`），再把每个参数的字节依次复制进栈上 1024 字节的缓冲区，总长超过 `max_arg_bytes` 返回 `-E2BIG`。任何一个指针坏了都是 `-EFAULT`。长度为 0 的参数不检查 `ptr`。
+2. `argc > max_args` 返回 `-E2BIG`。从 `argv_ptr` 复制 `argc` 个 `Arg`（每个 16 字节，`{ ptr, len }`），再把每个参数的字节依次复制进栈上 2048 字节（`max_arg_bytes`）的缓冲区，总长超过 `max_arg_bytes` 返回 `-E2BIG`。任何一个指针坏了都是 `-EFAULT`。长度为 0 的参数不检查 `ptr`。
 3. 交给 `proc.exec(path, args)`：参数这时已经在内核里了，`exec` 换掉旧的地址空间之后照样能用。它在文件系统里找程序（没有 `/` 的名字在 `/bin` 里找）、在一个快照上加载（[process.md](process.md#exec)）。
 4. 成功时返回 `argc`：`handleTrap` 把返回值写进 `a0`，正好是新程序看到的 `argc`；`a1` 和 `sp` 由 `proc.exec` 设成栈上 `Arg` 数组的地址（[process.md](process.md#命令行参数)）。
 

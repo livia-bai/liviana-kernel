@@ -2,12 +2,12 @@
 
 涉及文件：`src/file.zig`（文件表、串口和文件的读写）、`src/pipe.zig`（管道）、`src/syscall.zig` 的 `read`、`write`、`close`、`dup`、`pipe`、`open`、`src/proc.zig` 的 `Process.files`
 
-照 xv6 的 `file.c`、`pipe.c`、`sysfile.c` 写。“文件”有三种：**串口**、**管道的一端**、**文件系统里的文件或目录**（`open` 打开，[fs.md](fs.md)）。用户程序用 fd（一个小整数）指代打开的文件，`read`/`write` 不关心 fd 背后是哪一种。
+照 xv6 的 `file.c`、`pipe.c`、`sysfile.c` 写。“文件”有四种：**串口**、**管道的一端**、**文件系统里的文件或目录**（`open` 打开，[fs.md](fs.md)）、**设备文件**（`open` 打开 `/dev/null` 这类文件，读写交给设备，[设备文件](#设备文件)）。用户程序用 fd（一个小整数）指代打开的文件，`read`/`write` 不关心 fd 背后是哪一种。
 
 ## 三层结构
 
 ```
-进程 A 的 fd 表            文件表（全局，32 项）              底下的东西
+进程 A 的 fd 表            文件表（全局，128 项）             底下的东西
 files[0] ──┐
 files[1] ──┼──────────→  File{ ref = 6, console }  ──→  串口（uart.zig）
 files[2] ──┘         ┌→
@@ -19,8 +19,8 @@ files[1] ──────────┴──────────↗
 ...
 ```
 
-- **fd 表**（`Process.files: [abi.max_fds]?*File`，16 项）：每个进程一个，下标就是 fd。只有进程自己会改它，不用加锁。
-- **文件表**（`file.table: [32]File`）：全局，每个 `File` 带引用数 `ref`，`ref = 0` 表示空槽位。`fork` 复制 fd 表、`dup` 复制 fd，都只是让两个 fd 指向同一个 `File`（`ref` 加 1）。
+- **fd 表**（`Process.files: [abi.max_fds]?*File`，32 项）：每个进程一个，下标就是 fd。只有进程自己会改它，不用加锁。
+- **文件表**（`file.table: [128]File`，xv6 的 `NFILE` 是 100）：全局，每个 `File` 带引用数 `ref`，`ref = 0` 表示空槽位。`fork` 复制 fd 表、`dup` 复制 fd，都只是让两个 fd 指向同一个 `File`（`ref` 加 1）。
 - **底下的东西**：串口不需要状态；管道是一个 `Pipe`，读端和写端是两个不同的 `File`，指向同一个 `Pipe`。
 
 为什么要中间这一层，而不是 fd 表直接指向管道：fd 表里的每一项要知道自己是读端还是写端；同一个“打开”被 `fork`、`dup` 共享时，要知道什么时候最后一个引用没了，才能真正关掉（管道的一端关了，另一端才会读到结尾或写失败）。文件系统里的文件还要记读写位置（`off`）：`fork`、`dup` 出来的 fd 共用一个位置（父进程写一段、子进程接着写一段，不会互相覆盖），各自 `open` 的各有各的，和 Unix 一样。
@@ -31,11 +31,12 @@ files[1] ──────────┴──────────↗
 pub const File = struct {
     lock: Spinlock,              // 保护 ref
     ref: u32 = 0,
-    kind: Kind = .none,          // .none（空槽位）、.console、.pipe、.inode
+    kind: Kind = .none,          // .none（空槽位）、.console、.pipe、.inode、.device
     readable: bool = false,
     writable: bool = false,
     pipe: *pipe.Pipe = undefined,
-    ino: u64 = 0,                // .inode：文件系统里的 inode 号
+    ino: u64 = 0,                // .inode、.device：文件系统里的 inode 号
+    major: abi.Major = .console, // .device：哪个设备
     off: u64 = 0,                // .inode：下一次读写的位置（pos_lock 保护）
     append: bool = false,        // .inode：open_append，每次写之前先把 off 挪到文件末尾
     pos_lock: Sleeplock,         // 保护 off：读写文件、lseek、readdir 的整个过程拿着它
@@ -44,6 +45,7 @@ pub const File = struct {
 pub fn openConsole() error{TooManyFiles}!*File
 pub fn openPipe() error{ TooManyFiles, OutOfMemory }![2]*File   // { 读端, 写端 }
 pub fn openInode(ino: u64, readable: bool, writable: bool, append: bool) error{TooManyFiles}!*File
+pub fn openDevice(ino: u64, major: abi.Major, readable: bool, writable: bool) error{ TooManyFiles, NoSuchDevice }!*File
 pub fn dup(f: *File) *File
 pub fn close(f: *File) void
 pub fn read(f: *File, space: *vm.PageTable, ptr: usize, len: usize) Error!usize
@@ -65,7 +67,7 @@ pub fn seek(f: *File, offset: i64, whence: usize) Error!u64
 
 - init 启动时（`proc.userinit`）打开一次串口，作为 0、1、2 号 fd（同一个 `File`，`ref = 3`）。之后所有进程都是 `fork` 出来的，继承这三个 fd，所以串口的 `File` 只有一个，`ref` 随进程数变化。
 - `pipe` 系统调用创建管道。
-- `open` 系统调用打开文件系统里的文件、目录（`openInode`），关掉不用做什么：内容都已经在磁盘上了（每个 `write` 提交一次）。
+- `open` 系统调用打开文件系统里的文件、目录（`openInode`），关掉不用做什么：内容都已经在磁盘上了（每个 `write` 提交一次）。打开的是设备文件的话用 `openDevice`。
 - 进程结束时（`proc.finish`）关掉 fd 表里所有的文件（[process.md](process.md#exit变成-zombie)）。`exec` 不碰 fd 表：shell 在子进程里先把标准输入输出换成管道，再 `exec`，新程序直接用 0、1 号 fd（[shell.md](shell.md#管道)）。
 
 单元测试（`file.zig` 末尾）检查：`dup` 之后关一次，管道的写端还开着，再关一次才关上；表只剩一个空位时 `openPipe` 失败，不漏槽位也不漏页。
@@ -81,6 +83,21 @@ fn consoleRead(space: *vm.PageTable, ptr: usize, len: usize) Error!usize
 - **读**：拿着 `uart.rx_lock` 检查输入缓冲区（[devices.md](devices.md#输入环形缓冲区)），空着就 `proc.sleep(uart.rx_chan, &uart.rx_lock)`，串口中断叫醒它；被 kill 了就返回。有字符就有多少读多少（最多 `len`），每次最多 64 个放进栈上的缓冲区，再 `copyToUser`。调用方（`read` 系统调用）已经检查过目标范围可写，`copyToUser` 不会失败。
 - **Ctrl-D（`0x04`）表示输入结束**，和 Unix 终端一样：读到它就停下。它前面有字符的话先返回这些字符，Ctrl-D 留在缓冲区里；下一次 `read` 读掉它、返回 0。所以单独按一次 Ctrl-D，`read` 返回 0。`cat`、`wc` 直接从键盘读时靠它结束；shell 读到 0 就忽略。
 - 不回显、不做行编辑（shell 自己做），Ctrl-C 在串口中断里就被截下了（[process.md](process.md#ctrl-c)），读不到。
+
+## 设备文件
+
+`open` 在文件系统里找到的 inode 是设备文件（[fs.md](fs.md#硬链接和设备文件)）时，`File` 的种类是 `.device`，记着 inode 号和设备号 `major`，读写按设备号分给设备（xv6 的 `devsw` 表）：
+
+| 设备号 | 设备 | 读 | 写 |
+| --- | --- | --- | --- |
+| 1 `console` | 串口 | 和 init 的 0 号 fd 一样（`consoleRead`） | 和 1 号 fd 一样（`consoleWrite`） |
+| 2 `null` | 空设备 | 马上返回 0（结尾） | 全部收下，返回 `len`，不读用户内存（和 Linux 一样） |
+| 3 `zero` | 零 | 读多少给多少个 0（一页一页 `copyToUser` 一个全 0 的常量页） | 同 `null` |
+
+- 内核不认识的设备号，`openDevice` 返回 `NoSuchDevice`，`open` 系统调用返回 `-ENXIO`（Linux 打开没有驱动的设备文件也是这个）。所以 `File` 里的设备号一定认识，读写时不用再检查。
+- 没有读写位置：`lseek` 是 `NotSeekable`（`-ESPIPE`），`readdir` 是 `-ENOTDIR`。不拿 `pos_lock`。
+- `fstat` 照常在文件系统里查 inode：种类 `device`、设备号、链接数，长度 0。
+- init 自己的 0、1、2 号 fd 还是种类 `.console`（`userinit` 时文件系统还没挂上，不能 `open("/dev/console")`），`fstat` 的种类是 `console`、inode 号 0；打开 `/dev/console` 得到的是 `.device`，读写的是同一个串口。
 
 ## 管道
 

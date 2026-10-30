@@ -37,7 +37,8 @@ TIMEBASE_HZ = 10_000_000  # QEMU virt 的 time CSR 频率
 # 用户地址空间里栈下面那一页保护页（src/proc.zig）
 GUARD_PAGE = (0x7FFFB000, 0x7FFFC000)
 USER_SPACE = (0x40000000, 0x80000000)
-MAX_PROCS = 16  # src/abi.zig 的 max_procs，其中两个槽位是 init 和 sh
+MAX_PROCS = 64  # src/abi.zig 的 max_procs，其中两个槽位是 init 和 sh
+MAX_ARGS = 32  # src/abi.zig 的 max_args
 # t_ipi 的两个延迟（中位数，微秒）的上限，多核时检查。没有核间中断时实测 kill ≥ 4000、wakeup ≥ 1100；
 # 有了之后 kill 约 300～560（Debug 最慢，含打印 killed 那一行）、wakeup 约 200
 IPI_KILL_MAX_US = 2000
@@ -178,7 +179,7 @@ def case_shell(q, c, mode):
     c.contains(q.command("uptime"), r"up \d+\.\d\ds\n", "uptime")
     c.contains(q.command("nope"), r"unknown command: nope", "unknown command")
     # /bin 里的程序按名字排序（测试程序 t_* 也在里面）
-    c.contains(q.command("run"), r"programs: cat echo fault hello init ls mkdir mv rm scrub sh spin( t_\w+)+ ticker wc\n",
+    c.contains(q.command("run"), r"programs: cat echo fault hello init ln ls mkdir mv rm scrub sh spin( t_\w+)+ ticker wc\n",
                "run without a name")
     c.contains(q.command("run nope"), r"no such program: nope\nprograms: ", "run nope")
     # 不写 run，直接写程序名；管道、重定向照样能用。不是内置命令也不是程序的才是 unknown command
@@ -339,13 +340,16 @@ def case_sched(q, c, mode):
     c.contains(q.command("kill"), r"usage: kill PID", "kill")
     c.expect(ps_table(q, c) == {}, "ps: processes left after killing all of them")
 
-    # 进程表满了（init 和 sh 占着两个槽位）
-    full = [start_background(q, c, "spin") for _ in range(MAX_PROCS - 2)]
+    # 进程表满了（init 和 sh 占着两个槽位）：t_fork fill 在后台 fork 到表满，子进程都睡着。
+    # 杀掉它之后，子进程发现自己交给了 init，各自结束
+    start = len(q.text())
+    m = c.contains(q.command("run t_fork fill &"), r"\[proc\] pid (\d+) \(t_fork\) started in the background", "run t_fork fill &")
+    q.wait_for(lambda t: "t_fork: filled the process table" in t[start:], COMMAND_TIMEOUT, "t_fork fill")
+    c.contains(q.text()[start:], rf"t_fork: filled the process table with {MAX_PROCS - 3} children\n", "t_fork fill")
     c.contains(q.command("run hello"), rf"run: too many processes \(at most {MAX_PROCS}\)", "run with a full table")
-    for pid in full:
-        if pid is not None:
-            q.command(f"kill {pid}")
-    c.expect(ps_table(q, c) == {}, "ps: processes left after killing all of them")
+    if m:
+        q.command(f"kill {m.group(1)}")
+    wait_ps_empty(q, c, "the children of t_fork fill")
 
 
 def case_syscall(q, c, mode):
@@ -430,7 +434,8 @@ def case_args(q, c, mode):
     exited(c, out, "t_args", 4)
     c.contains(q.command("run echo hello,   world"), r"\nhello, world\n", "run echo")
     c.contains(q.command("run echo"), r"echo\n\n\[proc\]", "run echo without arguments")
-    c.contains(q.command("run t_args " + " ".join(["x"] * 16)), r"run: too many arguments \(at most 16\)", "run t_args x*16")
+    c.contains(q.command("run t_args " + " ".join(["x"] * MAX_ARGS)), rf"run: too many arguments \(at most {MAX_ARGS}\)",
+               f"run t_args x*{MAX_ARGS}")
     check_counts(c, q.command("run t_args check"), "t_args")
 
 
@@ -446,8 +451,9 @@ def case_pipe(q, c, mode):
     c.contains(q.command("run t_args x y|wc"), r"\n5 7 62\n", "run t_args | wc")
     c.contains(q.command("run echo a | nope"), r"no such program: nope", "run echo | nope")
     c.contains(q.command("run echo a |"), r"run: empty command in the pipeline", "run echo |")
-    c.contains(q.command("run echo | echo | echo | echo | echo"), r"run: too many programs in the pipeline \(at most 4\)",
-               "run with 5 programs")
+    c.contains(q.command("run echo a b c | cat | cat | cat | cat | cat | cat | wc"), r"\n1 3 6\n", "run with 8 programs")
+    c.contains(q.command("run " + " | ".join(["echo"] * 9)), r"run: too many programs in the pipeline \(at most 8\)",
+               "run with 9 programs")
     # 后台管道
     m = c.contains(q.command("run echo bg | wc &"), r"\[proc\] pid (\d+) \(pipeline\) started in the background",
                    "run echo | wc &")
@@ -564,7 +570,7 @@ def reboot(q, c, what, steps):
 
 def scrub_ok(c, out, what):
     """scrub 通过了，返回它数出来的文件数。"""
-    m = c.contains(out, r"scrub: ok: (\d+) files, \d+ dirs, \d+ data blocks verified\n", what)
+    m = c.contains(out, r"scrub: ok: (\d+) files, \d+ dirs, 3 devices, \d+ data blocks verified\n", what)
     exited(c, out, "scrub", 0)
     return int(m.group(1)) if m else None
 
@@ -630,25 +636,46 @@ def check_fs_reboots(q, c):
 def case_fs(q, c, mode):
     # shell 里的文件操作：ls、重定向、cat、mkdir、cd、rm
     out = q.command("run ls /")
-    c.contains(out, r"\ndir +0 bin\n", "run ls /")
-    c.contains(q.command("run ls /bin"), r"\nfile +\d+ hello\n", "run ls /bin")
+    c.contains(out, r"\ndir +1 +0 bin\n", "run ls /")
+    c.contains(out, r"\ndir +1 +0 dev\n", "run ls /")
+    c.contains(q.command("run ls /bin"), r"\nfile +1 +\d+ hello\n", "run ls /bin")
+    # 设备文件：mkfs 建的 /dev，ls 显示设备号；重定向到 /dev/null 什么都不输出，写 /dev/console 输出到串口
+    out = q.command("run ls /dev")
+    for name, major in (("console", 1), ("null", 2), ("zero", 3)):
+        c.contains(out, rf"\ndev +1 +{major} {name}\n", "run ls /dev")
+    out = q.command("run echo into the void > /dev/null")
+    c.expect("into the void" not in out.split("\n", 1)[1], f"echo > /dev/null printed something:\n{indent(out)}")
+    exited(c, out, "echo", 0)
+    c.contains(q.command("run cat /dev/null"), r"cat /dev/null\r?\n\[proc\] pid \d+ \(cat\) exited with code 0", "run cat /dev/null")
+    c.contains(q.command("run echo via the console > /dev/console"), r"\nvia the console\n", "echo > /dev/console")
     q.command("run echo hello file system > /hello.txt")
     c.contains(q.command("run cat /hello.txt"), r"\nhello file system\n", "run cat /hello.txt")
     c.contains(q.command("run wc < /hello.txt"), r"\n1 3 18\n", "run wc < /hello.txt")
-    c.contains(q.command("run ls /hello.txt"), r"\nfile +18 /hello.txt\n", "run ls /hello.txt")
+    c.contains(q.command("run ls /hello.txt"), r"\nfile +1 +18 /hello.txt\n", "run ls /hello.txt")
+    # 硬链接：两个名字一个文件，链接数是 2；删掉原来的名字，新名字照常
+    exited(c, q.command("run ln /hello.txt /hl"), "ln", 0)
+    c.contains(q.command("run ls /hl"), r"\nfile +2 +18 /hl\n", "run ls /hl after ln")
+    q.command("echo appended >> /hl")
+    exited(c, q.command("rm /hello.txt"), "rm", 0)
+    c.contains(q.command("cat /hl"), r"\nhello file system\nappended\n", "cat /hl after rm of the other name")
+    c.contains(q.command("ls /hl"), r"\nfile +1 +27 /hl\n", "ls /hl after rm of the other name")
+    exited(c, q.command("mv /hl /hello.txt"), "mv", 0)
+    c.contains(q.command("ln /bin /b2"), r"ln: /bin -> /b2: PermissionDenied\n", "ln a directory")
     q.command("run echo a b c | cat >/p.txt")
     c.contains(q.command("run cat </p.txt"), r"\na b c\n", "run echo | cat > F")
     exited(c, q.command("run mkdir /d /d/e"), "mkdir", 0)
     q.command("cd /d/e")
     q.command("run echo deep > f")
-    c.contains(q.command("run ls"), r"\nfile +5 f\n", "run ls in /d/e")
+    c.contains(q.command("run ls"), r"\nfile +1 +5 f\n", "run ls in /d/e")
     q.command("cd ..")
-    c.contains(q.command("run ls"), r"\ndir +0 e\n", "run ls in /d")
+    c.contains(q.command("run ls"), r"\ndir +1 +0 e\n", "run ls in /d")
     c.contains(q.command("run rm /d"), r"rm: /d: NotEmpty\n", "run rm /d")
     exited(c, q.command("run rm e/f e"), "rm", 0)
     q.command("cd")
     exited(c, q.command("run rm /d /hello.txt /p.txt"), "rm", 0)
-    c.contains(q.command("run ls /"), r"\ndir +0 bin\n\[proc\]", "run ls / after rm")
+    out = q.command("run ls /")
+    names = sorted(re.findall(r"^\w+ +\d+ +\d+ (\S+)$", out, re.M))
+    c.expect(names == ["bin", "dev"], f"run ls / after rm: {names}")
     # 出错的情况
     c.contains(q.command("cd /nope"), r"cd: /nope: NotFound\n", "cd /nope")
     c.contains(q.command("cd /bin/hello"), r"cd: /bin/hello: NotDir\n", "cd /bin/hello")
@@ -725,7 +752,7 @@ CASES = {
     "interrupts": (case_interrupts, ["src/timer.zig", "src/sbi.zig", "src/plic.zig", "user/spin.zig"]),
     "user": (case_user, ["user/linker.ld", "user/hello.zig", "user/fault.zig", "user/tests/t_panic.zig",
                          "user/tests/t_time.zig"]),
-    "sched": (case_sched, ["src/timer.zig", "user/spin.zig", "user/ticker.zig", "user/hello.zig",
+    "sched": (case_sched, ["src/timer.zig", "user/spin.zig", "user/ticker.zig", "user/hello.zig", "user/tests/t_fork.zig",
                            "user/tests/t_sleep.zig"]),
     "syscall": (case_syscall, ["user/tests/t_sys.zig"]),
     "fork": (case_fork, ["user/hello.zig", "user/tests/t_fork.zig", "user/tests/t_read.zig"]),
@@ -742,7 +769,7 @@ CASES = {
                          "user/tests/t_disk.zig"]),
     "fs": (case_fs, ["src/sleeplock.zig", "src/bio.zig", "src/virtio_disk.zig", "src/btree.zig", "src/ctree.zig",
                      "src/fs.zig", "src/fsys.zig", "src/mkfs.zig", "user/ls.zig", "user/mkdir.zig", "user/rm.zig",
-                     "user/cat.zig", "user/echo.zig", "user/wc.zig", "user/scrub.zig", "user/mv.zig", "user/tests/t_fs.zig",
+                     "user/cat.zig", "user/echo.zig", "user/wc.zig", "user/scrub.zig", "user/mv.zig", "user/ln.zig", "user/tests/t_fs.zig",
                      "user/tests/t_fsmp.zig"]),
     "smp": (case_smp, ["src/timer.zig", "src/plic.zig", "src/pipe.zig", "user/spin.zig", "user/tests/t_smp.zig"]),
 }

@@ -89,7 +89,7 @@ const user_programs = [_]UserProgram{
     .{ .name = "fault" }, .{ .name = "spin" },  .{ .name = "ticker" },
     .{ .name = "echo" },  .{ .name = "cat" },   .{ .name = "wc" },
     .{ .name = "ls" },    .{ .name = "mkdir" }, .{ .name = "rm" },
-    .{ .name = "scrub" }, .{ .name = "mv" },
+    .{ .name = "scrub" }, .{ .name = "mv" },    .{ .name = "ln" },
 };
 const test_programs = [_]UserProgram{
     .{ .name = "t_sys", .dir = "user/tests" },
@@ -220,7 +220,7 @@ for (program_bins.items) |bin| make_disk.addFileArg(bin);
 b.getInstallStep().dependOn(&b.addInstallFile(disk, "disk.img").step);
 ```
 
-- `mkfs`（`src/mkfs.zig`，[fs.md](fs.md#生成磁盘镜像mkfszig)）编译成**主机**的程序，构建时运行：`mkfs <输出> 8192 7168 <ELF>...`。32 MiB 的镜像，前 7168 块格式化成文件系统，选中的每个用户程序装成 `/bin/<名字>`；后 1024 块是原始区域，填上固定图案（第 b 块的第 i 个字节是 `(b * 131 + i) % 251`），给回归测试 `t_disk` 检查读写（[disk.md](disk.md)）。结果装到 `zig-out/disk.img`。
+- `mkfs`（`src/mkfs.zig`，[fs.md](fs.md#生成磁盘镜像mkfszig)）编译成**主机**的程序，构建时运行：`mkfs <输出> 8192 7168 <ELF>...`。32 MiB 的镜像，前 7168 块格式化成文件系统，选中的每个用户程序装成 `/bin/<名字>`，再建 `/dev/console`、`/dev/null`、`/dev/zero` 三个设备文件；后 1024 块是原始区域，填上固定图案（第 b 块的第 i 个字节是 `(b * 131 + i) % 251`），给回归测试 `t_disk` 检查读写（[disk.md](disk.md)）。结果装到 `zig-out/disk.img`。
 - `addOutputFileArg`、`addFileArg` 让构建系统知道 Run 步骤的输入和输出：`mkfs` 或哪个 ELF 变了才重新生成，否则命中缓存。`InstallFile` 发现 `zig-out/disk.img` 的大小或修改时间和缓存里的不一样就重新拷一份，所以磁盘被改写过之后，下一次 `zig build` 会恢复原样。
 - `-Dtest-programs=true` 时测试程序也装进 `/bin`，镜像和平时的不一样（空闲块少一些）。
 - 两个数字和原始区域的图案在几个地方各写了一遍：`build.zig`（`mkfs` 的参数）、`src/mkfs.zig`（图案）、`user/tests/t_disk.zig`（原始区域的块数和图案）、`tools/qemu_test.py`（`FS_BLOCKS`、`DISK_BLOCKS`、`disk_original`），改一处要一起改。

@@ -25,7 +25,7 @@ const Sleeplock = @import("sleeplock.zig").Sleeplock;
 
 pub const block_size = abi.block_size;
 /// 缓冲区的个数
-pub const nbuf = 32;
+pub const nbuf = 64;
 /// 桶的个数。取质数，块号连续的块散到不同的桶里
 const nbucket = 13;
 /// 还没装过块的缓冲区的 blockno（check 不让任何块号等于它）
@@ -242,7 +242,7 @@ pub fn release(b: *Buf) void {
 
 // ---- 单元测试：一块内存当磁盘，记下读写了几次 ----
 
-const test_blocks = 64;
+const test_blocks = 160;
 var test_disk: [test_blocks][block_size]u8 = undefined;
 var test_reads: usize = 0;
 var test_writes: usize = 0;
@@ -280,7 +280,7 @@ test "缓存命中不读磁盘；超出 nbuf 时换掉最久没用的块" {
     release(try read(5));
     try expectEqual(nbuf, test_reads);
     // 再读一个新块：换掉的是最久没用的块 10，不是刚用过的块 5
-    release(try read(50));
+    release(try read(10 + nbuf + 20));
     release(try read(5));
     try expectEqual(nbuf + 1, test_reads);
     release(try read(10));

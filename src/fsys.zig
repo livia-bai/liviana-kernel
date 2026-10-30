@@ -95,6 +95,8 @@ pub fn errno(err: anyerror) abi.Errno {
         error.FileTooBig => .fbig,
         error.BadAddress => .fault,
         error.NoDevice => .nodev,
+        error.IsDirLink => .perm,
+        error.TooManyLinks => .mlink,
         else => .io, // Corrupt 等：磁盘上的东西不对
     };
 }

@@ -43,7 +43,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "fault" }, .{ .name = "spin" },  .{ .name = "ticker" },
         .{ .name = "echo" },  .{ .name = "cat" },   .{ .name = "wc" },
         .{ .name = "ls" },    .{ .name = "mkdir" }, .{ .name = "rm" },
-        .{ .name = "scrub" }, .{ .name = "mv" },
+        .{ .name = "scrub" }, .{ .name = "mv" },    .{ .name = "ln" },
     };
     const test_programs = [_]UserProgram{
         .{ .name = "t_sys", .dir = "user/tests" },

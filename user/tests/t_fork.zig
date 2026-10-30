@@ -1,6 +1,8 @@
 //! 回归测试：fork、exec、wait、kill、getppid、setfg、procinfo、meminfo 的正常情况和边界情况。
 //! 每项检查失败时打印 "FAIL: ..."，最后打印通过的项数，退出码是失败的项数。
 //! 由 shell 前台运行（父进程是 sh）。期望的输出见 tools/qemu_test.py。
+//! - `run t_fork fill &`：把进程表填满（qemu_test.py 测 shell 在表满时的报错）：一直 fork 到失败，打印个数，
+//!   然后睡下去，等着被 kill。子进程每 50 ms 看一次父进程，父进程没了（交给了 init）就结束。
 
 const std = @import("std");
 const sys = @import("sys");
@@ -67,7 +69,23 @@ fn execHello() u8 {
 
 var parent_pid: usize = 0;
 
+/// 填满进程表，见文件开头。
+fn fill() noreturn {
+    var n: usize = 0;
+    while (sys.fork()) |pid| : (n += 1) {
+        if (pid == 0) {
+            while (sys.getppid() != 1) sys.sleep(50);
+            sys.exit(0);
+        }
+    } else |_| {}
+    sys.print("t_fork: filled the process table with {d} children\n", .{n});
+    while (true) sys.sleep(1_000_000);
+}
+
 pub fn main() u8 {
+    if (sys.arg(1)) |a| {
+        if (std.mem.eql(u8, a, "fill")) fill();
+    }
     parent_pid = sys.getpid();
     const sh = sys.getppid();
 

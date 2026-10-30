@@ -84,6 +84,22 @@ pub const Syscall = enum(usize) {
     /// lseek(fd, offset, whence) 挪文件 fd 的读写位置，返回新的位置。whence 见 seek_*，offset 按有符号数理解。
     /// 可以挪到文件末尾之后（再写的话中间是洞）。串口、管道是 -ESPIPE；目录只能 lseek(fd, 0, seek_set) 从头再列
     lseek = 32,
+    /// link(old_ptr, old_len, new_ptr, new_len) 硬链接：给文件（或设备文件）old 再起一个名字 new，返回 0。
+    /// 两个名字是同一个文件，删掉一个另一个照常。目录不行（-EPERM），new 已经有了是 -EEXIST
+    link = 33,
+    /// mknod(path_ptr, path_len, major) 建一个设备文件，返回 0。major 见 Major；不认识的也能建，打开时才是 -ENXIO
+    mknod = 34,
+    _,
+};
+
+/// 设备号（设备文件的 major）。打开设备文件时内核按它找设备（file.zig）
+pub const Major = enum(u16) {
+    /// 串口，和 init 打开的 0、1、2 号 fd 一样
+    console = 1,
+    /// 读是结尾，写什么都丢掉
+    null = 2,
+    /// 读出来都是 0，写什么都丢掉
+    zero = 3,
     _,
 };
 
@@ -110,18 +126,25 @@ pub const max_name = 255;
 pub const FileKind = enum(u8) {
     file = 1,
     dir = 2,
+    /// init 打开的串口（不在文件系统里）。打开 /dev/console 得到的是 device
     console = 3,
     pipe = 4,
+    /// 文件系统里的设备文件
+    device = 5,
     _,
 };
 
 pub const Stat = extern struct {
     /// 文件系统里的 inode 号，串口和管道是 0
     ino: u64,
-    /// 文件的字节数，目录、串口、管道是 0
+    /// 文件的字节数，目录、设备、串口、管道是 0
     size: u64,
     kind: FileKind,
-    _pad: [7]u8 = @splat(0),
+    _pad: u8 = 0,
+    /// 设备文件的设备号（Major），别的是 0
+    major: u16 = 0,
+    /// 有几个名字（硬链接），目录是 1，串口、管道是 0
+    nlink: u32 = 0,
 };
 
 pub const Dirent = extern struct {
@@ -136,12 +159,16 @@ pub const Dirent = extern struct {
 pub const block_size = 4096;
 
 pub const Errno = enum(usize) {
-    /// 没有权限（kill init）
+    /// 没有权限（kill init）；给目录建硬链接（link）
     perm = 1,
     /// 没有这个程序（exec），没有这个文件或目录
     noent = 2,
     /// 没有这个进程（kill、setfg）
     srch = 3,
+    /// 设备文件的设备号内核不认识（open）
+    nxio = 6,
+    /// 链接数到上限了（link）
+    mlink = 31,
     /// 没有磁盘，或者磁盘上没有文件系统
     nodev = 19,
     /// 磁盘上的数据不对（校验和、结构）
@@ -191,18 +218,18 @@ pub const Errno = enum(usize) {
 };
 
 /// 进程表的大小：最多同时有这么多个进程（包括 init、shell 和还没被回收的 zombie）。
-pub const max_procs = 16;
+pub const max_procs = 64;
 
 /// 每个进程最多同时打开多少个文件（fd 的范围是 0..max_fds）。
-pub const max_fds = 16;
+pub const max_fds = 32;
 /// 约定的三个 fd：init 把它们都指向串口，之后由 fork 继承下去。
 pub const stdin = 0;
 pub const stdout = 1;
 pub const stderr = 2;
 
 /// exec 最多传多少个命令行参数，参数加起来最多多少字节。
-pub const max_args = 16;
-pub const max_arg_bytes = 1024;
+pub const max_args = 32;
+pub const max_arg_bytes = 2048;
 
 /// 一个命令行参数：用户地址空间里的一段字节（不以 0 结尾）。
 pub const Arg = extern struct {
@@ -263,6 +290,7 @@ pub const MemInfo = extern struct {
 pub const ScrubInfo = extern struct {
     files: u64,
     dirs: u64,
+    devices: u64,
     /// 读过、校验和对得上的数据块（不算内联在树里的小文件）
     data_blocks: u64,
     /// B 树的节点数、条目数、层数

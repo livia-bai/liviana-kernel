@@ -11,10 +11,10 @@ const abi = sys.abi;
 
 const Command = enum { help, uptime, mem, disk, cd, run, ps, kill, shutdown };
 
-var line: [128]u8 = undefined;
+var line: [512]u8 = undefined;
 
 /// 一个管道最多几个程序。进程表只有 abi.max_procs 个槽位，init、shell 和管道的“组长”（见 runPipeline）占三个。
-const max_stages = 4;
+const max_stages = 8;
 
 pub fn main() u8 {
     sys.print("Type 'help' for commands.\n", .{});

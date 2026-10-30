@@ -8,7 +8,7 @@
 系统调用 readblock / writeblock      文件系统（fs.zig → ctree.zig）
    （只能碰原始区域）                        │
         └──────────────┬───────────────────┘
-bio.zig：缓冲区缓存（32 块，LRU，每块一把睡眠锁）
+bio.zig：缓冲区缓存（64 块，LRU，每块一把睡眠锁）
         │  Device.transfer(块号, 数据, 读/写)
 virtio_disk.zig：组请求、交给设备、睡着等中断
         │  DMA、中断（PLIC 1 号源）
@@ -150,7 +150,7 @@ pub const Sleeplock = struct {
 ## 缓冲区缓存（`bio.zig`）
 
 ```zig
-pub const nbuf = 32;
+pub const nbuf = 64;
 const nbucket = 13;
 pub const Buf = struct {
     lock: Sleeplock,     // 保护 valid、data
@@ -187,7 +187,7 @@ pub fn blockCount() u64
 2. 没有就放开桶的锁，**换块**（`evict`），拿着 `evict_lock`：
    1. 再在桶里找一次：放开桶的锁到拿到 `evict_lock` 之间，别的进程可能刚把这一块换进来。换进来都要拿着 `evict_lock`，所以拿着它查一次就够了，之后没人能再换进同一块：**同一块在缓存里不会有两份**。
    2. 依次看每个桶（`takeOldest`），找 `refcnt == 0`、`stamp` 最小的缓冲区。一直拿着目前最好的候选所在的桶的锁，找到更好的才换成新的桶，这样候选的 `refcnt` 不会在找完之前被别人加上去。最后把它从原来的桶里摘下来，改成这一块（`valid = false`、`refcnt = 1`），挂进新的桶。摘下来到挂进去之间它不在任何桶里，别人找不到它。
-   3. 都有人在用（32 个都有人拿着）就 `proc.sleep(&evicting, &evict_lock)`，等有人 `release`。xv6 在这里 panic。
+   3. 都有人在用（64 个都有人拿着）就 `proc.sleep(&evicting, &evict_lock)`，等有人 `release`。xv6 在这里 panic。
 3. 换来的缓冲区同样再拿睡眠锁。
 
 **两把桶的锁同时拿只发生在换块的时候**，而换块拿着 `evict_lock`，一次只有一个进程在换，所以不会互相等。顺序是 `evict_lock` → 桶的锁；找已经缓存着的块只拿一把桶的锁，拿着它不再拿别的锁。

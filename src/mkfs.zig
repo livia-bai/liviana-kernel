@@ -2,7 +2,8 @@
 //!
 //!   mkfs <输出文件> <总块数> <文件系统的块数> <文件>...
 //!
-//! 磁盘的前一部分是文件系统：格式化，建 /bin，把给的每个文件装成 /bin/<文件名>。
+//! 磁盘的前一部分是文件系统：格式化，建 /bin，把给的每个文件装成 /bin/<文件名>；
+//! 建 /dev 和里面的设备文件 console、null、zero（abi.Major）。
 //! 后一部分（文件系统之后的块）是“原始区域”，readblock/writeblock 系统调用只能读写这里（见 fsys.zig），
 //! 填上固定的图案：第 b 块（从原始区域的开头算）的第 i 个字节是 (b * 131 + i) % 251，回归测试 t_disk 照着它检查。
 //!
@@ -13,6 +14,7 @@ const std = @import("std");
 const fs = @import("fs.zig");
 const ctree = @import("ctree.zig");
 const bio = @import("bio.zig");
+const abi = @import("abi.zig");
 
 const block_size = fs.block_size;
 
@@ -56,6 +58,12 @@ pub fn main(init: std.process.Init) !void {
         const name = try std.fmt.bufPrint(&name_buf, "/bin/{s}", .{std.fs.path.basename(path)});
         const ino = try f.run(fs.Fs.create, .{ fs.root_ino, name, fs.Kind.file });
         _ = try f.run(fs.Fs.write, .{ ino, 0, data.len, SliceIn{ .data = data } });
+    }
+    _ = try f.run(fs.Fs.create, .{ fs.root_ino, "/dev", fs.Kind.dir });
+    for ([_]abi.Major{ .console, .null, .zero }) |m| {
+        var name_buf: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "/dev/{s}", .{@tagName(m)});
+        _ = try f.run(fs.Fs.mknod, .{ fs.root_ino, name, @backingInt(m) });
     }
     _ = try f.check();
 

@@ -1,4 +1,5 @@
-//! 回归测试：文件系统的系统调用（open、read、write、mkdir、unlink、chdir、fstat、readdir、lseek、rename）。
+//! 回归测试：文件系统的系统调用（open、read、write、mkdir、unlink、chdir、fstat、readdir、lseek、rename、
+//! link、mknod）和设备文件（/dev/null、/dev/zero、/dev/console）。
 //! - `run t_fs`：正常情况和边界情况，失败的项打印 "FAIL: ..."，最后打印检查了几项、失败了几项。
 //!   所有东西建在 /t_fs 下面，结束时删干净（开始时也先删掉上一次留下的）。
 //! - `run t_fs churn &`：掉电测试的写的一方，一直写到被杀（或者 QEMU 被杀）：往 /churn.dat 末尾追加记录，
@@ -77,7 +78,7 @@ fn removeTree(path: []const u8) void {
                 removeTree(child);
             }
         }
-    } else |_| return;
+    } else |_| {} // 打不开的（比如内核不认识的设备文件）也删
     sys.unlink(path) catch {};
 }
 
@@ -387,6 +388,8 @@ pub fn main() u8 {
     testLseek();
     testAppend();
     testRename();
+    testLink();
+    testDevices();
 
     removeTree("/t_fs");
     expect(sys.open("/t_fs", .{}) == error.NotFound, "everything removed", .{});
@@ -563,6 +566,121 @@ fn testRename() void {
     // sub 里的 c 已经挪走了，是空的：目录可以换掉它
     expect(if (sys.rename("/t_fs/r2/d", "/t_fs/r2/sub")) |_| true else |_| false, "rename a directory over an empty one", .{});
     expect(sys.open("/t_fs/r2/d", .{}) == error.NotFound, "old name of the directory is gone", .{});
+}
+
+fn nlinkOf(path: []const u8) u32 {
+    const fd = sys.open(path, .{}) catch return 999;
+    defer sys.close(fd) catch {};
+    const st = sys.fstat(fd) catch return 999;
+    return st.nlink;
+}
+
+fn inoOf(path: []const u8) u64 {
+    const fd = sys.open(path, .{}) catch return 0;
+    defer sys.close(fd) catch {};
+    const st = sys.fstat(fd) catch return 0;
+    return st.ino;
+}
+
+/// link：两个名字是同一个文件，链接数，删掉一个另一个照常，打开着的 fd，各种错误。
+fn testLink() void {
+    var buf: [64]u8 = undefined;
+    sys.mkdir("/t_fs/l") catch {};
+    {
+        const fd = mustOpen("/t_fs/l/a", .{ .write = true, .create = true });
+        _ = writeAll(fd, "first");
+        sys.close(fd) catch {};
+    }
+    expect(nlinkOf("/t_fs/l/a") == 1, "nlink of a new file: {d}", .{nlinkOf("/t_fs/l/a")});
+    expect(if (sys.link("/t_fs/l/a", "/t_fs/l/b")) |_| true else |_| false, "link", .{});
+    expect(inoOf("/t_fs/l/a") == inoOf("/t_fs/l/b") and inoOf("/t_fs/l/a") != 0, "two names, one inode", .{});
+    expect(nlinkOf("/t_fs/l/a") == 2 and nlinkOf("/t_fs/l/b") == 2, "nlink after link", .{});
+    // 从一个名字写，另一个名字读到
+    {
+        const fd = mustOpen("/t_fs/l/b", .{ .write = true, .append = true });
+        _ = writeAll(fd, "+b");
+        sys.close(fd) catch {};
+    }
+    var n = readAll("/t_fs/l/a", &buf, 64);
+    expect(std.mem.eql(u8, buf[0..n], "first+b"), "write through one name, read through the other: \"{s}\"", .{buf[0..n]});
+    // 删掉一个名字：另一个照常，打开着的 fd 也照常
+    const fd = mustOpen("/t_fs/l/b", .{});
+    expect(if (sys.unlink("/t_fs/l/a")) |_| true else |_| false, "unlink one of two names", .{});
+    expect(sys.open("/t_fs/l/a", .{}) == error.NotFound, "unlinked name is gone", .{});
+    expect(nlinkOf("/t_fs/l/b") == 1, "nlink after unlinking one name", .{});
+    n = sys.read(fd, &buf) catch 0;
+    expect(n == 7, "read an fd after another name was unlinked: {d}", .{n});
+    sys.close(fd) catch {};
+    // 链接到别的目录、用相对路径；rename 到同一个文件的另一个名字什么都不做
+    sys.mkdir("/t_fs/l/sub") catch {};
+    sys.chdir("/t_fs/l") catch {};
+    expect(if (sys.link("b", "sub/c")) |_| true else |_| false, "link into another directory, relative paths", .{});
+    sys.chdir("/") catch {};
+    expect(if (sys.rename("/t_fs/l/b", "/t_fs/l/sub/c")) |_| true else |_| false, "rename onto another link of the same file", .{});
+    expect(nlinkOf("/t_fs/l/b") == 2 and nlinkOf("/t_fs/l/sub/c") == 2, "rename onto the same file changes nothing", .{});
+    // 错误
+    expect(sys.link("/t_fs/l/sub", "/t_fs/l/d") == error.PermissionDenied, "link a directory", .{});
+    expect(sys.link("/t_fs/l/b", "/t_fs/l/sub/c") == error.Exists, "link onto an existing name", .{});
+    expect(sys.link("/t_fs/l/nope", "/t_fs/l/x") == error.NotFound, "link a missing file", .{});
+    expect(sys.link("/t_fs/l/b", "/t_fs/l/nope/x") == error.NotFound, "link into a missing directory", .{});
+    expect(sys.link("/t_fs/l/b", "/t_fs/l/b/x") == error.NotDir, "link under a file", .{});
+    expect(sys.link("/t_fs/l/b", "/t_fs/l/..") == error.InvalidArgument, "link to ..", .{});
+    expect(sys.link(@as([*]const u8, @ptrFromInt(0x8020_0000))[0..4], "/x") == error.BadAddress, "link from a kernel pointer", .{});
+    // 删掉最后一个名字：没了
+    expect(if (sys.unlink("/t_fs/l/b")) |_| true else |_| false, "unlink", .{});
+    expect(if (sys.unlink("/t_fs/l/sub/c")) |_| true else |_| false, "unlink the last name", .{});
+    expect(sys.open("/t_fs/l/sub/c", .{}) == error.NotFound, "file is gone after the last unlink", .{});
+}
+
+/// 设备文件：mkfs 建的 /dev 下的三个，mknod 建新的；读写、fstat、lseek、readdir，不认识的设备号。
+fn testDevices() void {
+    var buf: [64]u8 = undefined;
+    // /dev/null：读是结尾，写什么都收下（坏指针也不看）
+    {
+        const fd = mustOpen("/dev/null", .{ .read = true, .write = true });
+        defer sys.close(fd) catch {};
+        expect((sys.read(fd, &buf) catch 99) == 0, "read /dev/null", .{});
+        expect((sys.write(fd, "discarded") catch 0) == 9, "write /dev/null", .{});
+        const st = sys.fstat(fd) catch std.mem.zeroes(abi.Stat);
+        expect(st.kind == .device and st.major == @backingInt(abi.Major.null) and st.size == 0 and st.nlink == 1 and st.ino != 0, "fstat /dev/null", .{});
+        expect(sys.lseek(fd, 0, .set) == error.NotSeekable, "lseek /dev/null", .{});
+        var ent: abi.Dirent = undefined;
+        expect(sys.readdir(fd, &ent) == error.NotDir, "readdir /dev/null", .{});
+    }
+    // /dev/zero：读出来都是 0
+    {
+        const fd = mustOpen("/dev/zero", .{});
+        defer sys.close(fd) catch {};
+        @memset(&read_buf, 0xaa);
+        const n = sys.read(fd, &read_buf) catch 0;
+        expect(n == read_buf.len and std.mem.allEqual(u8, &read_buf, 0), "read {d} bytes of /dev/zero", .{n});
+        expect(sys.write(fd, "x") == error.BadFd, "write a read-only /dev/zero", .{});
+    }
+    // /dev/console：写到串口上
+    {
+        const fd = mustOpen("/dev/console", .{ .write = true });
+        defer sys.close(fd) catch {};
+        expect((sys.write(fd, "t_fs: hello via /dev/console\n") catch 0) == 29, "write /dev/console", .{});
+    }
+    // mknod：自己建一个 null，可以链接、改名、删；不认识的设备号能建不能打开
+    expect(if (sys.mknod("/t_fs/mynull", .null)) |_| true else |_| false, "mknod", .{});
+    expect(sys.mknod("/t_fs/mynull", .zero) == error.Exists, "mknod an existing name", .{});
+    {
+        const fd = mustOpen("/t_fs/mynull", .{ .write = true });
+        expect((sys.write(fd, "gone") catch 0) == 4, "write a device made by mknod", .{});
+        sys.close(fd) catch {};
+    }
+    expect(if (sys.link("/t_fs/mynull", "/t_fs/null2")) |_| true else |_| false, "link a device", .{});
+    expect(nlinkOf("/t_fs/null2") == 2, "nlink of a linked device", .{});
+    expect(sys.mknod("/t_fs/weird", @fromBackingInt(999)) != error.InvalidArgument, "mknod an unknown device", .{});
+    expect(sys.open("/t_fs/weird", .{}) == error.NoSuchDevice, "open an unknown device", .{});
+    expect(sys.mknod("/t_fs/zero_major", @fromBackingInt(0)) == error.InvalidArgument, "mknod major 0", .{});
+    expect(sys.mknod("/t_fs/nope/x", .null) == error.NotFound, "mknod in a missing directory", .{});
+    // 设备文件不能当目录、程序
+    expect(sys.chdir("/dev/null") == error.NotDir, "chdir to a device", .{});
+    expect(sys.open("/dev/null/x", .{}) == error.NotDir, "path through a device", .{});
+    expect(sys.exec("/dev/zero", &.{"zero"}) == error.BadElf, "exec a device", .{});
+    for ([_][]const u8{ "/t_fs/mynull", "/t_fs/null2", "/t_fs/weird" }) |p| sys.unlink(p) catch expect(false, "unlink {s}", .{p});
 }
 
 // ---- 掉电测试 ----
