@@ -28,7 +28,7 @@ const Source = union(enum) {
 
 - **init 嵌在内核里**：构建系统只把 init 的 ELF 作为匿名模块交给内核（[build.md](build.md#用户程序)），`@embedFile("init")` 拿到它的字节，放在内核的 `.rodata` 里。第一个进程要在挂载文件系统之前加载：挂载要读盘，读盘要睡着等，只有进程能做（[fs.md](fs.md#接进内核fsyszig)）。xv6 也是这样，只是它嵌的是一小段汇编（`initcode`），由它去 `exec("/init")`。
 - **别的程序都在文件系统的 `/bin` 里**：构建时 `mkfs` 把它们装进去（init 也在，可以 `run init`），`exec` 从那里加载。程序是普通的文件，可以复制、删除，也可以运行别的路径上的文件（`run /h`）。
-- 加载器（[ELF 加载器](#elf-加载器)）只通过 `Source` 读 ELF，不关心它在哪：嵌着的直接复制，文件系统里的用 `fs.read` 读，段的内容直接读进新分配的用户页，不经过别的缓冲区。
+- 加载器（[ELF 加载器](#elf-加载器)）只通过 `Source` 读 ELF 的文件头和程序头，不关心它在哪：嵌着的直接复制，文件系统里的用 `fs.read` 读。段的内容不在 `exec` 时读：程序运行起来、访问到哪一页，才从同一个来源（`vm.Backing`：嵌着的字节，或者程序文件的 inode）读进那一页（[按需分页](#按需分页)）。
 
 ## 进程表
 
@@ -44,7 +44,7 @@ pub const Process = struct {
     hart: usize = 0,                   // lock。running 时在哪个 hart 上运行（kill 发核间中断用）
     pid: usize = 0,                    // lock
     name: Name = .{},                  // lock。程序名（最多 16 字节，存在这里），exec 时换掉；fork 出来的子进程沿用父进程的
-    space: *vm.PageTable = undefined,  // 根页表
+    space: vm.Space = undefined,       // 地址空间：根页表、各个段、堆（按需分页要用，见 paging.md）
     parent: ?*Process = null,          // wait_lock。父进程；init 没有
     context: Context = undefined,      // 不在运行时保存的内核上下文
     chan: ?*const anyopaque = null,    // lock。sleeping 时等的通道
@@ -52,8 +52,6 @@ pub const Process = struct {
     xstatus: u32 = 0,                  // lock。zombie 的结束状态，父进程 wait 时取走
     ticks: u64 = 0,                    // lock。在 U 模式运行期间来过的时钟中断数
     files: [abi.max_fds]?*file.File = @splat(null),  // 打开的文件，下标就是 fd
-    heap_start: usize = 0,             // 堆的起点（最后一个段之后的页边界）
-    brk: usize = 0,                    // 堆的末尾，sbrk 调整
     sleeplocks: u32 = 0,               // 拿着几把睡眠锁，回到 U 模式时必须是 0
     cwd: u64 = fs.root_ino,            // 当前目录的 inode 号（chdir），fork 继承，exec 不变
 };
@@ -64,7 +62,7 @@ var next_pid: std.atomic.Value(usize) = .init(1);  // 每次创建进程加 1（
 var init_proc: ?*Process = null;                   // 孤儿交给它；userinit 设置后不再改
 var foreground: std.atomic.Value(usize) = .init(0);  // 前台进程的 pid（setfg），按 Ctrl-C 时杀掉它
 
-var kernel_stacks: [max_procs][16 * 1024]u8 align(16) = undefined;  // 槽位 i 的进程用第 i 块
+// 槽位 i 的进程用 kstack.process[i] 作内核栈（src/kstack.zig）
 
 const Cpu = struct {                   // 每个 hart 一份（xv6 的 struct cpu）
     proc: ?*Process = null,            // 正在这个 hart 上运行的进程；在调度器里时为 null
@@ -88,11 +86,12 @@ pub fn current() ?*Process              // cpus[hart.id()].proc
 
 所有的状态变化都拿着这个进程的锁。
 
-- **每个进程一块 16 KiB 的内核栈**，静态分配在 `.bss` 里（64 块共 1 MiB）。不从页分配器要：它一次只给一页，给不出连续的 16 KiB。实测 Debug 模式下跑完全部 QEMU 测试（单核和 4 核，包括文件系统的 `t_fs` 和掉电后重新启动），最深用了 11624 字节，safe 模式下 7800 字节，small 模式下 7384 字节（加了符号链接、`getcwd` 之后重新量的：路径解析多了一个 256 字节的缓冲区，Debug 的最深值没变，safe、small 多了一百多字节），最深的是文件系统的系统调用（B 树的操作，[fs.md](fs.md#接进内核fsyszig)）。再上一次（加硬链接、设备文件，`exec` 的参数上限调到 32 个、2048 字节）比之前多出来的 1 KiB 多，推测来自 `exec`：它在栈上放着参数（2048 字节加两个 32 项的数组），再从文件系统读程序（没有逐个调用量过）。测法：`.bss` 启动时清零，`shutdown` 时从每块栈的底部找第一个不为 0 的字节，取最大值（临时加的代码，没有留在仓库里；最底下 256 字节的金丝雀不算）。内核栈两侧没有保护页：内核内存是用大页恒等映射的，要在中间挖出不映射的页得拆大页，现在没做。
-- **栈底的金丝雀**（`src/canary.zig`）：没有保护页，进程 i 的内核栈往下溢出时不会缺页，而是正好写进进程 i-1 内核栈的最顶上，也就是它的 `TrapFrame`，那个进程回到 U 模式时寄存器就乱了，很难查。所以每块内核栈最底下的 256 字节写着固定的图案（`allocSlot` 拿到空槽位时写，这时这块栈没人用），切回调度器（`sched`）、回到 U 模式之前（`handleTrap` 末尾、`forkretC`）由 `proc.checkStack` 检查，图案被改了就 panic：`kernel stack overflow: pid N (name)`。这是尽力而为的检查：一个很大、只写了一部分的栈帧可能整个跨过 256 字节而不碰它。临时在 `getpid` 里放一个 15.5 KiB 的数组实测过，shell 一调用 `getpid` 就 panic。启动栈也有一份（[boot.md](boot.md#每个-hart-的启动栈)）。
+- **每个进程一块 16 KiB 的内核栈**（`kstack.process`，`src/kstack.zig`），静态分配在 `.bss` 里（64 块，每块下面还有一页保护页，共 1.25 MiB）。不从页分配器要：它一次只给一页，给不出连续的 16 KiB。实测 Debug 模式下跑完全部 QEMU 测试（单核和 4 核，包括文件系统的 `t_fs` 和掉电后重新启动），最深用了 11624 字节，safe 模式下 7800 字节，small 模式下 7384 字节（加了符号链接、`getcwd` 之后重新量的：路径解析多了一个 256 字节的缓冲区，Debug 的最深值没变，safe、small 多了一百多字节），最深的是文件系统的系统调用（B 树的操作，[fs.md](fs.md#接进内核fsyszig)）。再上一次（加硬链接、设备文件，`exec` 的参数上限调到 32 个、2048 字节）比之前多出来的 1 KiB 多，推测来自 `exec`：它在栈上放着参数（2048 字节加两个 32 项的数组），再从文件系统读程序（没有逐个调用量过）。测法：`.bss` 启动时清零，`shutdown` 时从每块栈的底部找第一个不为 0 的字节，取最大值（临时加的代码，没有留在仓库里；最底下 256 字节的金丝雀不算）。这些数是加按需分页、保护页之前量的；按需分页从程序文件读页（`vm.fault` → `fsys.readText` → `fs.read`）不会叠在别的文件系统操作上面（拿着文件系统的锁时不读，见 [paging.md](paging.md#内核访问用户内存)），推测最深值没有变，没有重新量。
+- **栈下面的保护页**：每块内核栈下面一页不映射（`vm.init` 建内核页表时跳过它，[paging.md](paging.md#内核页表)）。进程 i 的内核栈往下溢出时，碰到的是保护页，马上缺页，而不是写进进程 i-1 内核栈的最顶上（它的 `TrapFrame`，那个进程回到 U 模式时寄存器就乱了，很难查）。缺页时 `sp` 已经在保护页里了，所以 S 模式的陷阱都在每个 hart 的陷阱栈上处理（[trap.md](trap.md#sscratch-约定)），`handleTrap` 看出 `stval` 落在谁的保护页里，panic：`kernel stack overflow: pid N (name) hit its guard page at 0x...`。临时让 `yield` 系统调用在内核里无限递归实测过，`t_sleep` 一调用 `yield` 就是这一行。
+- **栈底的金丝雀**（`src/canary.zig`）：保护页只能发现越过栈底的访问。一个很大、只写了一部分的栈帧可能整个跨过 4 KiB 的保护页，写进下面那块栈；用到了离栈底很近的地方也值得知道。所以每块内核栈最底下的 256 字节还写着固定的图案（`allocSlot` 拿到空槽位时写，这时这块栈没人用），切回调度器（`sched`）、回到 U 模式之前（`handleTrap` 末尾、`forkretC`）由 `proc.checkStack` 检查，图案被改了就 panic：`kernel stack overflow: pid N (name)`。这是尽力而为的检查：一个很大、只写了一部分的栈帧可能整个跨过 256 字节而不碰它。临时在 `getpid` 里放一个 15.5 KiB 的数组实测过（那时还没有保护页），shell 一调用 `getpid` 就 panic。启动栈也有保护页和金丝雀（[boot.md](boot.md#每个-hart-的启动栈)）。
 - init 和 shell 一直占着两个槽位，所以同时最多运行 14 个别的程序。
 - `current()` 返回当前 hart 上正在运行的进程：`cpus[hart.id()].proc`，只在 `scheduler` 切到进程前设置、切回来后清回 `null`。系统调用和陷阱处理程序用 `current().?` 取当前进程，Debug/safe 模式下没有进程时会 panic。它不用加锁：只有这个 hart 自己读写自己那一项，而且内核关着中断运行，读到之后到开中断之前，这个 hart 不会换进程（xv6 的 `myproc` 为此要 `push_off`）。
-- 哪些字段由谁保护见[锁](#锁)。`space`、`context`、`files`、`heap_start`、`brk`、`cwd` 不用加锁：只有进程自己会读写它们（`close`/`dup`/`pipe`/`sbrk` 系统调用、`fork` 时复制给子进程、结束时关掉文件），没有线程，别的进程碰不到；父进程回收 zombie 时它已经不会再运行了。
+- 哪些字段由谁保护见[锁](#锁)。`space`、`context`、`files`、`cwd` 不用加锁：只有进程自己会读写它们（`close`/`dup`/`pipe`/`sbrk` 系统调用、缺页、`fork` 时复制给子进程、结束时关掉文件），没有线程，别的进程碰不到；父进程回收 zombie 时它已经不会再运行了。
 
 ## 用户地址空间
 
@@ -102,35 +101,17 @@ pub fn current() ?*Process              // cpus[hart.id()].proc
 | --- | --- | --- |
 | `0x4000_0000` 起 | ELF 的各个 PT_LOAD 段（代码 / 只读数据 / 数据和 `.bss`） | 按程序头：`R-X` / `R--` / `RW-`，都带 U |
 | 紧接着最后一个段之后的页边界（`heap_start`）到 `brk` | 堆，`sbrk` 调整（[sbrk](#sbrk堆)），一开始是空的 | `RW-`，带 U |
-| …… | 不映射 | |
-| `0x7fff_b000..0x7fff_c000` | 保护页，不映射 | 栈溢出时触发缺页异常，而不是悄悄踩坏别的数据 |
-| `0x7fff_c000..0x8000_0000` | 用户栈，16 KiB（4 页）。最顶上是 `exec` 传进来的命令行参数（[命令行参数](#命令行参数)） | `RW-`，带 U |
+| …… | 没有页 | |
+| `0x7fef_f000..0x7ff0_0000`（`vm.heap_limit..vm.stack_limit`） | 保护页，永远没有页 | 栈溢出时触发缺页异常（结束进程），而不是悄悄写进堆里；堆也不能长进来 |
+| `0x7ff0_0000..0x8000_0000`（`vm.stack_limit..vm.stack_top`） | 用户栈，最多 1 MiB（`vm.stack_max`）。最顶上是 `exec` 传进来的命令行参数（[命令行参数](#命令行参数)） | `RW-`，带 U |
 
-运行 `hello`（Debug 模式）时在 `syscall.dispatch` 处停下，用 GDB 的 `monitor info mem` 看到的完整映射：
-
-```
-vaddr            paddr            size             attr
-000000000c000000 000000000c000000 0000000000600000 rw--gad    ┐ 内核映射（共用），没有 u
-0000000010000000 0000000010000000 0000000000001000 rw--gad    ┘
-0000000040000000 00000000802cb000 0000000000001000 r-xu-ad    ┐
-0000000040001000 00000000802ce000 0000000000012000 r-xu-ad    │ 代码段（物理页不连续：中间穿插着页表页）
-0000000040013000 00000000802e0000 0000000000004000 r--u-ad    │ 只读数据段
-0000000040017000 00000000802e4000 0000000000001000 rw-u-ad    │ 数据段
-000000007fffc000 00000000802e5000 0000000000001000 rw-u-ad    │ 用户栈
-000000007fffd000 00000000802e7000 0000000000003000 rw-u-ad    ┘
-0000000080200000 0000000080200000 000000000004c000 r-x-gad    ┐
-000000008024c000 000000008024c000 0000000000063000 r---gad    │ 内核映射（共用），没有 u
-00000000802af000 00000000802af000 0000000000151000 rw--gad    │
-0000000080400000 0000000080400000 0000000007c00000 rw--gad    ┘
-```
-
-`0x7fffb000` 那一页没有出现，就是保护页。用户映射没有 `g`（全局）位，内核映射都有。
+这张表是“可以有页的地方”（`vm.Space` 记着它），不是页表里已经有的：页表里只有访问过的页（[按需分页](#按需分页)）。刚 `exec` 完的程序只有栈最顶上那一页（放命令行参数），运行到哪儿、用到哪儿再分配；栈用多深就分配多少页，最多 1 MiB。
 
 ## ELF 加载器
 
 ```zig
-fn load(space: *vm.PageTable, src: Source) LoadError!struct { entry: usize, brk: usize }  // 入口地址、堆的起点
-fn loadSegment(space: *vm.PageTable, src: Source, phdr: elf.Elf64.Phdr) LoadError!void
+fn load(space: *vm.Space, src: Source) LoadError!usize          // 记下各个段，设好堆的起点，返回入口地址
+fn loadSegment(space: *vm.Space, src: Source, phdr: elf.Elf64.Phdr) LoadError!void
 const LoadError = error{ BadElf, OutOfMemory, IoError };
 ```
 
@@ -158,15 +139,28 @@ ELF 来自文件系统，任何人都能往里写一个文件再去运行它，�
 | `p_filesz <= p_memsz` | 文件里的内容不能比内存里的段还长 |
 | `[p_offset, p_offset + p_filesz)` 在文件内 | 防止越界读 |
 | 段必须可读（`p_flags.R`） | R/W/X 全为 0 的页表项会被 CPU 当成指向下一级页表的指针；W 无 R 是保留组合。见下面的说明 |
-| 和已经映射的页重叠 → `BadElf` | `allocUserPage` 返回 `AlreadyMapped` 时转换过来 |
+| 和已经记下的段重叠（按页算）、段超过 `vm.max_segments`（8）个 → `BadElf` | `vm.Space.addSegment` 返回 `Overlap`、`TooMany` 时转换过来 |
 
-然后逐页 `vm.allocUserPage(space, p_vaddr + offset, {R, W, X})`：分配一页清零的物理内存、映射上，把文件里对应的内容读进去（`Source.read` 直接读进这一页）；`p_filesz` 之后的部分（`.bss`）保持清零。
+检查通过的段只是**记下来**（`vm.Space.addSegment`：`[p_vaddr, alignForward(p_vaddr + p_memsz))`、权限、`p_offset`、`p_filesz`），不分配页、不读内容。程序访问到段里的某一页时缺页，`vm.fault` 才分配一页清零的物理内存，把文件里对应的部分（`[p_offset + 页在段里的偏移, ...)`，最多 `p_filesz` 为止）读进去，`p_filesz` 之后的部分（`.bss`）保持清零，再按段的权限映射上（[按需分页](#按需分页)）。所以上面的检查必须在 `exec` 时做完：之后缺页时读的范围都是这里检查过的。
+
+最后检查**入口地址落在一个可执行的段里**，不然是 `BadElf`：以前加载器把每一页都映射好，入口不对的程序运行起来第一条指令就缺页；现在在 `exec` 时就拒绝它。
 
 **为什么一定要拒绝不可读的段**：如果一个段的 R/W/X 全为 0，`map` 写出的页表项只有 V = 1，硬件会把它当成“指向下一级页表”的项，而它指向的是一页用户数据。只要用户程序（或者构造 ELF 的人）往那一页里写入精心构造的页表项，就能把任意物理内存映射进自己的地址空间。这个漏洞是写完加载器后复查代码时发现的，现在加载器拒绝这样的段，`vm.map` 也断言了叶子权限合法。回归测试 `t_noperm`（[testing.md](testing.md#回归测试程序)）一直在检查这一点：故意去掉这条检查时，Debug 模式下 `vm.map` 的断言让内核 panic，small 模式下断言被编译掉，那一页真的被当成了页表。
 
-所有段加载完后，映射用户栈：`[栈底, 0x8000_0000)` 的 4 页，`RW-`。前面已经保证段都在保护页之下，所以这里不会 `AlreadyMapped`（写成 `unreachable`）。
+栈也不在这里分配（[命令行参数](#命令行参数)写参数时分配最顶上那一页）。
 
-返回值里的 `brk` 是**所有段的末尾按页向上取整后的最大值**，也就是堆的起点。段的最后一页已经整页映射了（权限是那个段的，比如只读），堆从下一页开始，堆里的页都是 `RW-`，不会和段的权限混在一起。
+堆的起点（`space.heap_start`，`brk` 一开始也是它）是**所有段的末尾按页向上取整后的最大值**。段的最后一页整页属于段（权限是那个段的，比如只读），堆从下一页开始，堆里的页都是 `RW-`，不会和段的权限混在一起。
+
+单元测试（`src/proc.zig` 末尾）加载真正的 `hello`：加载完只多用了根页表这一页；再把每个段的每一页都读一遍（按需分配），读到的第一个字节和 ELF 文件里 `p_offset` 处的一样；栈的两端读得到，保护页、空的堆读不到；释放后不漏页。
+
+## 按需分页
+
+`exec` 只记下“哪些地址可以有页、页从哪来”（`vm.Space`），页表里一开始几乎是空的。用户程序访问一页还没有的地址时缺页（读是 `load_page_fault`，写是 `store_page_fault`，取指令是 `instruction_page_fault`），陷阱处理程序调用 `vm.fault`：地址在某个段、堆或者栈里，并且这次访问是那个区域允许的，就分配一页（段的页从程序文件读内容），映射上，回到那条指令重新执行；不然（没有这个区域、保护页、写代码段、执行数据）照常结束进程。写时复制也在这里处理（[paging.md](paging.md#按需分页)）。
+
+- **页从哪读**（`vm.Backing`）：init 是嵌在内核里的字节（`.bytes`），别的程序是程序文件的 inode（`.file`）。缺页时 `fsys.readText` 拿一个新的快照、按 inode 读那一页、马上放开快照。读盘要睡着等磁盘中断，陷阱处理程序这时什么锁都没拿，可以睡。
+- **程序文件运行期间不能变**：不然一个进程前后读到的页来自两个版本的文件（比如代码段的前一半是旧的、后一半是新的）。所以 `exec` 先占住它（`fsys.holdText`），之后有人要改它的内容（`write`、截断）、删掉它的最后一个名字（`unlink`、`rename` 换掉它）都是 `TextBusy`（`-ETXTBSY`，和 Linux 一样）；它正在被改时也不能开始运行（`exec` 返回 `-ETXTBSY`）。改名、加硬链接、删掉别的名字不动内容，照常可以。`fork` 出来的子进程多占一份（`fsys.dupText`），进程结束时（`finish`）就放开，不等父进程回收；`exec` 换掉地址空间时放开旧的。见 [fs.md](fs.md#正在运行的程序文件)。
+- **内存不够**：缺页时分配不到页，进程被结束：`[proc] pid N (name) killed: out of memory (demand paging) at ...`（写时复制没内存复制是 `out of memory (copy-on-write)`），读不出程序文件是 `cannot read the program file (demand paging)`。`sbrk` 不预先分配，所以“堆长成功了、用的时候没内存”是可能的（和 Linux 的 overcommit 一样）。
+- 回归测试 `t_demand`（[testing.md](testing.md#回归测试程序)）：程序里 256 KiB 的只读数组，读其中 16 页正好多用 16 页；数据页的内容来自文件、可写、`fork` 之后各改各的；内核替它读写还没读进来的页；512 KiB 的栈；运行中的程序文件不能写、截断、删除、被 `rename` 换掉，能改名、删另一个硬链接，结束之后又都可以。
 
 ## 创建进程
 
@@ -177,8 +171,8 @@ pub fn userinit() SpawnError!void                          // kmain 调用，创
 pub const ForkError = error{ TooManyProcesses, OutOfMemory };
 pub fn fork() ForkError!usize                              // fork 系统调用，返回子进程的 pid
 
-pub const ExecError = error{ NoSuchProgram, OutOfMemory, BadElf };
-pub fn exec(name: []const u8, args: []const []const u8) ExecError!void   // exec 系统调用
+pub const ExecError = error{ NoSuchProgram, OutOfMemory, BadElf, IoError, NoDevice, NotDir, NameTooLong, SymlinkLoop, TextBusy };
+pub fn exec(path: []const u8, args: []const []const u8) ExecError!void   // exec 系统调用
 ```
 
 三个函数都要准备一个“下次被调度时从哪里开始”的状态。用户进程第一次被调度时的路径都一样：
@@ -213,7 +207,7 @@ scheduler → switchContext ─ret→ forkret → forkretC（放开进程锁、c
 
 ### userinit
 
-和 xv6 的 `userinit` 一样，只在启动时调用一次（这时别的 hart 已经在各自的调度器里空转了）：`loadImage` 新建地址空间（`vm.createUserSpace()`，复制内核的根页表）、加载嵌在内核里的 `init` 程序（`Source.bytes`，[程序从哪来](#程序从哪来)）、把命令行参数 `"init"` 放到栈顶（[命令行参数](#命令行参数)）；**打开串口作为 0、1、2 号 fd**（一个 `File`，引用数 3，[files.md](files.md)），之后所有进程都从 init `fork` 继承它们；拿着空槽位的锁（`allocSlot`），用 `startFrame(frame, image)` 构造从入口开始运行的 `TrapFrame`，填好字段，状态设为 `runnable`，pid 是 1，记进 `init_proc`，最后才放开锁。`init_proc` 在放开锁之前设置：别的 hart 要先拿到这把锁才能运行 init，那时一定看得到它。没有 `init` 程序是构建配置错了，直接 `@panic`；其他错误 `kmain` 会 panic。
+和 xv6 的 `userinit` 一样，只在启动时调用一次（这时别的 hart 已经在各自的调度器里空转了）：新建地址空间（`vm.createUserSpace()`，复制内核的根页表），页从嵌在内核里的 `init` 程序读（`backing = .bytes`，[程序从哪来](#程序从哪来)），`loadImage` 记下它的段（`Source.bytes`）、把命令行参数 `"init"` 放到栈顶（[命令行参数](#命令行参数)）；**打开串口作为 0、1、2 号 fd**（一个 `File`，引用数 3，[files.md](files.md)），之后所有进程都从 init `fork` 继承它们；拿着空槽位的锁（`allocSlot`），用 `startFrame(frame, image)` 构造从入口开始运行的 `TrapFrame`，填好字段，状态设为 `runnable`，pid 是 1，记进 `init_proc`，最后才放开锁。`init_proc` 在放开锁之前设置：别的 hart 要先拿到这把锁才能运行 init，那时一定看得到它。没有 `init` 程序是构建配置错了，直接 `@panic`；其他错误 `kmain` 会 panic。
 
 `startFrame` 构造的 `TrapFrame`：`sepc` = 入口地址，`sp`（`regs[2]`）和 `a1`（`regs[11]`）= 栈上 `Arg` 数组的地址，`a0`（`regs[10]`）= `argc`，其他寄存器为 0，`sstatus = (当前 sstatus & ~(SPP | SIE)) | SPIE`：
 
@@ -226,8 +220,8 @@ scheduler → switchContext ─ret→ forkret → forkretC（放开进程锁、c
 ```zig
 pub fn fork() ForkError!usize {
     const parent = current().?;
-    const space = try vm.cloneUserSpace(parent.space);
-    errdefer vm.destroyUserSpace(space);
+    var space = try vm.cloneUserSpace(&parent.space);
+    errdefer vm.destroyUserSpace(&space);
     wait_lock.acquire();
     defer wait_lock.release();
     const child = try allocSlot();          // 拿着它的锁返回
@@ -239,8 +233,7 @@ pub fn fork() ForkError!usize {
     for (&files, parent.files) |*c, f| c.* = if (f) |x| file.dup(x) else null;
     const pid = next_pid.fetchAdd(1, .monotonic);
     fill(child, .{ .state = .runnable, .pid = pid, .name = parent.name, .space = space,
-                   .parent = parent, .context = firstContext(child), .files = files,
-                   .heap_start = parent.heap_start, .brk = parent.brk });
+                   .parent = parent, .context = firstContext(child), .files = files, .cwd = parent.cwd });
     return pid;
 }
 ```
@@ -250,7 +243,7 @@ pub fn fork() ForkError!usize {
 - **地址空间写时复制**（`vm.cloneUserSpace`，[paging.md](paging.md#复制用户地址空间)）：子进程只新分配页表，用户页和父进程共用（引用数加 1）；可写的页两边都改成只读、标上 `cow`，谁先写哪一页，谁在写缺页里复制一份（`vm.breakCow`，[paging.md](paging.md#写时复制)），所以之后仍然各改各的。shell 运行程序是 `fork` 之后马上 `exec`，子进程的旧地址空间一页都不用复制。
 - **`TrapFrame` 原样复制**，只把 `a0` 改成 0。`fork` 是在系统调用里调用的，这时 `handleTrap` 已经把父进程 `TrapFrame` 的 `sepc` 加过 4 了，所以子进程第一次被调度时，经 `forkret` → `trapExit` 回到 U 模式，正好从 `ecall` 的下一条指令继续，看到 `fork` 返回了 0。父进程照常从系统调用返回，`a0` 是子进程的 pid。
 - **打开的文件和父进程共用**：fd 表逐项复制，每个 `File` 的引用数加 1（`file.dup`），所以父子进程的 fd 指向同一个串口、同一个管道的同一端。shell 运行管道就靠这个（[shell.md](shell.md#管道)）。`dup` 只加引用数，不会失败。
-- 堆（`heap_start`、`brk`）也照抄，堆里的页随地址空间一起共用（写时复制）。
+- 段、堆（`space` 里的 `heap_start`、`brk`）、程序文件也照抄（程序文件多占一份，`fsys.dupText`），已经有的页随地址空间一起共用（写时复制）；父进程还没访问过的页，子进程访问时自己按需分配，从同一个程序文件读（[paging.md](paging.md#复制用户地址空间)）。
 - 进程表满了是 `TooManyProcesses`，`fork` 系统调用返回 `-EAGAIN`；内存不够（页表都分配不出来）是 `OutOfMemory`（`-ENOMEM`），`cloneUserSpace` 自己释放已经建好的部分。
 - pid 用原子变量 `next_pid.fetchAdd` 分配：几个 hart 同时 `fork` 也不会拿到同一个 pid。
 
@@ -259,36 +252,44 @@ pub fn fork() ForkError!usize {
 ```zig
 pub fn exec(path: []const u8, args: []const []const u8) ExecError!void {
     const p = current().?;
-    var r = fsys.reader() catch return error.NoDevice;   // 在文件系统的一个快照上加载
-    const image = blk: {
+    const ino = blk: {                                   // 在一个快照上找到程序文件
+        var r = fsys.reader() catch return error.NoDevice;
         defer r.end();
-        break :blk try loadImage(try openProgram(&r.fs, p.cwd, path), args);   // 新地址空间 + 加载 + 参数放到栈顶
+        break :blk try findProgram(&r.fs, p.cwd, path);
     };
-    const old = p.space;
-    p.space = image.space;
-    vm.activate(image.space);
-    vm.destroyUserSpace(old);
+    fsys.holdText(ino) catch return error.TextBusy;      // 占住它：运行期间不能改、不能删
+    var space = vm.createUserSpace() catch |err| { fsys.releaseText(ino); return err; };
+    space.backing = .{ .file = ino };                    // 占用交给地址空间，destroyUserSpace 时放开
+    errdefer vm.destroyUserSpace(&space);
+    const image = blk: {                                 // 占住之后再拿一个快照，读文件头、记下段
+        var r = fsys.reader() catch return error.NoDevice;
+        defer r.end();
+        const st = r.fs.stat(ino) catch ...;             // 中间被删掉了是 NoSuchProgram
+        break :blk try loadImage(&space, .{ .file = .{ .fs = &r.fs, .ino = ino, .size = st.size } }, args);
+    };
+    var old = p.space;
+    p.space = space;
+    vm.activate(space.root);
+    vm.destroyUserSpace(&old);                           // 也放开旧的程序文件
     p.lock.acquire();
-    p.name = .init(std.fs.path.basenamePosix(path));   // procinfo 在别的 hart 上读它
+    p.name = .init(std.fs.path.basenamePosix(path));     // procinfo 在别的 hart 上读它
     p.lock.release();
-    p.heap_start = image.brk;
-    p.brk = image.brk;
     startFrame(frameOf(p), image);
 }
 ```
 
-- **找程序**（`openProgram`）：`path` 里没有 `/` 的在 `/bin` 里找（`run hello` 就是 `/bin/hello`，相当于 `PATH` 只有 `/bin`），有的按路径找，相对路径从当前目录开始，跟着符号链接走（进程名是路径的最后一段，也就是链接的名字）。找不到是 `NoSuchProgram`（`ENOENT`），是目录是 `BadElf`（`ENOEXEC`），路径中间不是目录是 `NotDir`，符号链接有环是 `SymlinkLoop`（`ELOOP`），`/bin/` 加上名字超过 256 字节是 `NameTooLong`，没挂上文件系统是 `NoDevice`。
-- **加载期间用同一个快照**（[fs.md](fs.md#接进内核fsyszig)）：程序文件读到一半被别的进程改掉、删掉，读到的也还是开始时的样子，不会半新半旧；也不挡着别人读写文件系统（几个 hart 同时 `exec` 各读各的）。拿着快照分配页（页分配器的锁，自旋锁）是允许的：它不用等修改文件系统的一方。
-- 先把新程序完整加载进**新的**地址空间，全部成功之后才换掉旧的。失败时旧的地址空间和 `TrapFrame` 都没动，系统调用返回错误，原来的程序接着运行（xv6 也是这样）。
+- **找程序**（`findProgram`）：`path` 里没有 `/` 的在 `/bin` 里找（`run hello` 就是 `/bin/hello`，相当于 `PATH` 只有 `/bin`），有的按路径找，相对路径从当前目录开始，跟着符号链接走（进程名是路径的最后一段，也就是链接的名字）。找不到是 `NoSuchProgram`（`ENOENT`），是目录是 `BadElf`（`ENOEXEC`），路径中间不是目录是 `NotDir`，符号链接有环是 `SymlinkLoop`（`ELOOP`），`/bin/` 加上名字超过 256 字节是 `NameTooLong`，没挂上文件系统是 `NoDevice`。
+- **先占住、再读**：`exec` 只读文件头和程序头，段的内容要等程序运行起来、缺页时才读，那时用的是新的快照（`fsys.readText`），所以必须保证这段时间里文件不变：先 `holdText` 占住（[fs.md](fs.md#正在运行的程序文件)），再拿一个**新的**快照读文件头。找程序时的那个快照是占住之前拿的，可能已经旧了：别人可能刚好在两者之间改完了这个文件。占住之后，修改它的一方都会得到 `TextBusy`；占住之前就开始了的修改，要么还没做完（`holdText` 看到有人正在改它，`exec` 返回 `TextBusy`），要么已经提交了，新快照里看得到。所以新快照里的文件头和之后每次缺页读到的内容是同一个版本。两次之间文件被删掉了是 `NoSuchProgram`。快照都不挡着别人读写文件系统（几个 hart 同时 `exec` 各读各的）。
+- 先把新程序加载进**新的**地址空间（记下段、写好参数），全部成功之后才换掉旧的。失败时旧的地址空间和 `TrapFrame` 都没动，系统调用返回错误，原来的程序接着运行（xv6 也是这样）。
 - `args` 已经在**内核内存**里了：参数在旧的地址空间里，换掉之前 `exec` 系统调用就把它们复制到了内核栈上（[syscalls.md](syscalls.md#exec)）。
-- **释放旧的页表之前必须先切走**：这时 `satp` 还指着旧的根页表。
+- **释放旧的页表之前必须先切走**：这时 `satp` 还指着旧的根页表。`destroyUserSpace` 同时放开旧的程序文件（`vm.releaseBacking`）。
 - 改写 `TrapFrame`：从新程序的入口开始，`a1`、`sp` 指向参数，其他寄存器为 0。系统调用返回值会写进 `a0`，所以 `exec` 系统调用成功时返回 `argc`，新程序看到 `a0 = argc`，和 init 第一次运行时一样。
 - pid、父进程、`ticks`、`killed`、**打开的文件**、当前目录都不变；名字换成程序文件的名字（路径的最后一段，`Name` 存在进程里，最多 16 字节，`run /h` 之后叫 `h`）；堆重新从新程序的段之后开始（空的）。
 
 ### 命令行参数
 
 ```zig
-fn pushArgs(space: *vm.PageTable, args: []const []const u8) usize   // 返回栈上 Arg 数组的地址
+fn pushArgs(space: *vm.Space, args: []const []const u8) error{OutOfMemory}!usize   // 返回栈上 Arg 数组的地址
 
 pub const Arg = extern struct { ptr: usize, len: usize };            // abi.zig
 pub const max_args = 32;
@@ -306,7 +307,7 @@ Arg 数组          argc 个 { ptr, len }，ptr 是上面那些字节的用户�
 
 - 新程序的 `sp` 就从 `Arg` 数组的地址开始，往下才是真正的栈。`Arg` 数组的地址按 16 字节对齐（RISC-V 调用约定要求 `sp` 16 字节对齐）。
 - 和 C 不一样，参数不以 0 结尾、`argv` 数组后面也没有 `NULL`：Zig 用切片，长度和指针一起传，`user/start.zig` 直接把它变成 `[]const abi.Arg`（[user-programs.md](user-programs.md#startzig)）。
-- 最多 32 个参数、加起来最多 2048 字节，所以整块不到 2.6 KiB（2048 + 32 × 16 字节的 `Arg`，再加对齐），栈最顶上那一页一定放得下，`copyToUser` 不会失败（写成 `unreachable`）；剩下的 13 KiB 多给程序当栈用。上限由 `exec` 系统调用检查，超出返回 `-E2BIG`。
+- 最多 32 个参数、加起来最多 2048 字节，所以整块不到 2.6 KiB（2048 + 32 × 16 字节的 `Arg`，再加对齐），栈最顶上那一页一定放得下。栈是按需分配的，`copyToUser` 写参数时才分配这一页，没有内存时 `exec` 返回 `OutOfMemory`（`-ENOMEM`），这是这里唯一可能的失败。上限由 `exec` 系统调用检查，超出返回 `-E2BIG`。
 - 用 `loadImage(&hello, &.{ "hello", "", "world!" })` 的单元测试检查了布局：16 字节对齐，每个 `Arg` 指向栈上正确的字节，没有参数时 `sp` 就是栈顶。
 
 ### sbrk：堆
@@ -316,12 +317,12 @@ pub fn sbrk(increment: isize) SbrkError!usize   // 返回原来的 brk
 pub const SbrkError = error{ OutOfMemory, InvalidArgument };
 ```
 
-照 xv6 的 `growproc`：堆是 `[heap_start, brk)`，`brk` 按字节记，映射按页。
+照 xv6 的 `growproc`：堆是 `[heap_start, brk)`（都在 `p.space` 里），`brk` 按字节记，页按页分配。和 xv6 的 lazy allocation 实验一样，**按需分配**：
 
-- **变大**：`vm.growUser` 把 `[alignForward(旧 brk), alignForward(新 brk))` 的页都映射上，清零、`RW-`。`brk` 还在已经映射的那一页里时不用新的页。物理内存不够时把这次映射的页都释放掉，返回 `OutOfMemory`（`-ENOMEM`），`brk` 不变。
-- **变小**：`vm.shrinkUser` 把整个落在新 `brk` 之后的页释放掉，空出来的第 0 级页表也释放（[paging.md](paging.md#堆的增长和缩小)），然后 `sfence.vma`：这些页可能还在 TLB 里，不刷的话进程还能访问已经还给页分配器的页。
-- **边界**：不能小于 `heap_start`（`InvalidArgument`，`-EINVAL`），不能长进栈下面的保护页（`heap_limit` = 栈底 − 4096，超出是 `OutOfMemory`）。`increment` 是有符号的，加减都检查溢出。
-- 回归测试 `t_sbrk` 检查了：新内存清零、按页映射（`brk` 所在页的页尾能写，下一页缺页）、缩小后被释放的页缺页、`fork` 复制堆、各种越界，以及长到超过物理内存时失败、不漏页。
+- **变大**：只挪 `brk`，一页都不分配。新跨进来的页第一次被访问时缺页，`vm.fault` 才分配一页清零的 `RW-` 页（[按需分页](#按需分页)）。所以 `sbrk(4 MiB)` 之后只碰两页，只多用两页和装它们的页表。
+- **变小**：`vm.shrinkUser` 把整个落在新 `brk` 之后、已经分配了的页释放掉（没访问过的本来就没有），空出来的第 0 级页表也释放（[paging.md](paging.md#堆的增长和缩小)），然后 `sfence.vma`：这些页可能还在 TLB 里，不刷的话进程还能访问已经还给页分配器的页。
+- **边界**：不能小于 `heap_start`（`InvalidArgument`，`-EINVAL`），不能长进栈下面的保护页（`vm.heap_limit`，超出是 `OutOfMemory`）。堆一共比整个物理内存（`page.total_pages`）还大时也是 `OutOfMemory`：肯定用不上，和 Linux 默认的 overcommit 检查一个意思。别的时候不看还有多少空闲的页，比空闲内存大的堆也能长成功，真的都用上时，访问它的进程因为没内存被结束（内核替它写的时候返回 `-EFAULT`）。`increment` 是有符号的，加减都检查溢出。
+- 回归测试 `t_sbrk` 检查了：新内存清零、按页分配（`brk` 所在页的页尾能写，下一页缺页）、缩小后被释放的页缺页、`fork` 复制堆、各种越界、超过物理内存时失败；按需分配：`sbrk(4 MiB)` 不用页，碰两页用 2～5 页（加页表），缩回去全部还回来；比空闲内存大的堆，子进程一页页写满时被结束（`qemu_test.py` 检查 `out of memory (demand paging)` 那一行），内核替进程写（读 `/dev/zero`）写到没内存时返回 `-EFAULT`。
 
 ## 调度
 
@@ -608,6 +609,7 @@ fn finish(p: *Process, status: u32) noreturn {
         if (f.*) |x| file.close(x);
         f.* = null;
     }
+    vm.releaseBacking(&p.space);   // 不会再缺页了：放开程序文件
     wait_lock.acquire();
     reparent(p, init);
     wakeup(p.parent.?);
@@ -622,9 +624,10 @@ fn finish(p: *Process, status: u32) noreturn {
 
 1. **init 不能结束**：所有孤儿都靠它回收，它没了内核就 panic（xv6 也是 `panic("init exiting")`）。正常情况下 init 从不退出，`kill` 也不允许杀它。
 2. **关掉所有打开的文件**。必须在这里关，不能等父进程回收：管道的写端关了，读的进程才会读到结尾。要是等到 `wait` 回收时才关，读的进程能不能结束就取决于父进程先回收谁：`run echo hi | wc` 的组长要是先 `wait` wc，echo 的写端就一直开着，wc 永远读不到结尾，两边一起卡住。`reap` 断言 zombie 的 fd 表是空的。
-3. 拿上 `wait_lock`（下面要读写 `parent`）。**`reparent`：子进程交给 init**。被交过去的子进程可能已经是 zombie 了，所以顺便叫醒 init，让它的 `wait` 重新看一遍。
-4. 叫醒父进程（它可能在 `wait` 里睡着）。先叫醒、后改状态也不会漏：父进程要拿到 `wait_lock` 才能检查子进程，而 `wait_lock` 要等这个进程变成 `zombie` 之后才放开。
-5. 拿上自己的锁，记下结束状态（`exit(code)` 是退出码 0..255，被杀的是 `abi.killed_status` 即 `0x100`，两者不会混淆），状态改成 `zombie`，放开 `wait_lock`，拿着自己的锁切回调度器，再也不回来。顺序和 xv6 的 `exit` 一样。
+3. **放开程序文件**（`vm.releaseBacking`，[按需分页](#按需分页)）：之后不会再回到 U 模式、不会再缺页，用不着它了。不等父进程回收：父进程可能很久以后才 `wait`（比如后台进程），这段时间里程序文件应该已经能改、能删了。
+4. 拿上 `wait_lock`（下面要读写 `parent`）。**`reparent`：子进程交给 init**。被交过去的子进程可能已经是 zombie 了，所以顺便叫醒 init，让它的 `wait` 重新看一遍。
+5. 叫醒父进程（它可能在 `wait` 里睡着）。先叫醒、后改状态也不会漏：父进程要拿到 `wait_lock` 才能检查子进程，而 `wait_lock` 要等这个进程变成 `zombie` 之后才放开。
+6. 拿上自己的锁，记下结束状态（`exit(code)` 是退出码 0..255，被杀的是 `abi.killed_status` 即 `0x100`，两者不会混淆），状态改成 `zombie`，放开 `wait_lock`，拿着自己的锁切回调度器，再也不回来。顺序和 xv6 的 `exit` 一样。
 
 **不在这里释放内存**：进程这时还在用自己的内核栈和地址空间（`satp` 指着它的页表）。地址空间由父进程在 `wait` 里回收，那时运行的是父进程，用的是父进程的页表。父进程可能在另一个 hart 上，正好在这个进程切走的同时去回收它：它要拿到这个进程的锁才能看到 `zombie`，而锁要等调度器换回内核页表之后才放开（[调度器](#调度器)），所以回收时这个进程的页表和内核栈已经没人在用了。zombie 只占一个槽位和它的用户内存，直到被回收。
 
@@ -696,11 +699,13 @@ Ctrl-C 结束的是**前台进程和它的所有子孙**：shell 用 `fork` 启�
 
 - 内核代码不可抢占：进程在内核里关着中断运行，直到自己调用 `sched`。xv6 在内核里也开着中断，内核代码被时钟中断打断时也会 `yield`。这里内核里没有长时间的计算，不需要。
 - 进程之间没有优先级，也不考虑在哪个 hart 上运行过（没有亲和性）。
-- 进程表固定 64 项，内核栈和启动栈是静态的，两侧没有保护页：溢出时会踩坏相邻的数据，所以栈的大小按实测用量留了余量；栈底的金丝雀能在被踩坏的数据被用到之前发现大多数溢出（[进程表](#进程表)）。
-- `fork` 写时复制，但页表还是整个复制的；内存用完时写共用的页只能结束进程（没有换页、没有 OOM killer 挑别的进程）。
+- 进程表固定 64 项，内核栈和启动栈是静态的、大小固定，所以按实测用量留了余量；溢出时撞到下面的保护页，内核 panic（[进程表](#进程表)），不能像用户栈那样长。
+- `fork` 写时复制，但页表还是整个复制的；内存用完时，按需分配新页、写共用的页都只能结束进程（没有换页、没有 OOM killer 挑别的进程）。
+- 按需分页每缺一页读一次盘（经过缓冲区缓存），没有预读，也没有页缓存：同一个程序的几个进程（不是 `fork` 出来的）各读各的，代码页不共用；页一旦读进来就不会被换出去。
+- 正在运行的程序文件不能删（`TextBusy`），Linux 允许删（inode 留到最后一个用它的进程结束）；这里的文件系统没有“没名字但还打开着”的 inode。
 - `exec` 没有 `PATH`、没有 `#!` 脚本，也不检查执行权限（文件系统没有权限位）：`/bin` 之外的程序要写路径，任何文件都可以拿去试着运行，不是 ELF 的得到 `ENOEXEC`。
 - 只有一个前台进程，没有进程组和信号：Ctrl-C 杀前台进程和它的子孙；前台进程的子孙被交给 init 之后（父进程先结束了）就不算了。
-- 只有 `sbrk`，没有 `mmap`；用户栈固定 16 KiB，不能增长。
+- 只有 `sbrk`，没有 `mmap`；用户栈最多 1 MiB，按需分配，不能再长（Linux 默认 8 MiB）。
 
 ## 锁
 
@@ -721,8 +726,9 @@ Ctrl-C 结束的是**前台进程和它的所有子孙**：shell 用 `fork` 启�
 | `Volume.snap_lock` | 文件系统已提交的根、读者计数；修改的一方等旧树的读者时拿着它睡下 | [btree.md](btree.md#快照读者) |
 | `Sleeplock.lk` | 一把睡眠锁的 `locked`、`holder`；等锁的进程拿着它睡下 | [disk.md](disk.md#睡眠锁sleeplockzig) |
 | `uart.tx_lock` | 串口输出：一次 `print`、一次 `write` 系统调用整段输出，不和别的 hart 的输出交错 | [devices.md](devices.md#串口uartzig) |
+| `fsys.text_lock` | 正在运行的程序文件的表（`texts`）和正在被改的 inode（`modifying`） | [fs.md](fs.md#正在运行的程序文件) |
 
-不用锁的：`proc.next_pid`、`proc.foreground`、每一页的引用数（`page.refs`）、缓冲区缓存的 `clock`、`evicting` 是原子变量；`init_proc` 只在启动时写一次；`cpus[i]`、`spinlock` 的 `held[i]`、`timer.deadline[i]` 只有 hart i 自己读写；进程的 `space`、`context`、`files`、`heap_start`、`brk`、`cwd` 只有进程自己读写（见[进程表](#进程表)）；内核页表启动后不再改。
+不用锁的：`proc.next_pid`、`proc.foreground`、每一页的引用数（`page.refs`）、缓冲区缓存的 `clock`、`evicting` 是原子变量；`init_proc` 只在启动时写一次；`cpus[i]`、`spinlock` 的 `held[i]`、`timer.deadline[i]` 只有 hart i 自己读写；进程的 `space`、`context`、`files`、`cwd` 只有进程自己读写（见[进程表](#进程表)）；内核页表启动后不再改。
 
 **锁尽量细**：进程、管道、打开的文件、页分配器（每个 hart 一把）、缓冲区缓存（按块号分桶）各有各的锁，文件系统的读者不拿锁（快照）。几个 hart 做互不相干的事（各自分配页、读各自的文件、读同一个文件的不同块）时不抢同一把锁。剩下几把全局的锁是有原因的：
 
@@ -739,10 +745,13 @@ Ctrl-C 结束的是**前台进程和它的所有子孙**：shell 用 `fork` 启�
 - **加锁顺序**（只按这个方向嵌套，就不会死锁）：
 
   ```
-  wait_lock → Process.lock → page.Pool.lock、File.lock、uart.tx_lock
+  wait_lock → Process.lock → page.Pool.lock、File.lock、uart.tx_lock、fsys.text_lock
   bio.evict_lock → bio 的桶的锁
   timer.lock、Pipe.lock、uart.rx_lock、virtio_disk.lock、bio.evict_lock、Volume.snap_lock、Sleeplock.lk → Process.lock
+  Pipe.lock、uart.tx_lock、uart.rx_lock → page.Pool.lock
   ```
+
+  最后一行是按需分页带来的：拿着这些锁替用户程序复制内存（`copyFromUser`、`copyToUser`）时，碰到还没分配的页就地分配一页清零的页（[paging.md](paging.md#内核访问用户内存)）。页分配器的锁是叶子，所以没有环。
 
   另外有**睡眠锁**（[disk.md](disk.md#睡眠锁sleeplockzig)：打开的文件的 `File.pos_lock`、文件系统的写锁 `fsys.write_lock`、缓冲区缓存的每一块）：拿着它可以睡觉，所以拿它之前不能拿着任何自旋锁；拿着它可以再去拿自旋锁（读写磁盘时拿 `virtio_disk.lock`）。回到 U 模式时也不能拿着睡眠锁（`proc.assertNoLocksHeld`）。睡眠锁之间的顺序是 `File.pos_lock` → `fsys.write_lock` → 缓冲区的睡眠锁（[fs.md](fs.md#接进内核fsyszig)）。同时拿着好几个缓冲区的只有修改文件系统的一方（一次一个，`write_lock`）；文件系统的读者、`readblock`、`writeblock` 一次只拿一个，拿着的时候不等别的缓冲区，所以不会互相等（[disk.md](disk.md#找缓冲区get)）。
 
@@ -750,7 +759,7 @@ Ctrl-C 结束的是**前台进程和它的所有子孙**：shell 用 `fork` 启�
 
   - `wait_lock` 在进程锁前面：`fork`、`finish`、`wait`、`interruptForeground`、`info` 都是先拿 `wait_lock` 再拿进程锁。
   - 等待条件的锁在进程锁前面：`sleep` 拿着 `lock` 去拿进程锁；改条件的一方拿着 `lock` 调用 `wakeup`、`isKilled`，它们拿进程锁。`wait_lock` 也是这种用法。
-  - 页分配器、`File`、串口输出的锁是“叶子”：拿着它们时不再拿别的锁。`fork` 拿着 `wait_lock` 和子进程的锁时调用 `file.dup`（拿 `File.lock`），`reap` 拿着锁释放页（拿当前 hart 的 `Pool.lock`），各处拿着锁打印（拿 `uart.tx_lock`）。
+  - 页分配器、`File`、串口输出、`fsys.text_lock` 的锁是“叶子”：拿着它们时不再拿别的锁（串口输出锁例外：拿着它复制用户内存时可能拿页分配器的锁，见上面最后一行）。`fork` 拿着 `wait_lock` 和子进程的锁时调用 `file.dup`（拿 `File.lock`），`reap` 拿着锁释放页（拿当前 hart 的 `Pool.lock`），各处拿着锁打印（拿 `uart.tx_lock`）。
   - 同一层的锁不嵌套：`file.close` 先放开 `File.lock` 再去关管道（拿 `Pipe.lock`）；一次只拿一个进程的锁（`sleep` 里交接时拿着自己的进程锁和 `lock`，两者不同层）；页分配器从别的 hart 拿页（`steal`）时先放开别人的链表的锁再拿自己的；`file.alloc` 一个槽位一个槽位地拿锁；缓冲区缓存的两把桶的锁只有拿着 `evict_lock` 时才同时拿。
 - 同一个 hart 重复拿同一把锁直接 panic（`holding()` 比较锁里记的 hart 编号和 `hart.id()`）。
 - 等锁时每转一圈看一眼是不是有别的 hart 在 panic（`hart.checkPanic`）：锁可能在已经停下的 hart 手里，永远等不到。

@@ -109,22 +109,23 @@ fn walk(root: *PageTable, va: usize, level: u2) MapError!*Pte
 ## 内核页表
 
 ```zig
-pub fn init(memory: dtb.Region) MapError!void
+pub fn init(memory: dtb.Region, guards: []const usize) MapError!void
+fn mapExcept(root: *PageTable, start: usize, end: usize, holes: []const usize, perm: Perm) MapError!void
 ```
 
-`kmain` 在页分配器初始化之后调用它。所有内核映射都是**恒等映射**（虚拟地址 = 物理地址），不带 U 位，带 G 位：
+`kmain` 在页分配器初始化之后调用它，`guards` 是内核栈下面的保护页（`kstack.guardPages()`，按地址排好序，[process.md](process.md#进程表)）。所有内核映射都是**恒等映射**（虚拟地址 = 物理地址），不带 U 位，带 G 位：
 
 | 范围 | 来自 | 权限 | Debug 模式实测 | 页大小 |
 | --- | --- | --- | --- | --- |
-| `[__text_start, __rodata_start)` | 代码 | R-X | `0x80200000..0x8026e000` | 4 KiB |
-| `[__rodata_start, __data_start)` | 只读数据（含 `.eh_frame`、嵌入的 init 的 ELF） | R-- | `0x8026e000..0x802ac000` | 4 KiB |
-| `[__data_start, __kernel_end)` | `.data`、`.bss`、每个 hart 的启动栈、进程内核栈 | RW- | `0x802ac000..0x80359000` | 4 KiB |
-| `[__kernel_end, 内存末尾)` | 页分配器管理的内存、设备树 | RW- | `0x80359000..0x88000000` | 到 `0x80400000` 为止用 4 KiB，之后 62 个 2 MiB |
+| `[__text_start, __rodata_start)` | 代码 | R-X | `0x80200000..0x8027d000` | 4 KiB |
+| `[__rodata_start, __data_start)` | 只读数据（含 `.eh_frame`、嵌入的 init 的 ELF） | R-- | `0x8027d000..0x802bf000` | 4 KiB |
+| `[__data_start, __kernel_end)` 去掉 80 个保护页 | `.data`、`.bss`、每个 hart 的启动栈和陷阱栈、进程内核栈 | RW- | `0x802bf000..0x804d0000` | 4 KiB |
+| `[__kernel_end, 内存末尾)` | 页分配器管理的内存、设备树 | RW- | `0x804d0000..0x88000000` | 到 `0x80600000` 为止用 4 KiB，之后 61 个 2 MiB |
 | 串口 | `uart.base`、`uart.mmio_size` 向上取整到页 | RW- | `0x10000000..0x10001000` | 4 KiB |
 | PLIC | `plic.base`、`plic.mmio_size` | RW- | `0x0c000000..0x0c600000` | 3 个 2 MiB |
 | virtio-mmio | `virtio_disk.mmio_base`、`virtio_disk.mmio_size`（8 个槽位） | RW- | `0x10001000..0x10009000` | 4 KiB |
 
-整张内核页表一共 5 页：
+整张内核页表一共 6 页（Debug 模式；内核镜像小一些的模式下，`__kernel_end` 没过 `0x8040_0000` 的话少一张第 0 级页表）：
 
 ```
 根页表
@@ -132,11 +133,14 @@ pub fn init(memory: dtb.Region) MapError!void
 │        ├─ [0x60..0x62]  PLIC 的 3 个 2 MiB 叶子
 │        └─ [0x80] → 第 0 级页表（串口 1 项、virtio-mmio 8 项）
 └─ [2] → 第 1 级页表 B
-         ├─ [1] → 第 0 级页表（0x8020_0000..0x8040_0000：内核镜像按段的 4 KiB 叶子 + 之后的空闲内存）
-         └─ [2..63]  0x8040_0000..0x8800_0000 的 62 个 2 MiB 叶子
+         ├─ [1] → 第 0 级页表（0x8020_0000..0x8040_0000：内核镜像按段的 4 KiB 叶子，保护页的项是空的）
+         ├─ [2] → 第 0 级页表（0x8040_0000..0x8060_0000：内核镜像的剩下部分 + 之后的空闲内存）
+         └─ [3..63]  0x8060_0000..0x8800_0000 的 61 个 2 MiB 叶子
 ```
 
-`mem` 命令在启动后显示的空闲页比启动日志里少 5，就是这 5 页。
+临时在 `vm.init` 前后打印空闲页数实测过：少了 6 页，就是这 6 页。
+
+**保护页**：`[__data_start, __kernel_end)` 用 `mapExcept` 映射，跳过 `guards` 里的页：洞之间的每一段照常调用 `map`（能用大页就用大页）。保护页本身是 `.bss` 里的物理内存，只是没有映射，内核不再访问它们（`_start` 清零 `.bss` 时还没开分页，清的是物理地址）。内核栈往下溢出碰到它就缺页（[trap.md](trap.md#内核栈溢出)）。80 页 = 8 个 hart 的启动栈 + 8 个 hart 的陷阱栈 + 64 块进程内核栈，各一页。以前这里没有洞，整段可以用一张第 0 级页表、少量的叶子映射；挖洞之后第 0 级页表多了一张（因为内核镜像变大了，过了 `0x8040_0000`），叶子还是 4 KiB 的，数量不变。
 
 几点说明：
 
@@ -144,6 +148,7 @@ pub fn init(memory: dtb.Region) MapError!void
 - **按段设权限**带来的保护：往代码或只读数据里写会触发写缺页（`store_page_fault`），跳到数据或空闲内存里执行会触发取指缺页。这要求各段按页对齐，见 [boot.md](boot.md#链接脚本)。开发时用一段临时代码验证过：往 `kmain` 所在的代码页写一个字，得到 `store_page_fault`。
 - **不映射的地方**：内核之前的 `0x8000_0000..0x8020_0000`（其中 `0x8000_0000..0x8006_0000` 是 OpenSBI，PMP 本来就不让 S 模式访问；后面是空着的，内核用不到）；地址 0 附近（空指针解引用变成 `load_page_fault`）；设备树里的其他外设（RTC、PCIe 等，内核不用）。
 - 开始映射前检查内核镜像是否完全在设备树报告的内存范围里，不在就 panic（`kernel image is outside of RAM`）。
+- 单元测试 `mapExcept 跳过保护页，两边照常映射` 检查了洞里的页没有映射、别的页都恒等映射。启动时 `kmain` 还做一次自检（`trap.probeGuard`）：把 `sp` 挪到启动栈的保护页上沿再往栈上写，必须缺页、并且在陷阱栈上处理完回来（[boot.md](boot.md#kmain-的初始化顺序)）。
 - **所有 hart 共用这一份内核页表**：启动 hart 在 `vm.init` 里建好、打开分页，其他 hart 启动时调用 `vm.initHart()`，只做 `activate(kernel_root)`（[boot.md](boot.md#启动其他-hart)）。内核页表启动后不再改，所以不用担心别的 hart 的 TLB 里留着旧的内核映射。
 
 ## 切换地址空间
@@ -160,7 +165,7 @@ pub fn activate(root: *PageTable) void {
 - 规范规定写 `satp` 本身不保证之前对页表的修改已经生效，也不会作废 TLB。所以写之前和之后各执行一次 `sfence.vma`：之前的那次保证页表的写入对页表遍历可见，之后的那次作废旧地址空间留在 TLB 里的翻译。
 - 没有使用 ASID，所有地址空间都是 ASID 0，所以每次切换都要作废整个 TLB。内核映射带 G 位，规范允许实现保留它们，但不带参数的 `sfence.vma` 会连全局项一起作废，这里也没有依赖这个优化。
 - `satp` 和 TLB 都是每个 hart 自己的，`activate` 和 `sfence.vma` 只影响当前 hart。
-- `vm.init` 最后调用 `activate(kernel_root)` 打开分页；`proc.scheduler` 每次切到用户进程前切到它的地址空间，进程让出 CPU 后切回 `kernel_root`（父进程可能在别的 hart 上回收它的页表，之前这个 hart 必须先切走，见 [process.md](process.md#调度器)）；`proc.exec` 换地址空间时先切到新的，再释放旧的。一个用户地址空间同一时刻只在一个 hart 上使用，所以改用户页表（`sbrk` 缩小、`fork` 把父进程的页改成写时复制、`breakCow`）后只刷当前 hart 的 TLB 就够了（[process.md](process.md#锁)）。写时复制让几个地址空间共用同一个物理页，但页表项是各自的：一个进程复制走自己那一份，只改它自己的页表项，别的进程的 TLB 里留着的还是它们自己的、仍然正确的翻译。
+- `vm.init` 最后调用 `activate(kernel_root)` 打开分页；`proc.scheduler` 每次切到用户进程前切到它的地址空间，进程让出 CPU 后切回 `kernel_root`（父进程可能在别的 hart 上回收它的页表，之前这个 hart 必须先切走，见 [process.md](process.md#调度器)）；`proc.exec` 换地址空间时先切到新的，再释放旧的。一个用户地址空间同一时刻只在一个 hart 上使用，所以改用户页表（`sbrk` 缩小、`fork` 把父进程的页改成写时复制、`breakCow`、按需分页映射上新的页）后只刷当前 hart 的 TLB 就够了（[process.md](process.md#锁)）。写时复制让几个地址空间共用同一个物理页，但页表项是各自的：一个进程复制走自己那一份，只改它自己的页表项，别的进程的 TLB 里留着的还是它们自己的、仍然正确的翻译。
 
 ## 用户地址空间
 
@@ -179,56 +184,117 @@ pub const user_end: usize = 0x8000_0000;
 
 QEMU `virt` 上 `0x4000_0000..0x8000_0000` 其实是 PCIe 的 32 位 MMIO 窗口（设备树 `pci@30000000` 的 `ranges`），但内核不用 PCIe，从不映射它，所以没有冲突。
 
-### 函数
+### 地址空间：Space
 
 ```zig
-pub fn createUserSpace() error{OutOfMemory}!*PageTable
+pub const Space = struct {
+    root: *PageTable,
+    segments: [max_segments]Segment = undefined,   // 程序的各个段（最多 8 个）
+    nsegments: usize = 0,
+    backing: Backing = .none,                      // 段的内容从哪读
+    heap_start: usize = 0,                         // 堆：[heap_start, brk)
+    brk: usize = 0,
+};
+pub const Segment = struct { start: usize, end: usize, perm: Perm, file_off: u64, file_size: u64 };
+pub const Backing = union(enum) { none, bytes: []const u8, file: u64 };
+
+pub const stack_max = 1 << 20;                     // 用户栈最多 1 MiB
+pub const stack_top = user_end;                    // 0x8000_0000
+pub const stack_limit = stack_top - stack_max;     // 0x7ff0_0000：栈最低能长到这里
+pub const heap_limit = stack_limit - page.size;    // 0x7fef_f000：堆最多长到这里，中间一页是保护页
 ```
 
-分配一页作为根页表，内容复制 `kernel_root.*`。
+一个进程的用户地址空间（`Process.space`）：根页表，加上按需分页要知道的“哪些地址可以有页、页从哪来”。页表里只有已经访问过的页；用户区里别的地址按顺序看是不是落在这些区域里（`Space.regionOf`）：
+
+| 区域 | 权限 | 一页的内容 |
+| --- | --- | --- |
+| `segments` 里的每个段 `[start, end)` | 段的权限（ELF 的 `p_flags`） | 开头最多 4096 字节来自 `backing` 的 `file_off + 页在段里的偏移`，到 `file_size` 为止；其余是 0（`.bss`） |
+| 堆 `[heap_start, alignForward(brk))` | `RW-` | 全是 0 |
+| 栈 `[stack_limit, stack_top)` | `RW-` | 全是 0 |
+
+都不是的地址（包括 `[heap_limit, stack_limit)` 这一页保护页、堆末尾之后）不该有页。段由 ELF 加载器记下（`addSegment`：按页对齐、不重叠、最多 8 个，[process.md](process.md#elf-加载器)），堆由 `sbrk` 挪，栈的范围是固定的。`backing` 是 `.bytes`（嵌在内核里的 init，单元测试）或者 `.file`（程序文件的 inode，`exec`）。
 
 ```zig
+pub fn createUserSpace() error{OutOfMemory}!Space
+pub fn destroyUserSpace(s: *Space) void
+pub fn releaseBacking(s: *Space) void
 pub fn allocUserPage(root: *PageTable, va: usize, perm: Perm) MapError!*align(page.size) page.Page
 ```
 
-分配一页清零的物理内存，以 `perm` + U 位映射到用户地址 `va`，返回这一页的指针（内核通过恒等映射直接往里写，比如复制 ELF 的内容）。映射失败时把刚分配的页还回去（`errdefer`）。用户映射**只用 4 KiB 的页**，每一页单独分配，所以物理上不连续也没关系。
+- `createUserSpace`：分配一页作为根页表，内容复制 `kernel_root.*`（用 `@memcpy`：`root.* = kernel_root.*` 在 Debug 模式下会先在栈上复制一份 4 KiB），段、堆都是空的。
+- `destroyUserSpace`：释放用户区（根页表第 1 项）下面的所有东西：`freeTree` 递归地释放每个有效的叶子指向的物理页、每一张中间级页表，最后释放根页表本身；再 `releaseBacking`。叶子指向的页可能还被别的进程共用（写时复制），`page.free` 只是放掉一个引用，最后一个用它的进程释放时它才回到空闲链表（[page-allocator.md](page-allocator.md#引用数)）。**调用前必须已经切换到别的地址空间**，否则正在使用的页表会被释放。`freeTree` 把叶子都当作 4 KiB 的页释放，这依赖于“用户映射只用 4 KiB 的页”。
+- `releaseBacking`：`backing` 是程序文件的话放开对它的占用（`fsys.releaseText`，[fs.md](fs.md#正在运行的程序文件)），改成 `.none`。进程结束时（`proc.finish`）就调用：之后不会再缺页了，不用等父进程回收地址空间。
+- `allocUserPage`：分配一页清零的物理内存，以 `perm` + U 位映射到用户地址 `va`。现在只有单元测试用它直接摆好页；内核自己的用户页都是按需分配的（`fault`）。用户映射**只用 4 KiB 的页**，每一页单独分配，所以物理上不连续也没关系。
+
+## 按需分页
 
 ```zig
-pub fn destroyUserSpace(root: *PageTable) void
+pub const Access = enum { read, write, exec };
+pub const FaultError = error{ BadAddress, OutOfMemory, CowOutOfMemory, IoError, WouldSleep };
+pub fn fault(s: *Space, va: usize, access: Access, may_sleep: bool) FaultError!void
 ```
 
-释放用户区（根页表第 1 项）下面的所有东西：`freeTree` 递归地释放每个有效的叶子指向的物理页、每一张中间级页表，最后释放根页表本身。叶子指向的页可能还被别的进程共用（写时复制），`page.free` 只是放掉一个引用，最后一个用它的进程释放时它才回到空闲链表（[page-allocator.md](page-allocator.md#引用数)）。**调用前必须已经切换到别的地址空间**，否则正在使用的页表会被释放。`freeTree` 把叶子都当作 4 KiB 的页释放，这依赖于“用户映射只用 4 KiB 的页”。
+用户地址 `va` 那一页还没有、或者不允许这样访问时调用。返回之后重新执行那次访问就能成功；返回错误的话，那次访问本来就不该成功，或者没法让它成功：
+
+1. `va` 不在用户区：`BadAddress`。
+2. **已经有这一页**（`leafOf`）：
+   - 页表项的权限够了：什么都不做，直接返回（TLB 里留着旧的无效项时可能这样）。
+   - 要写、是写时复制的页：`breakCow`（[写时复制](#写时复制)），没内存复制是 `CowOutOfMemory`。
+   - 别的（写只读的页、执行不可执行的页）：`BadAddress`。
+3. **没有这一页**：`regionOf` 找它在哪个区域，不在任何区域里、或者区域的权限不允许这次访问（写代码段、执行数据段、执行堆和栈）是 `BadAddress`，什么都不分配。
+4. 这一页有来自程序文件的内容、而 `may_sleep` 是 false：`WouldSleep`，什么都不改（读盘要睡着等，见下面）。
+5. `page.alloc()` 一页清零的页（没有是 `OutOfMemory`），把文件里的那部分读进来（`Backing.read`：`.bytes` 直接复制，`.file` 是 `fsys.readText`，读不出来是 `IoError`），按区域的权限加 U 位映射上（要新的页表、没有内存时把这一页还回去，`OutOfMemory`），最后刷新这一页的 TLB。读盘时进程睡着，但只有它自己会改自己的地址空间，醒来时这一页还是没有，`map` 不会 `AlreadyMapped`。
+
+**谁调用它**：
+
+- **用户程序访问**：陷阱处理程序收到 U 模式的 `load_page_fault`、`store_page_fault`、`instruction_page_fault` 时调用（`may_sleep = true`，这时什么锁都没拿），失败时结束进程，原因按错误不同（[trap.md](trap.md#分发)）。
+- **内核替用户程序访问**：`copyFromUser`、`copyToUser`、`checkUser` 翻译不了一页时调用（[内核访问用户内存](#内核访问用户内存)）。
+
+**为什么这样记区域**：和 xv6 的 lazy allocation 实验一样，只是多了从文件读的段。Linux 用 VMA（`vm_area_struct`）记同样的东西，每个区域有自己的缺页处理；这里只有三种区域，用一个固定大小的结构体就够了，`fork` 时整个复制（`cloneUserSpace`）。
+
+单元测试（`vm.zig` 末尾，用一段 6000 字节的“程序镜像”和两个段）检查了：一开始只有根页表；读代码段的第 2 页只分配这一页和它的页表，文件之外的部分是 0；数据段开头来自镜像、后面是 0、可写，`.bss` 的页整页是 0；写代码段、执行数据段返回 `BadAddress` 并且不分配；同一页缺两次只分配一次；堆的 `brk` 所在页整页能用、下一页不行；栈的两端能用、保护页不行；段不能重叠、最多 8 个；`backing` 是文件、不能睡时返回 `WouldSleep` 不分配，清零的页照常分配；释放后不漏页。
+
+### 内核访问用户内存
 
 ```zig
 fn translateUser(root: *PageTable, va: usize, write: bool) ?usize
-pub fn copyFromUser(root: *PageTable, dst: []u8, src: usize) error{BadAddress}!void
-pub fn copyToUser(root: *PageTable, dst: usize, src: []const u8) error{BadAddress}!void
-pub fn checkUser(root: *PageTable, va: usize, len: usize, write: bool) error{BadAddress}!void
+fn userPage(s: *Space, va: usize, write: bool) ?usize
+pub fn copyFromUser(s: *Space, dst: []u8, src: usize) error{BadAddress}!void
+pub fn copyToUser(s: *Space, dst: usize, src: []const u8) error{BadAddress}!void
+pub fn checkUser(s: *Space, va: usize, len: usize, write: bool) error{BadAddress}!void
+pub fn prefault(s: *Space, va: usize, len: usize) void
 ```
 
-`translateUser` 用软件走一遍页表，把用户虚拟地址翻译成物理地址；要求地址在用户区里，叶子有效、带 U 位、可读（`write` 为 true 时还要可写），否则返回 null。`copyFromUser` / `copyToUser` 在此基础上逐页翻译、逐页复制，是系统调用读写用户内存的唯一途径；`checkUser` 只检查整个范围、不复制。写的时候（`copyToUser`、`write` 为 true 的 `checkUser`）遇到写时复制的页，先 `breakCow` 复制一份再写，和用户程序自己写它一样。详见 [syscalls.md](syscalls.md#访问用户内存)。
+`translateUser` 用软件走一遍页表，把用户虚拟地址翻译成物理地址；要求地址在用户区里，叶子有效、带 U 位、可读（`write` 为 true 时还要可写），否则返回 null。`userPage` 翻译不了时先按缺页处理（`fault`：按需分配、写时复制的页复制一份）再翻译一次，处理不了就是 null。`copyFromUser` / `copyToUser` 在此基础上逐页翻译、逐页复制，是系统调用读写用户内存的唯一途径；`checkUser` 只检查整个范围、不复制，顺便把范围里的页都分配好、写时复制的页都复制好，所以检查通过之后拿着锁再复制这个范围一定成功。详见 [syscalls.md](syscalls.md#访问用户内存)。
+
+**拿着锁的时候读不了盘**：内核有不少地方是拿着锁复制用户内存的：写管道拿着管道的锁、写串口拿着输出锁（自旋锁），写文件拿着文件系统的写锁（睡眠锁，而且 `fs.write` 从用户内存取数据时还拿着缓冲区的睡眠锁），`readdir` 拿着读写位置的锁，`wait` 拿着进程的锁写结束状态。这时碰到还没有的页：
+
+- 堆、栈、`.bss` 的页（清零的页）：就地分配，只拿页分配器的锁（叶子锁），可以。
+- 段里来自程序文件的页：要读盘、睡着等，拿着自旋锁不能睡；拿着缓冲区的睡眠锁再去拿别的缓冲区，可能和别的进程互相等。所以 `canSleep()`（没拿着自旋锁、也没拿着睡眠锁）为 false 时，`userPage` 传 `may_sleep = false`，`fault` 返回 `WouldSleep`，复制失败（`BadAddress`）。拿着文件系统的快照（读者）不算：再拿一个快照不用等谁，`readlink`、`fstat` 这些可以直接按需读。
+
+这些系统调用在拿锁之前先调用 `prefault(space, 地址, 长度)`：把范围里**来自程序文件、还没读进来**的页都读好（只看段里有文件内容的页，`len` 再大也只走几页；尽力而为，读不了的页就停下，之后复制到那里时照常失败）。现在调用它的有 `write`（所有种类的 fd）、`readdir`、`wait`；`read`、`pipe` 等本来就先 `checkUser` 检查整个目标范围（同时也就分配好了）。拿着锁的复制碰到清零的页还会就地分配，所以加锁顺序里多了“`Pipe.lock`、`uart.tx_lock`、`uart.rx_lock` → 页分配器的锁”（[process.md](process.md#锁)）。
+
+单元测试检查了 `copyFromUser` 只读得到 U 模式可读的用户页（不可读的、没映射也不在区域里的、内核的、地址溢出的都是 `BadAddress`），`copyToUser` 只写得进可写的页，`checkUser` 检查整个范围。`t_demand` 在 QEMU 里检查了 `write` 管道、串口、文件的来源是没读进来的只读数据，`read`、`fstat`、`readdir`、`wait` 写进没读进来的数据页，都成功（[testing.md](testing.md#回归测试程序)）。
 
 ### 堆的增长和缩小
 
 ```zig
-pub fn growUser(root: *PageTable, old_end: usize, new_end: usize, perm: Perm) error{OutOfMemory}!void
 pub fn shrinkUser(root: *PageTable, old_end: usize, new_end: usize) void
 fn leafOf(root: *PageTable, va: usize) ?*Pte
 ```
 
-`sbrk` 用它们调整堆（[process.md](process.md#sbrk堆)）。`old_end`、`new_end` 按字节算，映射按页：一段内存 `[起点, end)` 占的页是到 `alignForward(end, 4096)` 为止。
+堆按需分配：`sbrk` 变大时只挪 `brk`，新的页第一次被访问时 `fault` 才分配（[process.md](process.md#sbrk堆)）；变小时用 `shrinkUser` 释放。`old_end`、`new_end` 按字节算，页按页：一段内存 `[起点, end)` 占的页是到 `alignForward(end, 4096)` 为止。
 
-- `growUser`：把 `[alignForward(old_end), alignForward(new_end))` 的每一页 `allocUserPage`。中途内存不够时，`errdefer` 调用 `shrinkUser` 把这次映射上的页都释放掉，地址空间保持原样。调用方保证 `old_end` 之后没有映射，所以 `AlreadyMapped` 写成 `unreachable`。
-- `shrinkUser`：把 `[alignForward(new_end), alignForward(old_end))` 的每一页找到页表项（`leafOf`，只查不分配）、还给页分配器、清掉页表项。然后检查这段范围涉及的每个 2 MiB 区域，**第 0 级页表整张都空了就也释放**，清掉指向它的第 1 级页表项。不这样做的话，堆长到 100 多 MiB 再缩回来，每 2 MiB 留下一张空页表，`t_sbrk` 里实测留下了 62 页。第 1 级页表整个用户区只有一张，栈总在里面，不会空，不用管。
+- `shrinkUser`：把 `[alignForward(new_end), alignForward(old_end))` 里已经分配了的页找到页表项（`leafOf`，只查不分配；没访问过的页本来就没有，跳过）、还给页分配器、清掉页表项。然后检查这段范围涉及的每个 2 MiB 区域，**第 0 级页表整张都空了就也释放**，清掉指向它的第 1 级页表项。不这样做的话，堆长到 100 多 MiB 再缩回来，每 2 MiB 留下一张空页表（以前一次分配好整个堆时，`t_sbrk` 里实测留下了 62 页）。第 1 级页表整个用户区只有一张，留着：它多半还有栈的映射，空了也只是一页，地址空间释放时一起释放。
 - 改的是正在用的页表，调用方（`proc.sbrk`）要 `sfence.vma`。
 - 缩小时释放的页可能和子进程共用（`fork` 之后还没写过的堆页），`page.free` 只放掉自己的引用。
 
-单元测试检查：长 1 字节也映射一整页、再长到页中间不用新的页；跨页；缩到页中间时这一页还在；跨过 2 MiB 边界再缩回来，页和页表都还回去；内存不够时一页不留。
+单元测试检查：`brk` 挪到 4 MiB 之后只碰三页，只分配这三页和它们的第 0 级页表；缩回去时碰过的页和空出来的页表都释放，没碰过的跳过；再长回来，重新分配的页是清零的；内存不够时缺页失败、一页都不留（页分配到了、页表分配不到时，这一页也还回去）。
 
 ### 复制用户地址空间
 
 ```zig
-pub fn cloneUserSpace(src: *PageTable) error{OutOfMemory}!*PageTable
+pub fn cloneUserSpace(src: *Space) error{OutOfMemory}!Space
 fn cloneTree(dst: *PageTable, pte: *Pte, level: u2, va: usize) error{OutOfMemory}!void
 ```
 
@@ -240,15 +306,18 @@ fn cloneTree(dst: *PageTable, pte: *Pte, level: u2, va: usize) error{OutOfMemory
    - `page.share` 给这个物理页加一个引用；
    - 把（改过的）叶子原样抄进 `dst`：同一个物理页、同样的权限。
 3. 中途内存不够时，`errdefer destroyUserSpace(dst)` 把 `dst` 整个释放掉（已经抄过去的叶子各放掉一个引用，正好抵消 `share`）。
-4. 最后刷新当前 hart 的 TLB（成功、失败都刷）：`src` 是正在用的地址空间，它的可写页刚变成只读。
+4. 段、堆、`backing` 照抄；`backing` 是程序文件的话多占一份（`fsys.dupText`）。
+5. 最后刷新当前 hart 的 TLB（成功、失败都刷）：`src` 是正在用的地址空间，它的可写页刚变成只读。
+
+`src` 里还没有的页（按需分页，还没访问过），`dst` 里也没有：以后谁访问谁自己分配，段里的页从同一个程序文件读，所以内容和 `src` 的一样（文件在这期间不会变，[fs.md](fs.md#正在运行的程序文件)）。
 
 之后父子进程读到的都是同一批物理页。谁先写一个 `cow` 页，谁就触发写缺页（W 是 0），由 `breakCow` 给它复制一份；本来就只读的页（代码、只读数据）不标 `cow`，一直共用，写它照常是用户程序的错。
 
-- 要新分配的只有子进程的页表：一个用户程序通常是根页表 + 第 1 级一张 + 第 0 级两张（段和堆一张、栈一张）= 4 页。`t_cow` 实测：带着 64 页堆的进程 `fork` 之后，子进程刚开始运行时整个系统只多用了 5 页（4 张页表，加上父子两边已经写过的 1 页栈）；改成写时复制之前是 78 页。
+- 要新分配的只有子进程的页表：一个用户程序通常是根页表 + 第 1 级一张 + 第 0 级两张（段和堆一张、栈一张）= 4 页。`t_cow` 实测：带着 64 页堆的进程 `fork` 之后，子进程刚开始运行时整个系统只多用了 6 页（4 张页表，加上父子两边已经写过的栈页）；改成写时复制之前是 78 页。
 - `fork` 之后马上 `exec`（shell 运行程序就是这样）的话，子进程的旧地址空间里一页都没复制过，`exec` 换掉它时只是放掉引用。
 - 先建好 `dst` 的页表、再改 `src`：`walk` 失败时这个叶子还没动过。`walk` 返回 `AlreadyMapped` 不可能发生（`dst` 是新的，按 `src` 的结构一页一页地映射），写成 `unreachable`。
 - 失败时 `src` 里已经改成 `cow` 的页不改回去：以后写的时候 `breakCow` 发现只剩自己在用，直接改回可写，不用复制，也不用内存。
-- 断言叶子都在第 0 级：用户映射只用 4 KiB 的页（`allocUserPage`），所以不会遇到大页。
+- 断言叶子都在第 0 级：用户映射只用 4 KiB 的页，所以不会遇到大页。
 
 ### 写时复制
 
@@ -265,17 +334,16 @@ pub fn breakCow(root: *PageTable, va: usize) CowError!void
 
 谁调用它：
 
-- 用户程序写 `cow` 页触发 `store_page_fault`，陷阱处理程序调用它，成功就回到原来那条写指令重新执行；内存不够时结束这个进程（`out of memory (copy-on-write)`）；`NotCow` 的写缺页照常是用户程序的错（[trap.md](trap.md#分发)）。
-- 内核往用户内存里写：`copyToUser`、`write` 为 true 的 `checkUser` 遇到 `cow` 页先调用它。内存不够时返回 `BadAddress`，系统调用返回 `-EFAULT`（Linux 的 `copy_to_user` 在这种情况下也是返回 `-EFAULT`）。
+- `fault` 发现要写的是已经有的 `cow` 页时调用它：用户程序写 `cow` 页触发 `store_page_fault`，成功就回到原来那条写指令重新执行，内存不够时结束这个进程（`out of memory (copy-on-write)`，[trap.md](trap.md#分发)）；内核往用户内存里写（`copyToUser`、`write` 为 true 的 `checkUser`）也经过 `fault`，内存不够时返回 `BadAddress`，系统调用返回 `-EFAULT`（Linux 的 `copy_to_user` 在这种情况下也是返回 `-EFAULT`）。
 
 几点说明：
 
 - **“只剩自己在用”看到了就不会再变**：只有映射着这一页的进程自己 `fork` 才会给它加引用，而这个进程正在这里处理缺页。所以“看到引用数是 1 → 直接改回可写”不需要一直拿着页分配器的锁。
 - **两个进程同时在不同的 hart 上复制同一页**：两边都看到引用数是 2，各自分配、复制，然后各放掉一个引用，旧页减到 0 被释放。每一边都是先复制、再放掉引用，所以复制的时候旧页一定还在；放掉之后谁也不再映射它。结果正确，只是多复制了一次。
 - 用户栈和全局变量在 `fork` 之后也是共用的：父子进程从系统调用一返回就会写栈，各自复制一两页。
-- `vm.zig` 只有这里和 `cloneUserSpace` 执行 `sfence.vma`（`flushTlb`），单元测试在主机上运行时跳过；其他函数都不执行特权指令。
+- `vm.zig` 只有这里、`fault` 和 `cloneUserSpace` 执行 `sfence.vma`（`flushTlb`），单元测试在主机上运行时跳过；其他函数都不执行特权指令。
 
-单元测试（`vm.zig` 末尾）检查：`fork` 只分配了 4 张页表；两边的可写页都变成 `cow`，代码页不是；子进程先写时复制一份，父进程的不变；父进程再写时这一页只剩它在用，不复制、还是原来那一页；代码页、没映射的页、已经复制过的页 `breakCow` 返回 `NotCow`；`checkUser` 检查可写时把 `cow` 页复制好；三方共用之后依次释放不漏页；`cloneUserSpace` 内存不够时不漏页；没有内存复制时 `breakCow` 返回 `OutOfMemory`、`copyToUser`/`checkUser` 返回 `BadAddress`，两边的页表项都不变。
+单元测试（`vm.zig` 末尾）检查：`fork` 只分配了 4 张页表；两边的可写页都变成 `cow`，代码页不是；子进程先写时复制一份，父进程的不变；父进程再写时这一页只剩它在用，不复制、还是原来那一页；代码页、没映射的页、已经复制过的页 `breakCow` 返回 `NotCow`；`checkUser` 检查可写时把 `cow` 页复制好；三方共用之后依次释放不漏页；`cloneUserSpace` 内存不够时不漏页；没有内存复制时 `breakCow` 返回 `OutOfMemory`、`fault` 返回 `CowOutOfMemory`、`copyToUser`/`checkUser` 返回 `BadAddress`，两边的页表项都不变；`fork` 之后两边都没访问过的页各自按需分配，内容都来自程序镜像。
 
 ## 调试技巧
 

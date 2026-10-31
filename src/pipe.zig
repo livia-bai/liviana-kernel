@@ -59,7 +59,7 @@ pub fn close(p: *Pipe, writable: bool) void {
 /// 把用户地址空间 space 里 [ptr, ptr+len) 的字节写进管道，写满了就等。返回写进去的字节数：
 /// 正常情况下是 len；中途读端关了、遇到坏地址、被 kill 了，返回已经写进去的字节数
 /// （一个字节都没写进去时返回对应的错误，被 kill 时返回 0）。
-pub fn write(p: *Pipe, space: *vm.PageTable, ptr: usize, len: usize) Error!usize {
+pub fn write(p: *Pipe, space: *vm.Space, ptr: usize, len: usize) Error!usize {
     p.lock.acquire();
     defer p.lock.release();
     var done: usize = 0;
@@ -88,7 +88,7 @@ pub fn write(p: *Pipe, space: *vm.PageTable, ptr: usize, len: usize) Error!usize
 
 /// 从管道读最多 len 个字节到用户地址空间 space 的 ptr。缓冲区空着、写端还开着时等；
 /// 有多少读多少，不等凑满 len。返回 0 表示读到结尾（或者被 kill 了）。
-pub fn read(p: *Pipe, space: *vm.PageTable, ptr: usize, len: usize) Error!usize {
+pub fn read(p: *Pipe, space: *vm.Space, ptr: usize, len: usize) Error!usize {
     p.lock.acquire();
     defer p.lock.release();
     while (p.nread == p.nwrite and p.write_open) {
@@ -117,8 +117,9 @@ test "管道：环形缓冲区回绕、读到结尾、读端关了写返回 Brok
     const base = @intFromPtr(&test_memory);
     page.init(base, base + test_memory.len, &.{});
     vm.kernel_root = @ptrCast(try page.alloc());
-    const space = try vm.createUserSpace();
-    const buf = try vm.allocUserPage(space, vm.user_base, .{ .r = true, .w = true });
+    var user = try vm.createUserSpace();
+    const space = &user;
+    const buf = try vm.allocUserPage(space.root, vm.user_base, .{ .r = true, .w = true });
     const before = page.freePages();
 
     const p = try create();

@@ -2,6 +2,16 @@
 
 每次改了内核（`src/`、`user/`、`build.zig`、链接脚本），在最上面加几行：新增了什么功能，修了什么 bug。最新的在前面。
 
+## 2026-10-31 按需分页；内核栈的保护页；写脚本用的程序
+
+- 新增：按需分页。用户地址空间（`vm.Space`）记着程序的各个段、堆、栈从哪到哪，页表里只有访问过的页：`exec` 只读 ELF 的文件头和程序头，段里的页第一次被访问时才分配、从程序文件读进来（init 从内核里嵌着的字节读）；`.bss`、堆、栈的页用到才分配清零的页。U 模式的读、写、取指缺页都交给 `vm.fault`（写时复制也在这里）；内核替用户程序读写用户内存（`copyFromUser` 这些）时也按需分配。没内存时进程被结束（`out of memory (demand paging)`），读不出程序文件是 `cannot read the program file (demand paging)`。
+- 新增：正在运行的程序文件不能改、不能删（新错误码 `ETXTBSY`，26）：`write`、截断、删掉最后一个名字、被 `rename` 换掉都是 `TextBusy`；正在被改的文件不能 `exec`。`exec` 占住程序文件（`fsys.holdText`），进程结束时放开。
+- 改动：`sbrk` 变大时只挪 `brk`，不分配页；比空闲内存大的堆也能长成功，比整个物理内存还大才是 `ENOMEM`。`vm.growUser` 去掉了。
+- 改动：用户栈从固定 16 KiB 改成按需长，最多 1 MiB（`0x7ff0_0000..0x8000_0000`），下面的保护页挪到 `0x7feff000`。`exec` 时入口地址不在可执行的段里是 `ENOEXEC`。
+- 新增：内核栈的保护页（`src/kstack.zig`）。进程内核栈、启动栈下面各一页不映射，栈溢出时缺页、panic，报出是哪块栈（`kernel stack overflow: pid N (name) hit its guard page at ...`），不再悄悄踩坏相邻进程的 `TrapFrame`。每个 hart 新增一块 16 KiB 的陷阱栈：S 模式的陷阱（调度器开中断时的中断、内核的异常）都在它上面处理，`sscratch` 在内核里改成这个 hart 的陷阱栈顶（原来是 0），`TrapFrame` 的填充字段换成 `kernel_sscratch`。启动时自检一次（`[ok] stack overflow check: ...`）。
+- 新增：写脚本用的用户程序 `test`、`expr`、`seq`、`sleep`、`head`、`tail`、`grep`、`cp`、`touch`、`tee`、`xargs`；`sys.zig` 新增按行读的 `LineReader`。`echo` 整行一次写出，不再和别的进程的输出交错在一行中间。
+- 新增：回归测试 `t_demand`，QEMU 测试用例 `demand`、`tools`；`t_sbrk`、`t_cow` 按按需分配改了；单元测试加上按需分页、保护页。`qemu_test.py` 比较前后的空闲页数时，两次都在新启动的 shell 里看（按需分页之后一直运行的 shell 会越用越大）。
+
 ## 2026-10-31 符号链接；shell 的命令语言、行编辑和脚本
 
 - 新增：符号链接。inode 种类 `symlink`，目标（最长 256 字节）内联在第 0 页的内容条目里。解析路径时遇到它就换成“目标 + 剩下的路径”接着走（相对的目标从链接所在的目录开始，不递归，最多 10 次，再多是新错误码 `ELOOP`）；`unlink`、`rename`、`link` 对的是链接自己；`open` 带 `O_CREATE` 穿过悬空的链接时建出目标。`check`/`scrub` 核对每个符号链接正好有一个内联的目标，统计里多了符号链接数。磁盘格式换成 `LBFS0003`。

@@ -90,6 +90,10 @@ const user_programs = [_]UserProgram{
     .{ .name = "echo" },  .{ .name = "cat" },   .{ .name = "wc" },
     .{ .name = "ls" },    .{ .name = "mkdir" }, .{ .name = "rm" },
     .{ .name = "scrub" }, .{ .name = "mv" },    .{ .name = "ln" },
+    .{ .name = "test" },  .{ .name = "expr" },  .{ .name = "seq" },
+    .{ .name = "sleep" }, .{ .name = "head" },  .{ .name = "tail" },
+    .{ .name = "grep" },  .{ .name = "cp" },    .{ .name = "touch" },
+    .{ .name = "tee" },   .{ .name = "xargs" },
 };
 const test_programs = [_]UserProgram{
     .{ .name = "t_sys", .dir = "user/tests" },

@@ -117,6 +117,15 @@ pub fn reader() error{NoDevice}!Reader     // 读：拿一个已提交的树的�
 pub fn writer() error{NoDevice}!*Fs        // 改：拿着 write_lock 返回文件系统
 pub fn unlock() void                       // 放开 write_lock
 pub fn errno(err: anyerror) abi.Errno      // 文件系统的错误 → 系统调用的错误码
+
+// 正在运行的程序文件（按需分页从它读页），见下面
+pub fn holdText(ino: u64) error{TextBusy}!void
+pub fn dupText(ino: u64) void
+pub fn releaseText(ino: u64) void
+pub fn beginModify(ino: u64) error{TextBusy}!void    // 拿着 write_lock，改 ino 之前
+pub fn endModify() void
+pub fn beginRemove(w: *Fs, cwd: u64, path: []const u8) error{TextBusy}!bool
+pub fn readText(ino: u64, off: u64, dst: []u8) error{IoError}!void
 ```
 
 **挂载**：第一个进程（init）第一次回到 U 模式之前，在 `forkretC` 里调用 `fsys.init()`（xv6 的 `forkret` 里调用 `fsinit` 也是这个原因）：挂载要读盘，读盘要睡着等中断，只有进程能做，`kmain` 不行。之后创建的进程都在这之后运行。成功时打印
@@ -129,7 +138,7 @@ pub fn errno(err: anyerror) abi.Errno      // 文件系统的错误 → 系统�
 
 **读者不拿锁，在快照上读；修改的一方拿写锁，一个一个来。** 写时复制的 B 树天然有快照：已提交的树的块从来不改，修改只写别的块，最后写超级块“一下子换成新的树”。所以读的一方只要记下最近一次提交的根，就能在那棵树上读，不管修改的一方同时在做什么（[btree.md](btree.md#快照读者)）。
 
-- **读**：`read`、`fstat`、`lstat`、`readdir`、`readlink`、`getcwd`、`lseek`、`chdir`、只打开已有文件的 `open`、`exec` 加载程序。`fsys.reader()` 拿一个快照（`ctree.Volume.beginRead`），返回一个只读的 `Fs`（`view` 设成快照的根，所有查找都在那棵树上做），读完 `r.end()`。几个读者之间、读者和修改的一方之间都不用等（只在同一个缓冲区的睡眠锁上短暂地排队）。读者看到的是开始读时最近一次提交的样子：修改的一方做到一半的东西看不到；一次 `read` 读出的整个内容一定来自同一个版本，不会半新半旧（`t_fsmp` 测这个）。
+- **读**：`read`、`fstat`、`lstat`、`readdir`、`readlink`、`getcwd`、`lseek`、`chdir`、只打开已有文件的 `open`、`exec` 加载程序、按需分页从程序文件读页（`readText`）。`fsys.reader()` 拿一个快照（`ctree.Volume.beginRead`），返回一个只读的 `Fs`（`view` 设成快照的根，所有查找都在那棵树上做），读完 `r.end()`。几个读者之间、读者和修改的一方之间都不用等（只在同一个缓冲区的睡眠锁上短暂地排队）。读者看到的是开始读时最近一次提交的样子：修改的一方做到一半的东西看不到；一次 `read` 读出的整个内容一定来自同一个版本，不会半新半旧（`t_fsmp` 测这个）。
 - **改**：`write`、`mkdir`、`unlink`、`rename`、`link`、`symlink`、`mknod`、建文件或者截断的 `open`、`scrub`。`fsys.writer()` 拿 `write_lock`（睡眠锁），在当前事务的树上做，`fs.run` 提交或作废，`fsys.unlock()`。B 树同一时刻只能有一个事务（一个事务是从根到叶子的整条写时复制路径，改的都是同一个根），所以修改之间还是排队；但它们不再挡着读。xv6 的 inode 各有一把睡眠锁，改不同的文件可以并行；这里要做到这一点得像 btrfs 那样让几个操作加入同一个正在进行的事务、给树的每个节点加锁，复杂得多。
 - **旧树的块不能马上重用**：读者可能还在读旧的那棵树，而提交之后旧树不用的块（`pending`）本来马上就能再分配、被改写。所以有旧树的读者时，这些块先进 `limbo`，旧树的读者都读完了才空出来；修改的一方在空闲块不够时睡着等它们读完（[btree.md](btree.md#快照读者)）。
 - **加锁顺序**：`File.pos_lock` → `write_lock` → 缓冲区的睡眠锁 → `virtio_disk.lock`。`write_lock` 是睡眠锁：拿着它要读写磁盘（睡着等），拿它之前不能拿着自旋锁，回到 U 模式之前放开。**拿着快照时不能去等 `pos_lock`、`write_lock`**：修改的一方可能拿着它们在等旧树的读者读完。系统调用都是先拿 `pos_lock`，再拿快照或写锁。
@@ -159,11 +168,40 @@ pub fn errno(err: anyerror) abi.Errno      // 文件系统的错误 → 系统�
 | `mknod(path, major)` | `mknod`；`major` 是 0 或者超过 `u16` 是 `EINVAL` |
 | `lseek(fd, offset, whence)` | 改 `File.off`，`seek_end` 要先 `stat`（[files.md](files.md#文件表)） |
 | `scrub` | 先作废缓存，再 `check` 整个文件系统（[检查](#检查整个文件系统checkscrub)） |
-| `exec` | 在 `/bin`（或给的路径）里找程序，在同一个快照上把 ELF 直接读进新的用户页（[process.md](process.md#程序从哪来)） |
+| `exec` | 在 `/bin`（或给的路径）里找程序，占住它（`holdText`），在一个新的快照上读 ELF 的文件头和程序头；段的内容等缺页时再读（`readText`，[process.md](process.md#按需分页)） |
 
 路径先复制进内核栈上的缓冲区（最长 `abi.max_path` = 256 字节，长了是 `ENAMETOOLONG`）。错误码：`SymlinkLoop` → `ELOOP`，`NotSymlink` → `EINVAL`，`NotFound` → `ENOENT`，`Exists` → `EEXIST`，`NotDir` → `ENOTDIR`，`IsDir` → `EISDIR`，`NotEmpty` → `ENOTEMPTY`，`NameTooLong` → `ENAMETOOLONG`，`InvalidName` → `EINVAL`，`NoSpace` → `ENOSPC`，`FileTooBig` → `EFBIG`，`BadAddress` → `EFAULT`，`Corrupt` 等磁盘上的东西不对 → `EIO`。
 
 **内核栈**：系统调用在 16 KiB 的进程内核栈上运行，B 树的操作走得很深。开发时内核栈被撑爆过一次（Debug 模式用到 54 KiB）：`std.bit_set` 的 `isSet`、`count` 按值接收整个位图，每调用一次在栈上复制 8 KiB；`x.* = y.*` 复制 4 KiB 的块也会先放在栈上。改成自己写的 `Bitmap`（方法接收指针）和 `@memcpy` 之后，实测跑完全部 QEMU 测试（包括 `t_fs`、掉电后重新启动、从文件系统 `exec`），最深 Debug 11624 字节、safe 7800 字节、small 7384 字节（加了符号链接、`getcwd` 之后重新量的，测法见 [process.md](process.md#进程表)）。路径解析（`walk`）跟着符号链接走时不递归，只在栈上多放一个 256 字节的缓冲区。
+
+## 正在运行的程序文件
+
+按需分页（[process.md](process.md#按需分页)）：进程运行期间才从它的程序文件里读页，每次缺页拿一个新的快照、按 inode 号读那一页（`readText`）。所以程序文件在有地址空间用着它的时候不能变，不然之后读进来的页和 `exec` 时读的文件头、和之前读进来的页就不是同一个版本了。和 Linux 一样，改它的一方得到 `TextBusy`（`-ETXTBSY`）：
+
+| 操作 | 什么时候是 `TextBusy` |
+| --- | --- |
+| `write` | 写的是正在运行的程序文件（`file.inodeWrite`） |
+| 带 `O_TRUNC` 的 `open` | 截断的是正在运行的程序文件（`syscall.openPath`） |
+| `unlink` | 删的是正在运行的程序文件的**最后一个**名字（`nlink == 1`，删了内容就没了） |
+| `rename` | 新名字已经有了、是正在运行的程序文件的最后一个名字（会被换掉）；两个名字是同一个 inode 时 `rename` 什么都不做，不算 |
+| `exec` | 程序文件正在被改（上面某个操作做到一半） |
+
+改名（`rename` 的旧名字）、加硬链接、删掉别的名字都不动内容，照常可以。Linux 允许删掉正在运行的程序（inode 留到最后一个用它的进程结束）；这里的文件系统没有“没有名字、但还有人用着”的 inode，删掉最后一个名字就删掉了内容，所以干脆不让删。
+
+**记账**（`fsys.zig` 末尾）：
+
+```zig
+var text_lock: Spinlock = .init("fs text");                   // 叶子锁
+var texts: [2 * abi.max_procs]struct { ino: u64 = 0, refs: u32 = 0 } = @splat(.{});
+var modifying: u64 = 0;                                       // 修改的一方正在改的 inode
+```
+
+- **占住**：`exec` 找到程序文件之后 `holdText(ino)`，引用数加 1（`modifying == ino` 的话是 `TextBusy`）；占用交给新的地址空间（`vm.Space.backing = .{ .file = ino }`）。`fork` 复制地址空间时 `dupText`；进程结束（`proc.finish`）、`exec` 换掉旧的地址空间、地址空间被释放时 `releaseText`（`vm.releaseBacking`，只放一次）。表按 inode 记，每个地址空间最多占一份，表的大小是地址空间最多能有的个数（每个进程一个，加上 `exec` 新建、还没换上的），不会满。
+- **修改**：上面那几个操作拿着 `write_lock`，在改之前 `beginModify(ino)`：有人占着就是 `TextBusy`；没有就记下 `modifying = ino`，事务提交或者作废之后 `endModify`。`unlink`、`rename` 先用 `beginRemove` 找到要删掉的 inode（用写的一方的 `Fs` 找：拿着 `write_lock`，没有做到一半的事务，它就是已提交的样子），是文件、并且是最后一个名字才检查。名字不存在之类的错误留给接下来的操作自己报。修改都拿着 `write_lock`，所以同一时刻最多一个 `modifying`。
+- **为什么 `exec` 占住之后要重新拿快照**：`exec` 先在一个快照上按路径找到 inode，再占住它。找的那个快照可能已经旧了：别人可能在两者之间改完、提交了这个文件。两边都拿着 `text_lock` 查、改：占住之前开始的修改，要么还没 `endModify`（`holdText` 看到 `modifying == ino`，`exec` 失败），要么已经提交了；占住之后开始的修改都会失败。所以占住之后新拿的快照里的文件，就是之后每次缺页读到的版本。
+- 加锁顺序：`text_lock` 是叶子锁。`proc.finish` 什么锁都没拿时放开；`beginModify` 拿着 `write_lock`（睡眠锁）拿它。
+
+`t_demand` 和 QEMU 测试用例 `tools`（`cp` 覆盖、`rm` 一个正在运行的 `spin` 的副本）检查了这张表（[testing.md](testing.md#回归测试程序)）。
 
 ## 改名（`rename`）
 
@@ -252,5 +290,5 @@ mkfs <输出文件> <总块数> <文件系统的块数> <文件>...
 - 只能截成 0；没有权限、时间戳。
 - 一页一个数据块，没有 btrfs 那种连续多块的 extent；也没有压缩。
 - 每个操作一个事务，每次都写超级块。
-- 删除打开着的文件之后，打开它的人再读写会出错（`ENOENT`）。
+- 删除打开着的文件之后，打开它的人再读写会出错（`ENOENT`）。正在运行的程序文件干脆不能删（`ETXTBSY`），见[正在运行的程序文件](#正在运行的程序文件)。
 - 修改之间排队：改不同文件的进程也要一个一个来（读不排队）。

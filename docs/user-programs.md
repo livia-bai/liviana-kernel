@@ -1,6 +1,6 @@
 # 用户程序
 
-涉及文件：`user/start.zig`、`user/sys.zig`、`user/linker.ld`、`user/init.zig`、`user/sh.zig`、`user/hello.zig`、`user/fault.zig`、`user/spin.zig`、`user/ticker.zig`、`user/echo.zig`、`user/cat.zig`、`user/wc.zig`、`user/ls.zig`、`user/mkdir.zig`、`user/rm.zig`、`user/mv.zig`、`user/ln.zig`、`user/scrub.zig`
+涉及文件：`user/start.zig`、`user/sys.zig`、`user/linker.ld`、`user/init.zig`、`user/sh.zig`、`user/hello.zig`、`user/fault.zig`、`user/spin.zig`、`user/ticker.zig`、`user/echo.zig`、`user/cat.zig`、`user/wc.zig`、`user/ls.zig`、`user/mkdir.zig`、`user/rm.zig`、`user/mv.zig`、`user/ln.zig`、`user/scrub.zig`，写脚本用的 `user/test.zig`、`user/expr.zig`、`user/seq.zig`、`user/sleep.zig`、`user/head.zig`、`user/tail.zig`、`user/grep.zig`、`user/cp.zig`、`user/touch.zig`、`user/tee.zig`、`user/xargs.zig`
 
 用户程序运行在 U 模式，只能访问自己地址空间里的页，要输出文字、读键盘、用管道、创建进程、退出都要通过系统调用（[syscalls.md](syscalls.md)）。它们在构建时编译成独立的 ELF，由 `mkfs` 装进磁盘镜像的 `/bin`；只有 `init` 嵌在内核里（[build.md](build.md#用户程序)、[process.md](process.md#程序从哪来)）。内核启动时只加载 `init`，其他程序都是由已有的进程 `fork` 再 `exec` 出来的（[process.md](process.md#创建进程)）：init 启动 shell（`sh`），shell 的 `run` 命令再启动别的程序。
 
@@ -81,6 +81,12 @@ pub fn meminfo() abi.MemInfo
 pub fn shutdown() noreturn
 pub fn print(comptime fmt: []const u8, args: anytype) void              // 输出到 stdout
 pub fn fprint(fd: Fd, comptime fmt: []const u8, args: anytype) void
+
+pub const LineReader = struct {          // 带缓冲区地按行读一个 fd（head、tail、grep、xargs 用）
+    pub fn init(fd: Fd, buf: []u8) LineReader
+    pub fn next(r: *LineReader) ReadError!?[]const u8      // 下一行，不含 '\n'；读完了是 null
+    pub fn nextRaw(r: *LineReader) ReadError!?[]const u8   // 带着 '\n'（有的话）
+};
 ```
 
 每个函数的语义和错误见 [syscalls.md](syscalls.md#用户态封装)。所有调用都通过 `syscall4`（`syscall` 是第四个参数为 0 的简写）：
@@ -103,6 +109,7 @@ pub fn syscall4(n: abi.Syscall, arg0: usize, arg1: usize, arg2: usize, arg3: usi
 - 封装函数把内核返回的错误码（`abi.errnoOf`）转换成 Zig 的错误，比如 `write` 的 `EFAULT` → `error.BadAddress`、`EBADF` → `error.BadFd`、`EPIPE` → `error.BrokenPipe`，其他 → `error.Unexpected`。`write` 的返回值可能小于 `bytes.len`（遇到坏地址时只写出了前一部分）。
 - `exit` 之后写的是 `unreachable`：内核保证 `exit` 不返回。
 - `print` 和内核的 `uart.print` 一样接入 `std.Io.Writer`，输出到 1 号 fd（stdout），带一个 256 字节的缓冲区：格式化的各段先攒在缓冲区里，`print` 最后 `flush`，用**一次** `write` 系统调用写出去（超过 256 字节时，`drain` 先写出攒着的部分，再直接写剩下的，会多写几次）。`write` 在内核里关着中断整段输出，所以一次 `print` 的输出不会被别的进程的输出从中间打断。最初没有缓冲区，每一段都是一次 `write`（`print("pid {d}\n", .{pid})` 是三次），时钟中断可能落在两次 `write` 之间：后台进程刚启动时，它打印的一行插进了 shell 的 `[proc] pid 9 (spin) started in the background` 中间，fast 模式下的 QEMU 测试因此失败过。`drain` 里 `write` 失败（比如 stdout 是读端已经关了的管道）就返回 `error.WriteFailed`，`print` 吞掉错误、丢掉没写出去的部分。要知道写没写成功的程序（`echo`、`cat`）直接用 `writeAll`。
+- `LineReader` 在调用方给的缓冲区里攒数据，找到 `\n` 就切出一行（返回的切片指向缓冲区，下一次调用就失效了），剩下的半行挪到开头再读。比缓冲区还长的行截成几段，每段当一行；最后一行没有 `\n` 也算一行。原样输出一行的程序用 `nextRaw`，带着换行一次 `write` 写出去：分两次写（内容、换行）的话，中间可能插进别的进程的输出（多核时管道里前面的程序结束，内核打印的 `[proc] ... exited` 那一行插在一行的中间，QEMU 测试在 4 核上碰到过）。
 - `Writer` 包在 `FdWriter` 里，`FdWriter` 记着写到哪个 fd，`drain` 用 `@fieldParentPtr` 从 `Writer` 找回它。stdout 的 `FdWriter` 是全局变量，放在程序的 `.data` 段里（实测 Debug 版 `hello` 的 `.data` 是 56 字节：它占 40 字节，`sys.argv` 占 16 字节），缓冲区在 `.bss` 里（256 字节）。`fprint` 写别的 fd 时在栈上临时建一个。`fork` 出来的子进程有自己的一份；`print` 每次都清空缓冲区，所以 `fork` 时缓冲区总是空的。
 
 ## 链接脚本
@@ -228,7 +235,7 @@ pub fn main() u8 {
 
 演示命令行参数和管道的三个小程序，和 Unix 的同名命令一样：
 
-- `echo`（`user/echo.zig`）：把参数用空格连起来，加换行，写到 stdout。写失败（读端关了）以 1 结束。
+- `echo`（`user/echo.zig`）：把参数用空格连起来，加换行，写到 stdout。整行先拼在一个全局缓冲区里，一次 `write` 写出去（参数最多 2048 字节，放得下），理由和 `LineReader.nextRaw` 一样。写失败（读端关了）以 1 结束。
 - `cat`（`user/cat.zig`）：`cat [文件...]` 把每个文件依次原样复制到 stdout；不给文件名时复制 stdin，读到结尾结束。打不开的文件打印 `cat: 名字: NotFound` 这样的一行，接着处理下一个，最后以 1 结束。直接从键盘读时输入不回显（串口不回显，回显是 shell 做的），按 Ctrl-D 结束。
 - `wc`（`user/wc.zig`）：数 stdin 的行数、单词数、字节数，读到结尾后打印 `行 词 字节`。
 
@@ -297,6 +304,47 @@ scrub: tree of 30 nodes, 1068 items, height 2; 6149 of 7168 blocks free, generat
 [proc] pid 494 (scrub) exited with code 0
 ```
 
+### 写脚本用的程序
+
+shell 没有 `if`、`while`、算术，也没有 `$(...)`（[shell.md](shell.md)），这些程序用退出码和管道补上，配合 `&&`、`||`、`;` 写脚本。和 Unix 的同名命令一样，只实现了常用的部分；出错信息写到 stderr（2 号 fd，平时也是串口），用法不对的退出码是 2。
+
+| 程序 | 用法 | 说明 |
+| --- | --- | --- |
+| `test`（`user/test.zig`） | `test EXPR` | 检查条件，成立以 0 结束、不成立以 1、写错了以 2。文件：`-e`（存在）、`-f`（普通文件）、`-d`（目录）、`-L`（符号链接，不跟着走）、`-s`（存在且不空）；字符串：`-z`、`-n`、`S`（不空）、`=`、`!=`；整数（可以是负数）：`-eq -ne -lt -le -gt -ge`；`!`、`-a`（先算）、`-o`、括号 `(` `)`（shell 不把括号当运算符，直接写，前后要有空格）。没有参数时不成立；`test ! = !` 是比较字符串 `!`。没有 `[`（文件名不好起） |
+| `expr` | `expr 1 + 2 '*' 3` | 64 位有符号整数运算，打印结果。优先级从低到高：`\|`、`&`、`= != < <= > >=`、`+ -`、`* / %`，括号。每个数、运算符是单独的参数；`*` 要写成 `'*'`（不然被当成文件名匹配），`<`、`>` 要加引号（不然是重定向）。结果不是 0 以 0 结束、是 0 以 1、出错（除以 0、溢出、不是数）以 2 |
+| `seq` | `seq [FIRST [STEP]] LAST` | 一行一个数，`STEP` 可以是负数，不能是 0 |
+| `sleep` | `sleep SECONDS` | 可以带小数（`sleep 0.25`），精确到毫秒，内核按 10 ms 一个 tick 睡（[syscalls.md](syscalls.md#调用列表)） |
+| `head` | `head [-n N] [FILE...]` | 前 N 行（默认 10），带着换行原样输出（`LineReader.nextRaw`）。几个文件时每个前面打印 `==> 名字 <==` |
+| `tail` | `tail [-n N] [FILE...]` | 后 N 行（默认 10）。要读到结尾才知道哪些是最后几行，所以整个输入读进堆里：每次 `sbrk` 1 MiB（只挪 `brk`，按需分配，读了多少才用多少内存），一次最多 `read` 64 KiB（`read` 先检查、分配好整个目标范围，[syscalls.md](syscalls.md#read)），读完再把堆缩回去 |
+| `grep` | `grep [-vincq] PATTERN [FILE...]` | 打印匹配的行。模式照 xv6 的 `grep`（出自 Kernighan、Pike 的《程序设计实践》）：`^`、`$`、`.`、`c*`、`\c`（字符本身），没有 `[...]`、`+`、`?`。`-v` 反过来、`-i` 不分大小写、`-n` 加行号、`-c` 只打印行数、`-q` 不打印。几个文件时每行前面加 `文件名:`。有匹配以 0 结束、没有以 1、出错以 2。输出的一行（文件名、行号、内容、换行）拼好了一次写出去 |
+| `cp` | `cp SRC DST`、`cp SRC... DIR` | 复制普通文件的内容；最后一个参数是目录时复制进去、名字不变。`DST` 已经有了就截断再写；和 `SRC` 是同一个文件（`cp a ./a`）的话截断之前就报 `are the same file`。正在运行的程序不能被覆盖（`TextBusy`，[process.md](process.md#按需分页)） |
+| `touch` | `touch FILE...` | 没有就建一个空文件；文件系统没有时间戳，已经有的不动 |
+| `tee` | `tee [-a] FILE...` | stdin 复制到 stdout，同时写进每个文件（`-a` 追加） |
+| `xargs` | `xargs [-n N] [PROGRAM [ARGS...]]` | 把 stdin 里的词（按空格、制表符、换行分，不认引号）接在 `ARGS` 后面运行 `PROGRAM`（默认 `echo`），每次最多 N 个（默认放得下多少放多少：最多 32 个参数、2048 字节），一批运行完再运行下一批。都成功以 0 结束；有一次失败（或者被杀了）以 123；程序运行不起来以 127，不再运行后面的（和 GNU `xargs` 一样） |
+
+```
+> seq 3 | xargs -n 1 echo hi
+hi 1
+hi 2
+hi 3
+> test -d /bin -a ! -f /bin && echo dir
+dir
+> expr '(' 2 + 3 ')' '*' 4
+20
+> seq 12 | grep -n 1
+1:1
+10:10
+11:11
+12:12
+> echo 'expr $1 % 2 > /dev/null && echo $1 odd || echo $1 even' > /odd.sh
+> seq 3 | xargs -n 1 sh /odd.sh
+1 odd
+2 even
+3 odd
+```
+
+（`[proc] ... exited` 的行略去了。）shell 没有循环，`seq ... | xargs -n 1 sh 脚本 ...` 就是一个循环：每个数运行一次脚本，数是 `$1`。QEMU 测试用例 `tools` 检查了上面这些程序的输出和退出码（[testing.md](testing.md#qemu-测试toolsqemu_testpy)）。
+
 ## 写一个新程序
 
 1. 新建 `user/<名字>.zig`：
@@ -314,15 +362,16 @@ scrub: tree of 30 nodes, 1068 items, height 2; 6149 of 7168 blocks free, generat
 2. 在 `build.zig` 的 `user_programs` 数组里加一项 `.{ .name = "<名字>" }`。（回归测试程序放在 `user/tests/`，加到 `test_programs` 里，见 [testing.md](testing.md#加一个回归测试)。）
 3. `zig build run`，在 shell 里 `run <名字> [参数...]`（加 ` &` 在后台运行，用 `|` 接成管道）。不带参数的 `run` 会列出所有程序。参数用 `sys.argv`、`sys.arg(i)` 读，`sys.arg(0)` 是程序名。
 
-可以用的：`std.mem`、`std.fmt`、`std.math` 等纯计算的标准库；全局变量；最多约 16 KiB 的栈。
+可以用的：`std.mem`、`std.fmt`、`std.math` 等纯计算的标准库；全局变量；最多 1 MiB 的栈（按需分配，用多少分配多少）。
 
 不能用或要注意的：
 
-- 堆要自己用 `sbrk` 要：`std.heap.page_allocator` 等依赖操作系统的分配器不可用，`sys.zig` 也还没有提供分配器。可以用 `sbrk` 要一块内存，再用 `std.heap.FixedBufferAllocator` 包起来；小的也可以直接用全局数组或者栈。
+- 堆要自己用 `sbrk` 要：`std.heap.page_allocator` 等依赖操作系统的分配器不可用，`sys.zig` 也还没有提供分配器。可以用 `sbrk` 要一块内存，再用 `std.heap.FixedBufferAllocator` 包起来；小的也可以直接用全局数组或者栈。`sbrk` 不分配页（用到才分配），所以要得多一点没关系；但真用上的时候没有内存了，进程会被结束。
+- 全局数组也是按需分配的：程序文件里的页用到才读进来，`.bss` 用到才分配，所以几百 KiB 的全局数组只要没用满，不占那么多内存（[process.md](process.md#按需分页)）。
 - 系统调用见 [syscalls.md](syscalls.md#调用列表)：可以读写 fd（串口、管道、文件）、用文件系统（`open`、`mkdir`、`readdir` 等）、`fork`/`exec`/`wait`、读命令行参数，没有线程。`exec` 运行文件系统里的程序：名字里没有 `/` 的在 `/bin` 里找。
 - 不能用浮点指令：浮点运算由 compiler_rt 软件实现，慢而且让程序变大。浮点单元被内核关掉了（`sstatus.FS = Off`），手写的浮点指令会触发 `illegal_instruction` 被结束（回归测试 `t_fp`）。
-- 栈只有 16 KiB，下面是不映射的保护页：栈溢出时触发 `store_page_fault`（`stval` 落在 `0x7fffb000..0x7fffc000`），进程被结束。
+- 栈最多 1 MiB，下面是永远没有页的保护页：栈溢出时触发 `store_page_fault`（`stval` 落在 `0x7feff000..0x7ff00000`），进程被结束。
 - 不能执行特权指令、不能访问 S 模式的 CSR（比如 `csrr sstatus`），否则触发 `illegal_instruction` 被结束。例外是 `cycle`、`time`、`instret` 三个计数器：OpenSBI 启动时把 `scounteren` 设成了 7（内核进入时实测，内核没有改它），所以用户程序可以直接用 `rdtime` 等指令读，实测 `rdtime` 在 U 模式下正常返回。
 - 代码段只读：往自己的代码里写会触发 `store_page_fault`。
-- 程序的各段加上栈不能超出 `0x4000_0000..0x7fff_b000`，堆也只能长到 `0x7fff_b000` 为止（实际上先碰到的是 128 MiB 的物理内存）。
+- 程序的各段不能超出 `0x4000_0000..0x7feff000`，堆也只能长到 `0x7feff000` 为止（实际上先碰到的是 128 MiB 的物理内存：堆比整个物理内存还大时 `sbrk` 失败）。
 - 读到 0 就是结尾，要结束循环：从管道读时写端都关了，从键盘读时按了 Ctrl-D。

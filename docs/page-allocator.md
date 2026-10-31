@@ -119,10 +119,10 @@ pub fn free(page: *align(size) Page) void {
 
 | 调用方 | 用途 | 何时释放 |
 | --- | --- | --- |
-| `vm.init` | 内核根页表、中间级页表（共 5 页） | 从不 |
+| `vm.init` | 内核根页表、中间级页表（Debug 模式下共 6 页） | 从不 |
 | `vm.walk` | 建映射时缺的中间级页表 | 用户区的页表在 `vm.destroyUserSpace` 时释放 |
 | `vm.createUserSpace` | 进程的根页表 | `vm.destroyUserSpace` |
-| `vm.allocUserPage` | 用户程序的代码、数据、栈（`exec` 加载时），堆（`sbrk` → `vm.growUser`） | `vm.destroyUserSpace`（`exec` 换掉旧的地址空间时；父进程 `wait` 回收子进程时）；堆缩小时 `vm.shrinkUser`。和别的进程共用的页只是放掉一个引用 |
+| `vm.fault`（按需分页） | 用户程序的代码、数据、`.bss`、堆、栈的页，第一次被访问时（用户程序自己访问缺页，或者内核 `copyFromUser` 这些替它访问时） | `vm.destroyUserSpace`（`exec` 换掉旧的地址空间时；父进程 `wait` 回收子进程时）；堆缩小时 `vm.shrinkUser`。和别的进程共用的页只是放掉一个引用 |
 | `vm.cloneUserSpace`（`fork`） | 子进程的页表；用户页不分配，`share` 父进程的 | 同上 |
 | `vm.breakCow` | 写时复制：给写共用页的进程复制一页，放掉它对旧页的引用 | 同上 |
 | `pipe.create` | 每个管道一页（缓冲区 2048 字节和状态） | 两端都关了（`pipe.close`） |

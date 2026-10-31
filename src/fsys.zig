@@ -12,6 +12,8 @@
 //! - 磁盘的前一部分是文件系统（超级块里记着它有多少块），后一部分是原始区域，
 //!   readblock/writeblock 系统调用只能读写原始区域（块号从原始区域的开头算），碰不到文件系统。
 //!   磁盘上没有文件系统时整个磁盘都是原始区域。
+//! - 正在运行的程序文件（按需分页从它读页）不能改、不能删：holdText 占住它，改它的一方（beginModify）
+//!   得到 TextBusy（和 Linux 的 ETXTBSY 一样）；正在被改的文件也不能开始运行。
 
 const std = @import("std");
 const abi = @import("abi.zig");
@@ -21,6 +23,7 @@ const bio = @import("bio.zig");
 const uart = @import("uart.zig");
 const vm = @import("vm.zig");
 const Sleeplock = @import("sleeplock.zig").Sleeplock;
+const Spinlock = @import("spinlock.zig").Spinlock;
 
 pub const Fs = fs.Fs;
 
@@ -99,13 +102,22 @@ pub fn errno(err: anyerror) abi.Errno {
         error.TooManyLinks => .mlink,
         error.SymlinkLoop => .loop,
         error.NotSymlink => .inval,
+        error.TextBusy => .txtbsy,
         else => .io, // Corrupt 等：磁盘上的东西不对
     };
 }
 
+/// fs.read 的 out：写进内核内存。
+pub const KernelOut = struct {
+    buf: []u8,
+    pub fn put(o: KernelOut, at: usize, bytes: []const u8) error{}!void {
+        @memcpy(o.buf[at..][0..bytes.len], bytes);
+    }
+};
+
 /// fs.read 的 out：写进用户地址空间 space 的 ptr 开始的地方。
 pub const UserOut = struct {
-    space: *vm.PageTable,
+    space: *vm.Space,
     ptr: usize,
     pub fn put(o: UserOut, at: usize, bytes: []const u8) error{BadAddress}!void {
         const va = std.math.add(usize, o.ptr, at) catch return error.BadAddress;
@@ -115,10 +127,102 @@ pub const UserOut = struct {
 
 /// fs.write 的 in：从用户地址空间 space 的 ptr 开始的地方取。
 pub const UserIn = struct {
-    space: *vm.PageTable,
+    space: *vm.Space,
     ptr: usize,
     pub fn get(i: UserIn, at: usize, dst: []u8) error{BadAddress}!void {
         const va = std.math.add(usize, i.ptr, at) catch return error.BadAddress;
         try vm.copyFromUser(i.space, dst, va);
     }
 };
+
+// ---- 正在运行的程序文件 ----
+//
+// 按需分页：进程运行期间才从它的程序文件里读页（vm.Backing.file），所以程序文件在有地址空间用着它的时候
+// 不能改、不能删，不然之后读进来的页和 exec 时读的文件头就不是同一个版本了。
+// exec 占住（holdText）、fork 多占一份（dupText），进程结束、exec 换掉地址空间时放开（releaseText，见 vm.releaseBacking）。
+// 改文件的一方拿着 write_lock，改之前 beginModify：文件被占着就是 TextBusy；没被占着就记下“正在改它”，
+// 改完（事务提交或者作废之后）endModify。这段时间里 exec 它也是 TextBusy。
+// 两边都拿着 text_lock 查、改，所以“exec 占住之后再拿快照读文件头”看到的，就是之后按需分页读到的版本：
+// 占住之前开始的修改要么还没 endModify（exec 失败），要么已经提交了（快照里看得到）。
+
+/// 保护 texts、modifying。叶子锁
+var text_lock: Spinlock = .init("fs text");
+/// 一个地址空间占一份。地址空间最多是每个进程一个，再加上正在 exec 的进程新建的那个
+var texts: [2 * abi.max_procs]struct { ino: u64 = 0, refs: u32 = 0 } = @splat(.{});
+/// 修改的一方正在改的 inode，0 表示没有。修改都拿着 write_lock，同一时刻只有一个
+var modifying: u64 = 0;
+
+pub fn holdText(ino: u64) error{TextBusy}!void {
+    text_lock.acquire();
+    defer text_lock.release();
+    if (modifying == ino) return error.TextBusy;
+    var free: ?usize = null;
+    for (&texts, 0..) |*t, i| {
+        if (t.refs > 0 and t.ino == ino) {
+            t.refs += 1;
+            return;
+        }
+        if (t.refs == 0 and free == null) free = i;
+    }
+    // 每个地址空间最多占一份，表比地址空间多，不会满
+    const t = &texts[free orelse @panic("fsys: too many program files in use")];
+    t.* = .{ .ino = ino, .refs = 1 };
+}
+
+/// 已经占着的程序文件再占一份（fork）。
+pub fn dupText(ino: u64) void {
+    text_lock.acquire();
+    defer text_lock.release();
+    textOf(ino).refs += 1;
+}
+
+pub fn releaseText(ino: u64) void {
+    text_lock.acquire();
+    defer text_lock.release();
+    textOf(ino).refs -= 1;
+}
+
+fn textOf(ino: u64) *@TypeOf(texts[0]) {
+    for (&texts) |*t| {
+        if (t.refs > 0 and t.ino == ino) return t;
+    }
+    std.debug.panic("fsys: program file {d} is not in use", .{ino});
+}
+
+/// 要改 inode ino 的内容、或者删掉它的最后一个名字之前调用（拿着 write_lock）。有进程在运行它就是 TextBusy。
+/// 成功之后改完要 endModify。
+pub fn beginModify(ino: u64) error{TextBusy}!void {
+    std.debug.assert(write_lock.holding());
+    text_lock.acquire();
+    defer text_lock.release();
+    for (texts) |t| {
+        if (t.refs > 0 and t.ino == ino) return error.TextBusy;
+    }
+    modifying = ino;
+}
+
+pub fn endModify() void {
+    text_lock.acquire();
+    defer text_lock.release();
+    modifying = 0;
+}
+
+/// 要删掉 path（不跟着最后一段的符号链接走）这个名字、或者换掉它（rename 的目标）之前调用（拿着 write_lock）：
+/// 它是文件、并且这是它的最后一个名字的话，内容会被删掉，按 beginModify 检查。返回 true 表示调用了 beginModify，
+/// 做完要 endModify。名字不存在等等的错误不在这里报，交给接下来的操作自己报。
+pub fn beginRemove(w: *Fs, cwd: u64, path: []const u8) error{TextBusy}!bool {
+    const ino = w.resolveNoFollow(cwd, path) catch return false;
+    const st = w.stat(ino) catch return false;
+    if (st.kind != .file or st.nlink != 1) return false;
+    try beginModify(ino);
+    return true;
+}
+
+/// 按需分页：从程序文件 ino 的 off 处读 dst.len 个字节（vm.fault 调用，要睡着等磁盘）。
+/// 文件被占着（holdText），内容不会变，所以每次拿一个新的快照读就行，读完就放开，不挡着别人。
+pub fn readText(ino: u64, off: u64, dst: []u8) error{IoError}!void {
+    var r = reader() catch return error.IoError;
+    defer r.end();
+    const n = r.fs.read(ino, off, dst.len, KernelOut{ .buf = dst }) catch return error.IoError;
+    if (n != dst.len) return error.IoError;
+}

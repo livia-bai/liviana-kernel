@@ -13,6 +13,8 @@ const ipi = @import("ipi.zig");
 const virtio_disk = @import("virtio_disk.zig");
 const syscall = @import("syscall.zig");
 const spinlock = @import("spinlock.zig");
+const kstack = @import("kstack.zig");
+const hart = @import("hart.zig");
 
 /// 陷阱发生时被打断的上下文。regs[i] 就是寄存器 xi（x0 恒为 0，它的槽位不用）。
 /// 布局必须和 trapEntry、trapExit 里的汇编一致。
@@ -22,8 +24,11 @@ pub const TrapFrame = extern struct {
     sstatus: usize,
     /// 回到 U 模式时内核的 tp（当前 hart 的编号，见 hart.zig），下次从 U 模式陷入时换回来
     kernel_tp: usize = 0,
-    /// 补齐到 16 字节：TrapFrame 放在内核栈顶，它的下沿就是 handleTrap 开始用的 sp，要 16 字节对齐
-    _pad: usize = 0,
+    /// 处理完这个陷阱、回到被打断的地方时 sscratch 要恢复成什么（见 trapEntry 的 sscratch 约定）：
+    /// 来自 U 模式的，是回到 U 模式时内核的 sscratch（这个 hart 的陷阱栈顶），下次陷入时换回来，和 kernel_tp 一样；
+    /// 来自 S 模式的，是陷入前的 sscratch（陷阱栈顶，或者嵌套时的 0）。
+    /// 它也让 TrapFrame 的大小是 16 的倍数：TrapFrame 放在栈顶，它的下沿就是 handleTrap 开始用的 sp，要 16 字节对齐
+    kernel_sscratch: usize = 0,
 };
 
 comptime {
@@ -56,12 +61,13 @@ const Exception = enum(usize) {
     _,
 };
 
+/// 每个 hart 启动时调用一次（stvec、sscratch 都是每个 hart 自己的）。
 pub fn init() void {
     // stvec 低 2 位是模式，0 = Direct：所有陷阱都进同一个入口。
     // trapEntry 按 4 字节对齐，所以地址低 2 位天然是 0。
     riscv.write(.stvec, @intFromPtr(&trapEntry));
-    // sscratch 为 0 表示 CPU 正在内核里（见 trapEntry）。固件不保证它的初值。
-    riscv.write(.sscratch, 0);
+    // 在内核里（不在处理 S 模式的陷阱时）sscratch 是这个 hart 的陷阱栈顶（见 trapEntry）。固件不保证它的初值
+    riscv.write(.sscratch, kstack.trap[hart.id()].top());
 }
 
 /// 在编译期生成保存/恢复 x1、x3..x31 的 30 条指令（x0 恒为 0 不用存，sp 单独处理）。
@@ -83,15 +89,23 @@ const asm_offsets = .{
     .sepc = @offsetOf(TrapFrame, "sepc"),
     .sstatus = @offsetOf(TrapFrame, "sstatus"),
     .kernel_tp = @offsetOf(TrapFrame, "kernel_tp"),
+    .kernel_sscratch = @offsetOf(TrapFrame, "kernel_sscratch"),
 };
 
 /// 陷阱入口。在 TrapFrame 里保存被打断的上下文，然后调用 handleTrap。
 ///
-/// 陷阱可能来自 S 模式（内核自己），也可能来自 U 模式（用户程序）。来自 U 模式时 sp 是用户栈，
-/// 不能用，要换成内核栈。约定：在 U 模式运行时 sscratch 存着内核栈顶，在内核里时 sscratch 为 0。
-/// 入口先交换 sp 和 sscratch：交换后 sp 不为 0 说明来自 U 模式，sp 已经是内核栈；
-/// 为 0 说明来自内核，原来的 sp 就在 sscratch 里，取回来接着用。
-/// 两种情况下 sscratch 最后都存着被打断时的 sp，保存进 TrapFrame 之后清零。
+/// 陷阱可能来自 U 模式（用户程序），也可能来自 S 模式（内核自己）。TrapFrame 压在哪块栈上，由 sscratch 决定：
+/// - 在 U 模式运行时，sscratch 是当前进程的内核栈顶：TrapFrame 总在进程内核栈的最顶上（proc.frameOf）。
+/// - 在内核里（系统调用、调度器……）运行时，sscratch 是这个 hart 的陷阱栈顶（kstack.trap）：S 模式的陷阱
+///   都在陷阱栈上处理，不用被打断的那块栈。内核栈溢出、撞到保护页时，被打断的 sp 已经在保护页里了，
+///   再往它下面压 TrapFrame 又会缺页、无限循环下去；换到陷阱栈上，handleTrap 才能报出是哪块栈溢出了。
+/// - 正在处理 S 模式的陷阱时，sscratch 为 0：再来的陷阱（只可能是处理程序自己出错）压在当前的栈上，
+///   不会盖掉陷阱栈顶上正在用的 TrapFrame。
+/// 入口先交换 sp 和 sscratch：交换后 sp 不为 0 就用它（进程内核栈顶或者陷阱栈顶）；为 0 是嵌套的陷阱，
+/// 原来的 sp 在 sscratch 里，取回来接着用。三种情况下 sscratch 最后都存着被打断时的 sp，保存进 TrapFrame 之后
+/// 清零，处理期间保持 0；来自 U 模式的，再换成 kernel_sscratch（trapExit 回到 U 模式时留下的陷阱栈顶），
+/// 系统调用里内核自己出的错就在陷阱栈上处理。来自 S 模式的，在 kernel_sscratch 里记下陷入前的 sscratch，
+/// trapExit 回去时恢复：TrapFrame 压在陷阱栈顶的（frame + size 不等于被打断的 sp）是陷阱栈顶，嵌套的是 0。
 ///
 /// 内核用 tp 存当前 hart 的编号（hart.zig）。来自 U 模式时 tp 是用户程序的，存进 TrapFrame 之后
 /// 换成 trapExit 回到 U 模式时留下的 kernel_tp；来自内核时 tp 本来就是对的，不动。
@@ -107,14 +121,23 @@ fn trapEntry() align(4) callconv(.naked) noreturn {
         ++ save_regs ++
             \\csrrw t0, sscratch, zero
             \\sd t0, {[sp]d}(sp)
-            \\csrr t0, sepc
-            \\sd t0, {[sepc]d}(sp)
-            \\csrr t0, sstatus
-            \\sd t0, {[sstatus]d}(sp)
-            \\andi t0, t0, %[spp]
-            \\bnez t0, 2f
+            \\csrr t1, sepc
+            \\sd t1, {[sepc]d}(sp)
+            \\csrr t1, sstatus
+            \\sd t1, {[sstatus]d}(sp)
+            \\andi t1, t1, %[spp]
+            \\bnez t1, 2f
             \\ld tp, {[kernel_tp]d}(sp)
+            \\ld t1, {[kernel_sscratch]d}(sp)
+            \\csrw sscratch, t1
+            \\j 4f
             \\2:
+            \\addi t1, sp, {[size]d}
+            \\bne t1, t0, 3f
+            \\li t1, 0
+            \\3:
+            \\sd t1, {[kernel_sscratch]d}(sp)
+            \\4:
             \\mv a0, sp
             \\call %[handleTrap]
             \\tail %[trapExit]
@@ -130,19 +153,26 @@ fn trapEntry() align(4) callconv(.naked) noreturn {
 /// 除了陷阱返回，新进程第一次被调度时也从这里进入 U 模式（见 proc.forkret）。
 ///
 /// 先写回 sstatus：其中 SIE 为 0，之后不会再被中断打断；SPP 决定 sret 回到哪个特权级。
-/// 如果要回到 U 模式，把这个 TrapFrame 的上沿（也就是内核栈顶）存进 sscratch，
-/// 下次从 U 模式陷入时 trapEntry 就从这里开始用内核栈；再把内核的 tp 存进 kernel_tp，
-/// 下次陷入时换回来。进程可能在别的 hart 上被调度过，所以每次回到 U 模式都要重新存。
+/// 如果要回到 U 模式，先把内核现在的 sscratch（这个 hart 的陷阱栈顶）存进 kernel_sscratch、内核的 tp 存进 kernel_tp，
+/// 下次陷入时换回来；再把这个 TrapFrame 的上沿（也就是内核栈顶）存进 sscratch，
+/// 下次从 U 模式陷入时 trapEntry 就从这里开始用内核栈。进程可能在别的 hart 上被调度过，所以每次回到 U 模式都要重新存。
+/// 回到 S 模式的话，sscratch 恢复成 trapEntry 记下的值。
 pub fn trapExit() callconv(.naked) noreturn {
     asm volatile (std.fmt.comptimePrint(
             \\ld t0, {[sstatus]d}(sp)
             \\csrw sstatus, t0
             \\andi t0, t0, %[spp]
             \\bnez t0, 1f
+            \\csrr t0, sscratch
+            \\sd t0, {[kernel_sscratch]d}(sp)
+            \\sd tp, {[kernel_tp]d}(sp)
             \\addi t0, sp, {[size]d}
             \\csrw sscratch, t0
-            \\sd tp, {[kernel_tp]d}(sp)
+            \\j 2f
             \\1:
+            \\ld t0, {[kernel_sscratch]d}(sp)
+            \\csrw sscratch, t0
+            \\2:
             \\ld t0, {[sepc]d}(sp)
             \\csrw sepc, t0
             \\
@@ -187,13 +217,22 @@ fn handleTrap(frame: *TrapFrame) callconv(.c) void {
                 frame.sepc += 4;
                 frame.regs[10] = syscall.dispatch(frame);
             },
-            // 写了 fork 之后和别的进程共用的页（写时复制，见 vm.cloneUserSpace）：给它复制一份能写的，
-            // 回到原来的地方重新执行这条写指令。别的写缺页（只读的段、没有映射的地址）照常结束进程
-            .store_page_fault => {
+            // 缺页：按需分页（还没分配的页，段里的从程序文件读）、写时复制（写了 fork 之后和别的进程共用的页），
+            // 见 vm.fault。处理完回到原来的地方重新执行这条指令。地址不该有页（没有映射的地址、保护页）、
+            // 或者不允许这样访问（写只读的段、执行数据）的，照常结束进程。这里没拿着锁，可以睡着等读盘
+            .load_page_fault, .store_page_fault, .instruction_page_fault => {
                 const stval = riscv.read(.stval);
-                vm.breakCow(proc.current().?.space, stval) catch |err| switch (err) {
-                    error.NotCow => killForFault(frame, exception),
-                    error.OutOfMemory => proc.killCurrent("out of memory (copy-on-write) at 0x{x}, stval=0x{x}", .{ frame.sepc, stval }),
+                const access: vm.Access = switch (exception) {
+                    .load_page_fault => .read,
+                    .store_page_fault => .write,
+                    else => .exec,
+                };
+                vm.fault(&proc.current().?.space, stval, access, true) catch |err| switch (err) {
+                    error.BadAddress => killForFault(frame, exception),
+                    error.OutOfMemory => proc.killCurrent("out of memory (demand paging) at 0x{x}, stval=0x{x}", .{ frame.sepc, stval }),
+                    error.CowOutOfMemory => proc.killCurrent("out of memory (copy-on-write) at 0x{x}, stval=0x{x}", .{ frame.sepc, stval }),
+                    error.IoError => proc.killCurrent("cannot read the program file (demand paging) at 0x{x}, stval=0x{x}", .{ frame.sepc, stval }),
+                    error.WouldSleep => unreachable, // may_sleep 是 true
                 };
             },
             else => killForFault(frame, exception),
@@ -206,12 +245,14 @@ fn handleTrap(frame: *TrapFrame) callconv(.c) void {
                 // sepc 指向 ebreak 本身，跳过它才不会无限循环
                 frame.sepc += instructionLength(frame.sepc);
             },
-            else => std.debug.panic("unhandled exception: {s} (scause={d}), sepc=0x{x}, stval=0x{x}", .{
-                std.enums.tagName(Exception, exception) orelse "unknown",
-                code,
-                frame.sepc,
-                riscv.read(.stval),
-            }),
+            // 内核碰到了栈下面的保护页：栈溢出了。这个陷阱是在陷阱栈上处理的（见 trapEntry），所以还能报出来。
+            // 启动时的自检（probeGuard）是故意碰的，跳过那条指令
+            .load_page_fault, .store_page_fault, .instruction_page_fault => if (kstack.guardOwner(riscv.read(.stval))) |owner| {
+                if (!probing) stackOverflow(owner, frame);
+                probe_hit = true;
+                frame.sepc += instructionLength(frame.sepc);
+            } else unhandled(exception, code, frame),
+            else => unhandled(exception, code, frame),
         }
     }
     // 回到 U 模式之前：先看内核栈溢出了没有（溢出会踩坏相邻进程的 TrapFrame，见 canary.zig）。
@@ -223,7 +264,53 @@ fn handleTrap(frame: *TrapFrame) callconv(.c) void {
     }
 }
 
-/// 来自 U 模式的异常（系统调用和写时复制以外的）都是用户程序自己的错：访问了没有映射或没有权限的地址、
+/// probeGuard 正在故意碰保护页。只在启动 hart 的 kmain 里用，那时别的 hart 还没启动
+var probing = false;
+var probe_hit = false;
+
+/// 启动时的自检：模拟一次内核栈溢出。把 sp 挪到 stack_bottom（一块栈的底，也就是它的保护页的上沿），
+/// 往栈上压一个字：这时 sp 已经越过了栈底，和栈溢出时一样。trapEntry 要在陷阱栈上处理这个缺页
+/// （handleTrap 看到 probing，跳过这条指令），回来之后恢复 sp。返回缺页有没有发生。
+/// trapEntry 要是往被打断的栈（保护页）上压 TrapFrame，就会一直缺页下去，启动停在这里。
+pub fn probeGuard(stack_bottom: usize) bool {
+    probing = true;
+    defer probing = false;
+    probe_hit = false;
+    // 用固定的寄存器：t0 存原来的 sp，stack_bottom 在 a0，编译器不会把它们分给别的
+    asm volatile (
+        \\mv t0, sp
+        \\mv sp, a0
+        \\sd zero, -8(sp)
+        \\mv sp, t0
+        :
+        : [bottom] "{a0}" (stack_bottom),
+        : .{ .t0 = true, .memory = true });
+    return probe_hit;
+}
+
+fn unhandled(exception: Exception, code: usize, frame: *TrapFrame) noreturn {
+    std.debug.panic("unhandled exception: {s} (scause={d}), sepc=0x{x}, stval=0x{x}", .{
+        std.enums.tagName(Exception, exception) orelse "unknown",
+        code,
+        frame.sepc,
+        riscv.read(.stval),
+    });
+}
+
+fn stackOverflow(owner: kstack.Owner, frame: *TrapFrame) noreturn {
+    const stval = riscv.read(.stval);
+    switch (owner) {
+        .boot => |h| std.debug.panic("kernel stack overflow: boot stack of hart {d} hit its guard page at 0x{x}, sepc=0x{x}", .{ h, stval, frame.sepc }),
+        .trap => |h| std.debug.panic("kernel stack overflow: trap stack of hart {d} hit its guard page at 0x{x}, sepc=0x{x}", .{ h, stval, frame.sepc }),
+        .process => |slot| {
+            // 不拿锁读 pid、name：就要 panic 了，锁可能在别人手里
+            const p = &proc.table[slot];
+            std.debug.panic("kernel stack overflow: pid {d} ({s}) hit its guard page at 0x{x}, sepc=0x{x}", .{ p.pid, p.name.slice(), stval, frame.sepc });
+        },
+    }
+}
+
+/// 来自 U 模式的异常（系统调用和能处理的缺页以外的）都是用户程序自己的错：访问了没有映射或没有权限的地址、
 /// 执行了非法指令等等。结束这个进程，内核照常运行。
 fn killForFault(frame: *TrapFrame, exception: Exception) noreturn {
     proc.killCurrent("{s} at 0x{x}, stval=0x{x}", .{

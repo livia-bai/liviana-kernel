@@ -1,4 +1,5 @@
-//! 回归测试：sbrk。堆的增长、缩小、清零、按页释放、越界、fork 复制堆。
+//! 回归测试：sbrk。堆的增长、缩小、清零、按页释放、越界、fork 复制堆；按需分配（sbrk 只挪末尾，
+//! 页用到才分配；内存不够时访问它的进程被结束）。
 //! 失败的项打印 "FAIL: ..."，最后打印通过的项数。漏页的话 qemu_test.py 比较前后的 mem 会发现。
 
 const std = @import("std");
@@ -81,16 +82,17 @@ pub fn main() u8 {
     _ = sys.sbrk(2 * page) catch {};
     expect(heap(base + 2 * page, page)[0] == 0, "regrown heap memory is zeroed", .{});
 
-    // 不能缩到堆的起点下面，不能长进栈；物理内存不够时失败，不留下半截（qemu_test.py 检查 mem）
+    // 不能缩到堆的起点下面，不能长进栈；一次要的比整个物理内存还多时失败；失败时什么都不变
     const now = sys.sbrk(0) catch 0;
     expect(sys.sbrk(-@as(isize, @intCast(now - base + 1))) == error.InvalidArgument, "shrinking below the heap start", .{});
     expect(sys.sbrk(std.math.minInt(isize)) == error.InvalidArgument, "sbrk(minInt)", .{});
     expect(sys.sbrk(0x4000_0000) == error.OutOfMemory, "growing into the stack", .{});
     expect(sys.sbrk(std.math.maxInt(isize)) == error.OutOfMemory, "sbrk(maxInt)", .{});
-    const free = sys.meminfo().free_pages;
-    expect(sys.sbrk(@intCast((free + 10) * page)) == error.OutOfMemory, "growing past physical memory", .{});
-    expect(sys.meminfo().free_pages == free, "failed sbrk leaked pages: {d} -> {d}", .{ free, sys.meminfo().free_pages });
+    const info = sys.meminfo();
+    expect(sys.sbrk(@intCast((info.total_pages + 1) * page)) == error.OutOfMemory, "growing past physical memory", .{});
+    expect(sys.meminfo().free_pages == info.free_pages, "failed sbrk used pages: {d} -> {d}", .{ info.free_pages, sys.meminfo().free_pages });
     expect((sys.sbrk(0) catch 0) == now, "failed sbrk moved the break", .{});
+    demandPaging(base);
 
     // 一个字节一个字节地长，跨过页边界
     {
@@ -111,4 +113,65 @@ pub fn main() u8 {
 
     sys.print("{d} checks, {d} failed\n", .{ checks, failures });
     return failures;
+}
+
+/// 按需分配：sbrk 只挪末尾，页用到才分配；比空闲内存还多（但不比整个物理内存多）的 sbrk 也成功，
+/// 真的都用上时，访问它的进程被结束（out of memory），内核替进程写的话返回 EFAULT。
+fn demandPaging(heap_start: usize) void {
+    // 内存用完的那一会儿，自己不能再用到还没分配的页（不然自己也会被结束）：先把程序的每一页都读进来，
+    // 栈最上面 16 KiB 也都分配好
+    var addr: usize = 0x4000_0000;
+    while (addr < heap_start) : (addr += page) _ = @as(*const volatile u8, @ptrFromInt(addr)).*;
+    addr = 0x8000_0000 - 16 * 1024;
+    while (addr < 0x8000_0000) : (addr += page) {
+        const p: *volatile u8 = @ptrFromInt(addr);
+        p.* = p.*;
+    }
+    const zero = sys.open("/dev/zero", .{}) catch {
+        expect(false, "open /dev/zero", .{});
+        return;
+    };
+    defer sys.close(zero) catch {};
+
+    // 从页边界开始：brk 所在的那一页之前已经属于堆了，碰它不算这里分配的
+    const brk = sys.sbrk(0) catch 0;
+    _ = sys.sbrk(@intCast((page - brk % page) % page)) catch {};
+    const start = sys.sbrk(0) catch 0;
+    const free = sys.meminfo().free_pages;
+    // 长 4 MiB：一页都不用
+    const big = 4 << 20;
+    expect((sys.sbrk(big) catch 0) == start, "sbrk 4 MiB", .{});
+    expect(sys.meminfo().free_pages == free, "sbrk 4 MiB used {d} pages before touching them", .{free -| sys.meminfo().free_pages});
+    // 碰其中两页（隔得很远）：只用这两页，加上装它们的页表（每 2 MiB 一张）
+    const mem = heap(start, big);
+    mem[0] = 1;
+    mem[big - 1] = 2;
+    const used = free -| sys.meminfo().free_pages;
+    expect(used >= 2 and used <= 5, "touching 2 pages of a 4 MiB heap used {d} pages", .{used});
+    expect(mem[1] == 0 and mem[big - 2] == 0 and mem[page * 100] == 0, "untouched heap memory is zeroed", .{});
+    // 缩回去：用过的都还回去了（页表也是）
+    _ = sys.sbrk(-@as(isize, big)) catch {};
+    expect(sys.meminfo().free_pages == free, "shrinking a sparse heap leaked {d} pages", .{free -| sys.meminfo().free_pages});
+
+    // 比空闲内存多：sbrk 成功；子进程把它一页一页写满，内存用完时被结束（qemu_test.py 检查那一行），父进程照常
+    // 多几页就够了（页表也要用内存）；多太多的话超过了整个物理内存，sbrk 会拒绝
+    const n = sys.meminfo().free_pages + 4;
+    const over = sys.sbrk(@intCast(n * page)) catch {
+        expect(false, "sbrk of more than the free memory", .{});
+        return;
+    };
+    const pid = sys.fork() catch unreachable;
+    if (pid == 0) {
+        for (0..n) |i| @as(*volatile u8, @ptrFromInt(over + i * page)).* = 1;
+        sys.exit(0); // 不应该走到这里
+    }
+    const r = (sys.wait(pid, false) catch null).?;
+    expect(r.status == abi.killed_status, "child that used up memory: status {d}", .{r.status});
+    // 内核替自己写一大片还没分配的堆（读 /dev/zero）：写到没内存了就停下，返回 EFAULT，自己不会被结束。
+    // 内存用完了，马上缩回去还掉，之后才调用 expect
+    const ok = sys.read(zero, heap(over, n * page)) == error.BadAddress;
+    _ = sys.sbrk(-@as(isize, @intCast(n * page))) catch {};
+    expect(ok, "kernel writing a heap larger than memory did not return EFAULT", .{});
+    expect((sys.sbrk(0) catch 0) == start, "heap back to where it was", .{});
+    _ = sys.sbrk(@as(isize, @intCast(brk)) - @as(isize, @intCast(start))) catch {};
 }

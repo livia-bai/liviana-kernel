@@ -49,10 +49,11 @@ python3 tools/qemu_test.py --list      # 列出 QEMU 测试的用例和它们覆
 
 绑在一起、改一边就要同步改另一边的：
 
-- `trap.TrapFrame` 的布局（大小是 16 的倍数，含 `kernel_tp`） ↔ `trap.trapEntry`、`trap.trapExit` 的汇编 ↔ `proc.startFrame` 构造初始 `TrapFrame`（`a0`/`a1`/`sp` 传命令行参数） ↔ `syscall.dispatch` 读参数的下标（[docs/trap.md](docs/trap.md#trapframe)）。
+- `trap.TrapFrame` 的布局（大小是 16 的倍数，含 `kernel_tp`、`kernel_sscratch`） ↔ `trap.trapEntry`、`trap.trapExit` 的汇编 ↔ `proc.startFrame` 构造初始 `TrapFrame`（`a0`/`a1`/`sp` 传命令行参数） ↔ `syscall.dispatch` 读参数的下标（[docs/trap.md](docs/trap.md#trapframe)）。
 - `proc.Context` ↔ `proc.contextAsm`（[docs/process.md](docs/process.md#保存的上下文)）。
-- `linker.ld` 里各段的 4 KiB 对齐和 `__text_start`、`__rodata_start`、`__data_start`、`__kernel_end` ↔ `vm.init` 设置的页权限（[docs/boot.md](docs/boot.md#链接脚本)）。
-- `hart.max` ↔ `main.zig` 的启动栈（`boot_stacks`、`_start` 里的编号检查） ↔ 各处按 hart 编号下标的数组（`proc.cpus`、`spinlock.held`、`timer.deadline`、`page.pools`）。启动栈的大小是实测的，改了 `kmain` 的初始化要重新量（[docs/boot.md](docs/boot.md#每个-hart-的启动栈)）。
+- `linker.ld` 里各段的 4 KiB 对齐和 `__text_start`、`__rodata_start`、`__data_start`、`__kernel_end` ↔ `vm.init` 设置的页权限（和跳过的保护页）（[docs/boot.md](docs/boot.md#链接脚本)）。
+- `hart.max` ↔ `kstack.boot`（`main.zig` 导出成 `boot_stacks`，`enter_asm` 按 `@sizeOf(kstack.Boot)` 算栈顶、`_start` 里的编号检查）、`kstack.trap` ↔ 各处按 hart 编号下标的数组（`proc.cpus`、`spinlock.held`、`timer.deadline`、`page.pools`）。启动栈的大小是实测的，改了 `kmain` 的初始化要重新量（[docs/boot.md](docs/boot.md#每个-hart-的启动栈)）。
+- 内核的栈（`src/kstack.zig`：启动栈、陷阱栈、进程内核栈）每块下面一页保护页 ↔ `kstack.guardPages` ↔ `vm.init` 不映射它们 ↔ `trap.handleTrap` 认出撞到保护页的缺页 ↔ `qemu_test.py` 检查的 `80 stack guard pages unmapped`。新加内核栈要放进 `kstack.zig`（[docs/trap.md](docs/trap.md#内核栈溢出)）。
 - 全局的初始化（启动 hart 的 `kmain`） ↔ 每个 hart 一份的初始化（`kmainSecondary`：`trap.init`、`vm.initHart`、`plic.initHart`、`timer.initHart`、`ipi.initHart`，以及清 `sstatus.FS`）：新加的每个 hart 的 CSR 设置两边都要做（[docs/boot.md](docs/boot.md#启动其他-hart)）。
 - `user/linker.ld` 的页对齐、可读的段 ↔ `proc.loadSegment` 的检查。
 - virtio-mmio 的地址和槽位数（`virtio_disk.mmio_base`、`mmio_size`）↔ `vm.init` 的映射；磁盘的中断号（`virtio_disk.irq`，运行时找到的）↔ `plic.init` 的参数、`trap.handleExternal` 的分发（[docs/disk.md](docs/disk.md)）。
@@ -62,7 +63,7 @@ python3 tools/qemu_test.py --list      # 列出 QEMU 测试的用例和它们覆
 
 不能破坏的不变量：
 
-- `sscratch`：在 U 模式运行时存进程内核栈顶，在内核里为 0（[docs/trap.md](docs/trap.md#sscratch-约定)）。
+- `sscratch`：在 U 模式运行时存进程内核栈顶；在内核里是这个 hart 的陷阱栈顶（`kstack.trap`，S 模式的陷阱都在陷阱栈上处理，`trap.init` 设、`kernel_sscratch` 记着）；正在处理 S 模式的陷阱时为 0。处理 S 模式陷阱的代码不能切换进程（[docs/trap.md](docs/trap.md#sscratch-约定)）。
 - `tp`：在内核里是当前 hart 的编号（`hart.id()`）；从 U 模式陷入时 `trapEntry` 换回内核的值，回到 U 模式时 `trapExit` 换成用户的。内核不能把 `tp` 挪作他用（[docs/trap.md](docs/trap.md#tp-约定)）。
 - `sstatus.FS` 保持 Off：`kmain`、`kmainSecondary` 一开始就清掉 OpenSBI 留下的 Dirty，进入 U 模式的 `sstatus` 从内核当前的值派生，所以用户程序也不能用浮点（[docs/riscv-sbi.md](docs/riscv-sbi.md#位定义)）。
 - 内核代码（陷阱处理、系统调用、调度器扫描进程表）全程关中断执行；只有调度器每一轮开头开一下中断（[docs/trap.md](docs/trap.md#中断开关不变量)）。
@@ -72,16 +73,17 @@ python3 tools/qemu_test.py --list      # 列出 QEMU 测试的用例和它们覆
 - 进程的 `TrapFrame` 总在它内核栈的最顶端（`proc.frameOf`）：`trapEntry`、`trapExit` 设 `sscratch`、`fork` 复制父进程的 `TrapFrame` 都依赖这一点。
 - 结束的进程只由父进程 `wait` 回收（`proc.reap`），父进程先结束的交给 init；init（pid 1）不能结束，结束内核就 panic（[docs/process.md](docs/process.md#结束进程)）。
 - 等待用 `proc.sleep(chan, lock)` / `proc.wakeup(chan)`，`lock` 是保护等待条件的锁（不能为空：改条件的一方也要拿它），醒来后在循环里重新检查条件；`proc.kill` 只做标记，被杀的进程在回到 U 模式之前（`handleTrap` 末尾、`forkret`）由 `checkKilled` 结束（[docs/process.md](docs/process.md#结束进程)）。
-- 自旋锁（`src/spinlock.zig`）只在关中断时拿；调用 `proc.sched` 时只能拿着这个进程自己的锁，回到 U 模式时不能拿着任何锁（`sched`、`handleTrap`、`forkretC` 会检查）。嵌套加锁按固定顺序：`wait_lock` → 进程锁 → 页分配器（每个 hart 一把）、`File.lock`、串口输出这些叶子锁；`bio.evict_lock` → `bio` 的桶的锁；`timer.lock`、管道锁、`uart.rx_lock`、`virtio_disk.lock`、`bio.evict_lock`、`Volume.snap_lock`、睡眠锁里的自旋锁 → 进程锁；睡眠锁之间 `File.pos_lock` → `fsys.write_lock` → 缓冲区的睡眠锁。新加的嵌套要先对照这个顺序（[docs/process.md](docs/process.md#锁)）。
+- 自旋锁（`src/spinlock.zig`）只在关中断时拿；调用 `proc.sched` 时只能拿着这个进程自己的锁，回到 U 模式时不能拿着任何锁（`sched`、`handleTrap`、`forkretC` 会检查）。嵌套加锁按固定顺序：`wait_lock` → 进程锁 → 页分配器（每个 hart 一把）、`File.lock`、串口输出、`fsys.text_lock` 这些叶子锁；管道锁、串口输出锁、`uart.rx_lock` → 页分配器（拿着它们复制用户内存时按需分配清零的页）；`bio.evict_lock` → `bio` 的桶的锁；`timer.lock`、管道锁、`uart.rx_lock`、`virtio_disk.lock`、`bio.evict_lock`、`Volume.snap_lock`、睡眠锁里的自旋锁 → 进程锁；睡眠锁之间 `File.pos_lock` → `fsys.write_lock` → 缓冲区的睡眠锁。新加的嵌套要先对照这个顺序（[docs/process.md](docs/process.md#锁)）。
 - 睡眠锁（`src/sleeplock.zig`：`File.pos_lock`、文件系统的 `fsys.write_lock`、缓冲区缓存的每一块）只有进程能拿，拿它之前不能拿着自旋锁，拿着它可以睡觉；回到 U 模式时不能拿着（`proc.assertNoLocksHeld` 检查）。磁盘只能由进程读写：`virtio_disk.rw` 要睡着等中断，`kmain`、调度器、中断处理程序都不能读盘（[docs/disk.md](docs/disk.md)），所以文件系统由第一个进程在 `forkretC` 里挂载。
 - 文件系统的读（`fsys.reader()`）在已提交的树的快照上读、不拿锁，读完 `end()`；拿着快照时不能去等 `File.pos_lock`、`fsys.write_lock`（修改的一方可能拿着它们等旧树的读者读完）。改动（`fsys.writer()`）拿着 `fsys.write_lock` 做完，每个改动是一个事务（`fs.Fs.run`：成功提交、出错作废）；提交时还有旧树的读者的话，释放的块先进 `limbo`，读者读完才能再分配（[docs/btree.md](docs/btree.md#快照读者)）；`readblock`/`writeblock` 只能碰文件系统之后的原始区域（`fsys.raw_base` 起）（[docs/fs.md](docs/fs.md#接进内核fsyszig)）。
-- 内核栈只有 16 KiB，文件系统的调用已经用掉 11 KiB 多（Debug）：不要按值传、按值复制大的结构体（`std.bit_set` 的方法按值接收整个位图，`x.* = y.*` 复制一整块都会先放到栈上），用指针和 `@memcpy`；改了文件系统要重新量一次栈（[docs/process.md](docs/process.md#进程表)）。内核栈和启动栈最底下 256 字节是金丝雀（`src/canary.zig`），不能挪作他用；看到 `kernel stack overflow` 的 panic 就是栈用超了。
+- 内核栈只有 16 KiB（下面是保护页，溢出就 panic），文件系统的调用已经用掉 11 KiB 多（Debug）：不要按值传、按值复制大的结构体（`std.bit_set` 的方法按值接收整个位图，`x.* = y.*` 复制一整块都会先放到栈上），用指针和 `@memcpy`；改了文件系统要重新量一次栈（[docs/process.md](docs/process.md#进程表)）。内核栈和启动栈最底下 256 字节是金丝雀（`src/canary.zig`），不能挪作他用；看到 `kernel stack overflow` 的 panic 就是栈用超了。
 - 进程结束时（`proc.finish`）关掉它所有的 fd，不能留给 `wait`：管道的写端不关，读的进程读不到结尾（[docs/process.md](docs/process.md#结束进程)）。
 - 用户地址空间只能用 Sv39 根页表的第 1 项（`vm.user_base..vm.user_end`），内核映射不能放进这个范围（[docs/paging.md](docs/paging.md#用户地址空间)）。内核页表启动后不再改，所有 hart 共用；一个用户地址空间同一时刻只在一个 hart 上用，改了它只刷当前 hart 的 TLB。
-- 内核碰用户内存只能通过 `vm.copyFromUser` 这类先查页表的函数，不要打开 `sstatus.SUM` 直接解引用用户指针（[docs/syscalls.md](docs/syscalls.md#访问用户内存)）。
+- 内核碰用户内存只能通过 `vm.copyFromUser` 这类先查页表的函数，不要打开 `sstatus.SUM` 直接解引用用户指针（[docs/syscalls.md](docs/syscalls.md#访问用户内存)）。用户页是按需分配的，这些函数会替调用方分配；但拿着自旋锁或睡眠锁时读不了盘（来自程序文件的页会失败），拿着锁复制用户内存的系统调用要先 `vm.prefault`（或者 `vm.checkUser`）这个范围（[docs/paging.md](docs/paging.md#内核访问用户内存)）。
+- 按需分页（[docs/process.md](docs/process.md#按需分页)）：用户地址空间是 `vm.Space`（根页表 + 段、堆、栈），页表里只有访问过的页，不能假设某个用户页已经映射了。段的页从程序文件读，所以有地址空间用着的程序文件不能变：改文件内容、截断、删掉最后一个名字的地方（拿着 `fsys.write_lock`）都要先 `fsys.beginModify`/`beginRemove`，做完 `endModify`；新加这类操作也要这样做（[docs/fs.md](docs/fs.md#正在运行的程序文件)）。`exec` 先 `holdText` 再拿新快照读文件头；`fork` 要 `dupText`；进程结束、地址空间释放时 `vm.releaseBacking`。
 - 页表叶子必须可读或可执行，可写必须可读；ELF 加载器拒绝不可读的段（[docs/process.md](docs/process.md#elf-加载器)）。
 - 写时复制 B 树（`src/ctree.zig`）：已提交的树的块从来不改（要改先 `cow`）；释放已提交的树的块只进 `pending`，提交（写超级块）之后才能再分配；超级块是每个事务最后写的一块；修改前先 `reserve` 最坏情况的块数，做到一半出错就 `abort`。`Volume` 的位图每个 8 KiB，只在原地改，不要在栈上复制（[docs/btree.md](docs/btree.md#事务和提交)）。掉电测试（`ctree.zig` 末尾）必须一直能通过。
-- 用户页可能被几个地址空间共用（`fork` 写时复制，页表项标着 `cow`）：释放用户页只用 `page.free`（放掉一个引用，减到 0 才真正释放），共用页的内容不能直接改，要先 `vm.breakCow` 复制一份；`copyToUser`、检查可写的 `checkUser` 已经替调用方做了。改了正在用的页表要刷当前 hart 的 TLB（[docs/paging.md](docs/paging.md#写时复制)）。
+- 用户页可能被几个地址空间共用（`fork` 写时复制，页表项标着 `cow`）：释放用户页只用 `page.free`（放掉一个引用，减到 0 才真正释放），共用页的内容不能直接改，要先 `vm.breakCow` 复制一份；`copyToUser`、检查可写的 `checkUser`、`vm.fault` 已经替调用方做了。改了正在用的页表要刷当前 hart 的 TLB（[docs/paging.md](docs/paging.md#写时复制)）。
 
 用户程序：`init`（第一个进程）和 `sh`（shell）必须有，shell 的命令写在 `user/sh.zig` 里（[docs/shell.md](docs/shell.md)）。新程序放在 `user/<名字>.zig`，提供 `pub fn main() u8`，用 `@import("sys")`（不是 `"sys.zig"`），再在 `build.zig` 的 `user_programs` 里加一项，它就会被 `mkfs` 装进 `/bin`，`exec` 从那里加载；只有 `init` 嵌在内核里（[docs/user-programs.md](docs/user-programs.md#写一个新程序)、[docs/process.md](docs/process.md#程序从哪来)）。回归测试程序放在 `user/tests/`，加到 `test_programs` 里，并在 `tools/qemu_test.py` 里加上检查（[docs/testing.md](docs/testing.md#加一个回归测试)）。
 

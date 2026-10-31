@@ -31,7 +31,7 @@ QEMU `virt` 机器、`-m 128M` 时，和这个内核有关的物理地址如下�
 | `0x1000_0000..0x1000_0100` | NS16550A 串口 | 映射一页 RW |
 | `0x1000_1000..0x1000_9000` | 8 个 virtio-mmio 槽位，每个 `0x1000` | 映射为 RW；磁盘（virtio 块设备）在其中一个，启动时逐个找（[disk.md](disk.md)） |
 | `0x8000_0000..0x8006_0000` | OpenSBI 自己的代码和数据 | 被 PMP 保护，S 模式无权访问；设备树里登记为保留内存 |
-| `0x8020_0000` 起 | 内核镜像：`.text`、`.rodata`、`.data`、`.bss`（含每个 hart 32 KiB 的启动栈、每个进程 16 KiB 的内核栈） | 按段设置权限，见 [paging.md](paging.md) |
+| `0x8020_0000` 起 | 内核镜像：`.text`、`.rodata`、`.data`、`.bss`（含每个 hart 32 KiB 的启动栈和 16 KiB 的陷阱栈、每个进程 16 KiB 的内核栈，每块栈下面一页保护页） | 按段设置权限，保护页不映射，见 [paging.md](paging.md) |
 | `__kernel_end..0x8800_0000` | 其余内存 | 交给页分配器（[page-allocator.md](page-allocator.md)）：页表、用户程序的页都从这里来 |
 | `0x87e0_0000` 起约 5.3 KiB | OpenSBI 传给内核的设备树 | 页分配器跳过这些页，不会分配出去 |
 
@@ -46,14 +46,16 @@ QEMU `virt` 机器、`-m 128M` 时，和这个内核有关的物理地址如下�
                                           
 0x0c00_0000  PLIC        RW- (G)          0x0c00_0000  PLIC        RW- (G)  ┐
 0x1000_0000  串口        RW- (G)          0x1000_0000  串口        RW- (G)  │ 和内核共用
-                                          0x4000_0000  程序各段    U + R/W/X│ ← 根页表第 1 项，
-                                          0x7fff_b000  保护页（不映射）    │   每个进程独有
-                                          0x7fff_c000  用户栈 16K  U + RW-  │
+                                          0x4000_0000  程序各段、堆 U + R/W/X│ ← 根页表第 1 项，
+                                          0x7fef_f000  保护页（没有页）    │   每个进程独有，
+                                          0x7ff0_0000  用户栈 ≤1M  U + RW-  │   按需分页
 0x8020_0000  内核镜像    R-X/R--/RW- (G)  0x8020_0000  内核镜像    同左     │ 和内核共用
 内核之后     其余内存    RW- (G)          内核之后     其余内存    同左     ┘
 ```
 
 - 内核的映射都是恒等映射（虚拟地址 = 物理地址），都不带 U 位、都带 G（全局）位。
+- 内核栈下面的保护页（80 页）在恒等映射里留成空洞，内核栈溢出时缺页、panic（[trap.md](trap.md#内核栈溢出)）。
+- 用户空间里的页都是**按需分配**的：`exec` 只记下各个段在程序文件里的位置，`sbrk` 只挪堆的末尾，访问到哪一页才分配哪一页，段里的页那时才从程序文件读进来（[process.md](process.md#按需分页)）。
 - 用户空间固定是 Sv39 根页表第 1 项覆盖的 `0x4000_0000..0x8000_0000`（1 GiB）。内核的映射都不在这一项里，所以新建进程地址空间时只复制一份内核根页表，下面的页表全部共用。陷入内核时不用切换页表：内核代码在用户地址空间里照样能执行，U 模式只是访问不到它们。
 
 为什么选根页表第 1 项、为什么用户映射不能用大页等细节见 [paging.md](paging.md) 和 [process.md](process.md)。
@@ -107,7 +109,9 @@ user/start.zig ─┬─ user/sys.zig ─── src/abi.zig（与内核共用的
 
 **中断**（[trap.md](trap.md)、[devices.md](devices.md)）：硬件跳到 `trap.trapEntry` → 压 `TrapFrame`（来自 U 模式时换回内核的 `tp`）→ `handleTrap` 按 `scause` 分发：时钟中断预约这个 hart 的下一次（启动 hart 上还让 `ticks` 加 1、叫醒等时钟的进程），打断的是 U 模式就让出 CPU；外部中断向 PLIC 领取中断号，串口中断把字符搬进环形缓冲区、处理 Ctrl-C、叫醒在 `read` 里等的进程 → 回到 U 模式之前检查 `killed` → `trapExit` 恢复寄存器、`sret`。
 
-**创建进程**（[process.md](process.md#创建进程)）：`fork` 系统调用 → `proc.fork`：写时复制地址空间（只建页表，用户页和父进程共用，谁先写谁在写缺页里复制一份）、复制 `TrapFrame`（子进程的 `a0` 改成 0）→ 拿着 `wait_lock` 和新槽位的锁一次填好，状态 `runnable`，父进程是调用者。`exec` 系统调用 → 把命令行参数复制进内核 → `proc.exec`：新建地址空间、加载 ELF、映射栈、参数放到栈顶 → 换掉旧的地址空间 → `TrapFrame` 改成从新程序的入口开始（`a0` = argc，`a1` = argv）。
+**创建进程**（[process.md](process.md#创建进程)）：`fork` 系统调用 → `proc.fork`：写时复制地址空间（只建页表，用户页和父进程共用，谁先写谁在写缺页里复制一份）、复制 `TrapFrame`（子进程的 `a0` 改成 0）→ 拿着 `wait_lock` 和新槽位的锁一次填好，状态 `runnable`，父进程是调用者。`exec` 系统调用 → 把命令行参数复制进内核 → `proc.exec`：占住程序文件（运行期间不能改、不能删）、新建地址空间、读 ELF 的程序头记下各个段、参数放到栈顶（分配栈最顶上那一页）→ 换掉旧的地址空间 → `TrapFrame` 改成从新程序的入口开始（`a0` = argc，`a1` = argv）。
+
+**缺页**（[process.md](process.md#按需分页)）：用户程序访问还没有的页 → `handleTrap` → `vm.fault`：在段、堆、栈里的话分配一页（段的页从程序文件读，睡着等磁盘）、映射上，回去重新执行那条指令；写时复制的页复制一份；别的地址结束进程。
 
 **系统调用**（[syscalls.md](syscalls.md)）：用户程序 `ecall` → `trapEntry` 通过 `sscratch` 换到内核栈 → `handleTrap` → `syscall.dispatch` → 返回值写进 `TrapFrame` 的 `a0` → `trapExit` 回到 U 模式。
 
@@ -117,7 +121,7 @@ user/start.zig ─┬─ user/sys.zig ─── src/abi.zig（与内核共用的
 
 改代码时要守住的几条约定，详细原因见各篇文档：
 
-- 内核在 S 模式时 `sscratch` 为 0；在 U 模式运行时 `sscratch` 存着当前进程的内核栈顶（[trap.md](trap.md)）。
+- `sscratch`：在 U 模式运行时存着当前进程的内核栈顶；在内核里是这个 hart 的陷阱栈顶（S 模式的陷阱都在陷阱栈上处理）；正在处理 S 模式的陷阱时为 0（[trap.md](trap.md#sscratch-约定)）。
 - 内核代码全程关着中断（`sstatus.SIE = 0`）：初始化、陷阱处理、系统调用、调度器扫描进程表。中断只会打断 U 模式，或者调度器每一轮开头开中断的那一下，不会嵌套（[trap.md](trap.md)）。
 - 拿自旋锁时中断关着；切换进程（`sched`）时只拿着这个进程自己的锁，回到 U 模式时不拿着任何锁；要拿着锁等待的用 `proc.sleep(chan, lock)`；同时拿几把锁时按固定的顺序（[process.md](process.md#锁)）。
 - 进程切换只在关中断、拿着这个进程的锁时发生，并且总是经过调度器：`scheduler` ↔ 进程，进程只通过 `proc.sched` 切回，进程之间不直接切换（[process.md](process.md#切换上下文)）。一个进程同一时刻只在一个 hart 上运行。
@@ -125,6 +129,7 @@ user/start.zig ─┬─ user/sys.zig ─── src/abi.zig（与内核共用的
 - 被 kill 的进程不会再回到 U 模式：陷阱返回前、新进程第一次进入 U 模式前都检查 `killed`（[process.md](process.md#结束进程)）。
 - init（pid 1）一直存在：结束的进程由父进程回收，父进程先结束的交给 init 回收。init 结束内核就 panic。
 - 用户程序只能用根页表第 1 项；内核的映射不能放进 `0x4000_0000..0x8000_0000`（[paging.md](paging.md)）。
-- 内核从不直接解引用用户给的指针，`sstatus.SUM` 始终为 0，访问用户内存一律走 `vm.copyFromUser`（[syscalls.md](syscalls.md)）。
+- 内核从不直接解引用用户给的指针，`sstatus.SUM` 始终为 0，访问用户内存一律走 `vm.copyFromUser`（[syscalls.md](syscalls.md)）。拿着锁复制用户内存的系统调用先 `vm.prefault`：拿着锁时不能为了按需分页读盘（[paging.md](paging.md#内核访问用户内存)）。
+- 正在运行的程序文件不能改、不能删（`ETXTBSY`）：按需分页一直要从它读页（[fs.md](fs.md#正在运行的程序文件)）。
 - `TrapFrame` 的布局和 `trapEntry`/`trapExit` 的汇编绑在一起；`proc.Context` 和 `proc.contextAsm` 绑在一起。
 - 内核和用户程序都不用浮点（目标是 rv64imac），陷阱处理不保存浮点寄存器；`sstatus.FS` 在启动时清成 Off，手写的浮点指令也会触发非法指令异常（[build.md](build.md)）。

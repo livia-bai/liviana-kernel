@@ -343,9 +343,10 @@ fn replaceFd(target: sys.Fd, path: []const u8, flags: sys.OpenFlags, saved: ?*[2
   `ps` 是 shell 执行的，所以 shell 自己总是 `running`；init 总在 `wait` 里睡着。单核时 shell 占着唯一的 hart，`spin` 只能是 `runnable`；多核时它在别的 hart 上跑，显示 `running`。`TICKS` 是进程在 U 模式运行期间来过的时钟中断数，大致等于它用掉的 CPU 时间（单位 10 ms）。按槽位顺序列出，不一定按 pid 排序。结束了还没被回收的进程显示为 `zombie`。
 - `kill PID`：没有参数、`PID` 不是数字时打印 `usage: kill PID...`，没有这个进程时打印 `kill: no such process: PID`，杀 init 打印 `kill: cannot kill pid 1: permission denied`；有一个失败 `$?` 就是 1。`kill` 系统调用只做标记（[process.md](process.md#kill只做标记)），所以 shell 接着 `wait(pid)`：是自己的子进程的话，等它真的结束、回收它，`killed: kill()` 那一行就在下一个提示符之前；不是自己的子进程时 `wait` 立刻返回 `NoChildren`。
 - `kill` shell 自己（它的 pid）也可以：shell 结束，init 打印 `init: sh exited, restarting it` 并启动一个新的 shell。
-- **列程序**（`run` 单独一个，`listPrograms`）：`readdir` 给的是名字的散列的顺序，shell 把名字收进全局的数组再排序。用的是插入排序：`std.mem.sort` 是块排序，栈上有一个 512 项的缓存（512 个切片，8 KiB），Debug 模式下把 shell 16 KiB 的用户栈撑爆过（`store_page_fault`，`stval` 在保护页里，init 重启了 shell）。glob、Tab 补全也用同一个数组和排序。
-- 大的东西（行、历史、展开好的词、命令、变量、名字列表）都是全局变量，不放在 16 KiB 的用户栈上。
-- 文件操作是普通的用户程序：`ls [PATH...]`、`cat [FILE...]`、`mkdir DIR...`、`rm PATH...`、`mv OLD NEW`、`ln [-s] OLD NEW`、`scrub`（[user-programs.md](user-programs.md)）。
+- **列程序**（`run` 单独一个，`listPrograms`）：`readdir` 给的是名字的散列的顺序，shell 把名字收进全局的数组再排序。用的是插入排序：`std.mem.sort` 是块排序，栈上有一个 512 项的缓存（512 个切片，8 KiB），Debug 模式下把 shell 那时 16 KiB 的用户栈撑爆过（`store_page_fault`，`stval` 在保护页里，init 重启了 shell；现在用户栈最多 1 MiB）。glob、Tab 补全也用同一个数组和排序。
+- 大的东西（行、历史、展开好的词、命令、变量、名字列表）都是全局变量，不放在用户栈上（以前用户栈只有 16 KiB；全局变量也是按需分配的，用到哪一页才占哪一页）。
+- 文件操作是普通的用户程序：`ls [PATH...]`、`cat [FILE...]`、`mkdir DIR...`、`rm PATH...`、`mv OLD NEW`、`ln [-s] OLD NEW`、`cp`、`touch`、`scrub`（[user-programs.md](user-programs.md)）。
+- shell 没有 `if`、`while`/`for`、算术和 `$(...)`。写脚本时用程序补上（[user-programs.md](user-programs.md#写脚本用的程序)）：条件用 `test`、`grep -q`、`expr` 的退出码配合 `&&`、`||`；循环用 `seq N | xargs -n 1 程序`（每个数运行一次，比如运行一个脚本 `sh 脚本`，数是 `$1`）；算术用 `expr`。
 
 ## 例子
 

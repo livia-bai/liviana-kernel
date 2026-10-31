@@ -38,8 +38,8 @@ pub const stdin: Fd = abi.stdin;
 pub const stdout: Fd = abi.stdout;
 pub const stderr: Fd = abi.stderr;
 
-/// NotFound：打开着的文件被删掉了（ReadError 也是）
-pub const WriteError = error{ BadAddress, BadFd, BrokenPipe, NoSpace, FileTooBig, IsDir, IoError, NotFound, Unexpected };
+/// NotFound：打开着的文件被删掉了（ReadError 也是）。TextBusy：文件是正在运行的程序，不能改
+pub const WriteError = error{ BadAddress, BadFd, BrokenPipe, NoSpace, FileTooBig, IsDir, IoError, NotFound, TextBusy, Unexpected };
 
 /// 写 fd，返回写出的字节数（串口、管道遇到坏地址时可能比 bytes.len 少；文件要么全写、要么返回错误）。
 pub fn write(fd: Fd, bytes: []const u8) WriteError!usize {
@@ -53,6 +53,7 @@ pub fn write(fd: Fd, bytes: []const u8) WriteError!usize {
         .isdir => error.IsDir,
         .io => error.IoError,
         .noent => error.NotFound,
+        .txtbsy => error.TextBusy,
         else => error.Unexpected,
     };
     return ret;
@@ -138,6 +139,8 @@ pub const FsError = error{
     SymlinkLoop,
     /// 给的缓冲区放不下（getcwd）
     BufferTooSmall,
+    /// 文件是正在运行的程序，不能截断、删掉它的最后一个名字（open、unlink、rename）
+    TextBusy,
     Unexpected,
 };
 
@@ -165,6 +168,7 @@ fn fsResult(ret: usize) FsError!usize {
         .nxio => error.NoSuchDevice,
         .loop => error.SymlinkLoop,
         .range => error.BufferTooSmall,
+        .txtbsy => error.TextBusy,
         else => error.Unexpected,
     };
 }
@@ -362,7 +366,8 @@ pub fn fork() ForkError!usize {
     return ret;
 }
 
-pub const ExecError = error{ NoSuchProgram, OutOfMemory, BadElf, BadAddress, ArgsTooLong, NameTooLong, NotDir, IoError, NoDevice, SymlinkLoop, Unexpected };
+/// TextBusy：程序文件正在被改（写到一半）
+pub const ExecError = error{ NoSuchProgram, OutOfMemory, BadElf, BadAddress, ArgsTooLong, NameTooLong, NotDir, IoError, NoDevice, SymlinkLoop, TextBusy, Unexpected };
 
 /// 换成文件系统里的程序 name 运行（name 里没有 '/' 时在 /bin 里找），命令行参数是 args（按惯例第一个是程序名）。
 /// 成功时不返回。
@@ -388,6 +393,7 @@ pub fn execRaw(name: []const u8, args: []const abi.Arg) ExecError!noreturn {
         .io => error.IoError,
         .nodev => error.NoDevice,
         .loop => error.SymlinkLoop,
+        .txtbsy => error.TextBusy,
         else => error.Unexpected,
     };
 }
@@ -505,3 +511,51 @@ pub fn fprint(fd: Fd, comptime fmt: []const u8, args: anytype) void {
     var w: FdWriter = .init(fd, &buffer);
     w.print(fmt, args);
 }
+
+// ---- 按行读 ----
+
+/// 带缓冲区地按行读一个 fd（head、tail、grep、xargs 用）。
+pub const LineReader = struct {
+    fd: Fd,
+    buf: []u8,
+    start: usize = 0,
+    end: usize = 0,
+    eof: bool = false,
+
+    pub fn init(fd: Fd, buf: []u8) LineReader {
+        return .{ .fd = fd, .buf = buf };
+    }
+
+    /// 下一行，不含结尾的 '\n'（最后一行没有 '\n' 也算一行），读到结尾返回 null。
+    /// 返回的切片指向缓冲区，下一次调用之后就失效了。比缓冲区还长的行截成几段返回，每段都当成一行。
+    pub fn next(r: *LineReader) ReadError!?[]const u8 {
+        const line = try r.nextRaw() orelse return null;
+        return if (line.len > 0 and line[line.len - 1] == '\n') line[0 .. line.len - 1] else line;
+    }
+
+    /// 和 next 一样，但是带着结尾的 '\n'（有的话）：原样输出一行时用它，一次 write 写完整行，
+    /// 不会和别的进程（比如内核打印的 [proc] 那一行）的输出交错在一行中间。
+    pub fn nextRaw(r: *LineReader) ReadError!?[]const u8 {
+        while (true) {
+            if (std.mem.indexOfScalar(u8, r.buf[r.start..r.end], '\n')) |i| {
+                const line = r.buf[r.start..][0 .. i + 1];
+                r.start += i + 1;
+                return line;
+            }
+            if (r.eof or r.end - r.start == r.buf.len) {
+                // 结尾的半行，或者一整个缓冲区都没有换行
+                if (r.start == r.end) return null;
+                const line = r.buf[r.start..r.end];
+                r.start = r.end;
+                return line;
+            }
+            // 把剩下的半行挪到开头，再读一些
+            std.mem.copyForwards(u8, r.buf, r.buf[r.start..r.end]);
+            r.end -= r.start;
+            r.start = 0;
+            const n = try read(r.fd, r.buf[r.end..]);
+            if (n == 0) r.eof = true;
+            r.end += n;
+        }
+    }
+};

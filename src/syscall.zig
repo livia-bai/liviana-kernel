@@ -72,8 +72,8 @@ pub fn dispatch(frame: *TrapFrame) usize {
     };
 }
 
-fn space() *vm.PageTable {
-    return proc.current().?.space;
+fn space() *vm.Space {
+    return &proc.current().?.space;
 }
 
 fn yield() usize {
@@ -122,12 +122,16 @@ fn fileError(err: file.Error) usize {
 }
 
 /// 写 fd。中途遇到坏地址就停下，返回已经写出的字节数；一个字节都没写出才返回错误（见 file.write）。
+/// 用户内存是拿着锁（串口的输出锁、管道的锁、文件系统的写锁）复制的，那时读不了盘：
+/// 来源在程序文件的页里（比如字符串常量）、还没读进来的话，先读好（vm.prefault）。
 fn write(fd: usize, ptr: usize, len: usize) usize {
     const f = fileOf(fd) orelse return abi.fail(.badf);
+    vm.prefault(space(), ptr, len);
     return file.write(f, space(), ptr, len) catch |err| fileError(err);
 }
 
 /// 读 fd。先检查整个目标范围可写：从串口的缓冲区取出来的字符放不回去，不能取出来之后才发现写不进去。
+/// 检查时顺便把还没分配的页都分配好（按需分页），之后拿着锁写进去时不用再读盘。
 fn read(fd: usize, ptr: usize, len: usize) usize {
     const f = fileOf(fd) orelse return abi.fail(.badf);
     if (len == 0) return 0;
@@ -266,14 +270,19 @@ fn open(path_ptr: usize, path_len: usize, flags: usize) usize {
 
 /// 找到（或者建好、截断）要打开的 inode，返回它的 Stat。root 是读者的话 flags 里不会有要改文件系统的（见 open）。
 /// 跟着符号链接走；没有并且带 open_create 时建文件，最后一段是悬空的符号链接的话建的是它指向的那个（createFollow）。
-fn openPath(root: *Fs, cwd: u64, path: []const u8, flags: usize, writable: bool) fs.Error!fs.Stat {
+/// 正在运行的程序文件不能截断（TextBusy，见 fsys.holdText）。
+fn openPath(root: *Fs, cwd: u64, path: []const u8, flags: usize, writable: bool) (fs.Error || error{TextBusy})!fs.Stat {
     const ino = root.resolve(cwd, path) catch |err| switch (err) {
         error.NotFound => if (flags & abi.open_create != 0) return root.stat(try root.run(Fs.createFollow, .{ cwd, path })) else return err,
         else => return err,
     };
     const st = try root.stat(ino);
     if (st.kind == .dir and writable) return error.IsDir;
-    if (flags & abi.open_trunc != 0 and writable and st.size > 0) try root.run(Fs.truncate, .{ino}); // 设备、目录的 size 是 0
+    if (flags & abi.open_trunc != 0 and writable and st.size > 0) { // 设备、目录的 size 是 0
+        try fsys.beginModify(ino);
+        defer fsys.endModify();
+        try root.run(Fs.truncate, .{ino});
+    }
     return st;
 }
 
@@ -291,6 +300,9 @@ fn pathOp(path_ptr: usize, path_len: usize, op: PathOp) usize {
             if (op == .mkdir) {
                 _ = root.run(Fs.create, .{ p.cwd, path, .dir }) catch |err| return abi.fail(fsys.errno(err));
             } else {
+                // 删掉正在运行的程序文件的最后一个名字：TextBusy
+                const guarded = fsys.beginRemove(root, p.cwd, path) catch return abi.fail(.txtbsy);
+                defer if (guarded) fsys.endModify();
                 root.run(Fs.unlink, .{ p.cwd, path }) catch |err| return abi.fail(fsys.errno(err));
             }
         },
@@ -307,14 +319,20 @@ fn pathOp(path_ptr: usize, path_len: usize, op: PathOp) usize {
 }
 
 /// 两个路径都先复制进内核，再拿着文件系统的写锁一个事务改名（fs.Fs.rename）。
+/// 新名字已经有了、是正在运行的程序文件的最后一个名字的话，它会被换掉（删掉）：TextBusy。
+/// 两个名字是同一个 inode 时 rename 什么都不做，不用检查。
 fn rename(old_ptr: usize, old_len: usize, new_ptr: usize, new_len: usize) usize {
     var old_buf: [abi.max_path]u8 = undefined;
     var new_buf: [abi.max_path]u8 = undefined;
     const old = userPath(old_ptr, old_len, &old_buf) catch |err| return abi.fail(fsys.errno(err));
     const new = userPath(new_ptr, new_len, &new_buf) catch |err| return abi.fail(fsys.errno(err));
+    const cwd = proc.current().?.cwd;
     const root = fsys.writer() catch return abi.fail(.nodev);
     defer fsys.unlock();
-    root.run(Fs.rename, .{ proc.current().?.cwd, old, new }) catch |err| return abi.fail(fsys.errno(err));
+    const same = if (root.resolveNoFollow(cwd, old)) |a| (if (root.resolveNoFollow(cwd, new)) |b| a == b else |_| false) else |_| false;
+    const guarded = if (same) false else fsys.beginRemove(root, cwd, new) catch return abi.fail(.txtbsy);
+    defer if (guarded) fsys.endModify();
+    root.run(Fs.rename, .{ cwd, old, new }) catch |err| return abi.fail(fsys.errno(err));
     return 0;
 }
 
@@ -425,6 +443,7 @@ fn fstat(fd: usize, ptr: usize) usize {
 fn readdir(fd: usize, ptr: usize) usize {
     const f = fileOf(fd) orelse return abi.fail(.badf);
     if (f.kind != .inode) return abi.fail(.notdir);
+    vm.prefault(space(), ptr, @sizeOf(abi.Dirent)); // 下面拿着 pos_lock 写进用户内存，那时读不了盘
     f.pos_lock.acquire();
     defer f.pos_lock.release();
     var r = fsys.reader() catch return abi.fail(.nodev);
@@ -504,6 +523,7 @@ fn exec(path_ptr: usize, path_len: usize, argv_ptr: usize, argc: usize) usize {
         error.NotDir => .notdir,
         error.NameTooLong => .nametoolong,
         error.SymlinkLoop => .loop,
+        error.TextBusy => .txtbsy,
     });
     return argc;
 }

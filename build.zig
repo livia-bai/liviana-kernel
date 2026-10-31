@@ -44,6 +44,10 @@ pub fn build(b: *std.Build) void {
         .{ .name = "echo" },  .{ .name = "cat" },   .{ .name = "wc" },
         .{ .name = "ls" },    .{ .name = "mkdir" }, .{ .name = "rm" },
         .{ .name = "scrub" }, .{ .name = "mv" },    .{ .name = "ln" },
+        .{ .name = "test" },  .{ .name = "expr" },  .{ .name = "seq" },
+        .{ .name = "sleep" }, .{ .name = "head" },  .{ .name = "tail" },
+        .{ .name = "grep" },  .{ .name = "cp" },    .{ .name = "touch" },
+        .{ .name = "tee" },   .{ .name = "xargs" },
     };
     const test_programs = [_]UserProgram{
         .{ .name = "t_sys", .dir = "user/tests" },
@@ -65,6 +69,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "t_disk", .dir = "user/tests" },
         .{ .name = "t_fs", .dir = "user/tests" },
         .{ .name = "t_fsmp", .dir = "user/tests" },
+        .{ .name = "t_demand", .dir = "user/tests" },
         // 数据段没有任何权限，用来验证 ELF 加载器会拒绝它
         .{ .name = "t_noperm", .dir = "user/tests", .linker_script = "user/tests/noperm.ld" },
     };

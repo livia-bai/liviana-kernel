@@ -12,13 +12,13 @@ liviana-kernel 的详细文档，按功能组织，讲这个用 Zig 写的 RISC-
 | [build.md](build.md) | 构建系统：目标平台、优化模式、用户程序的编译和嵌入、QEMU 运行步骤 |
 | [boot.md](boot.md) | 启动流程：OpenSBI 交接、链接脚本、`_start`、每个 hart 的启动栈、`kmain` 的初始化顺序、启动其他 hart、交给调度器、panic 时让所有 hart 停下 |
 | [riscv-sbi.md](riscv-sbi.md) | CSR 访问和 SBI 调用 |
-| [trap.md](trap.md) | 陷阱处理：异常委托、`TrapFrame`、`sscratch` 和 `tp` 约定、入口/出口汇编、分发 |
+| [trap.md](trap.md) | 陷阱处理：异常委托、`TrapFrame`、`sscratch` 和 `tp` 约定、陷阱栈、入口/出口汇编、分发、内核栈溢出 |
 | [devices.md](devices.md) | 串口（含输入缓冲区和 Ctrl-C）、PLIC、定时器 |
 | [devicetree.md](devicetree.md) | 设备树：格式、解析器、QEMU 给的内容、错误和限制 |
 | [page-allocator.md](page-allocator.md) | 物理页分配器、每一页的引用数 |
-| [paging.md](paging.md) | Sv39 分页：页表格式、建立映射、内核页表、用户地址空间、`fork` 的写时复制 |
-| [user-programs.md](user-programs.md) | 用户程序：运行时（`start.zig`、`sys.zig`）、示例程序、怎么写新程序 |
-| [process.md](process.md) | 进程：进程表、ELF 加载器、`userinit`/`fork`/`exec`、命令行参数、`sbrk`、xv6 式调度（每个 hart 的 `scheduler`、`sched`/`sleep`/`wakeup`）、核间中断、切换上下文、`exit`/`wait`/`kill`、Ctrl-C、锁和加锁顺序 |
+| [paging.md](paging.md) | Sv39 分页：页表格式、建立映射、内核页表（内核栈的保护页）、用户地址空间、按需分页、`fork` 的写时复制 |
+| [user-programs.md](user-programs.md) | 用户程序：运行时（`start.zig`、`sys.zig`）、示例程序、写脚本用的程序（`test`、`expr`、`xargs`……）、怎么写新程序 |
+| [process.md](process.md) | 进程：进程表、ELF 加载器、按需分页、`userinit`/`fork`/`exec`、命令行参数、`sbrk`、xv6 式调度（每个 hart 的 `scheduler`、`sched`/`sleep`/`wakeup`）、核间中断、切换上下文、`exit`/`wait`/`kill`、Ctrl-C、锁和加锁顺序 |
 | [disk.md](disk.md) | 磁盘：virtio 块设备驱动、睡眠锁、缓冲区缓存、读写块的系统调用 |
 | [btree.md](btree.md) | 写时复制 B 树（文件系统的基础，类似 btrfs）：节点格式、写时复制、事务和提交、空闲空间、掉电测试 |
 | [fs.md](fs.md) | 文件系统：inode、目录、文件内容（内联、数据块、洞、校验和），每个操作一个事务，接进内核（挂载、锁、系统调用、当前目录），`mkfs`，掉电测试 |
@@ -48,14 +48,15 @@ liviana-kernel 的详细文档，按功能组织，讲这个用 Zig 写的 RISC-
 | `src/btree.zig` | [btree.md](btree.md#节点格式btreezig) | |
 | `src/ctree.zig` | [btree.md](btree.md) | [disk.md](disk.md#缓冲区缓存biozig) |
 | `src/fs.zig` | [fs.md](fs.md) | [btree.md](btree.md) |
-| `src/fsys.zig` | [fs.md](fs.md#接进内核fsyszig) | [files.md](files.md)、[disk.md](disk.md#系统调用) |
+| `src/fsys.zig` | [fs.md](fs.md#接进内核fsyszig) | [fs.md](fs.md#正在运行的程序文件)、[files.md](files.md)、[disk.md](disk.md#系统调用) |
 | `src/mkfs.zig` | [fs.md](fs.md#生成磁盘镜像mkfszig) | [build.md](build.md#磁盘镜像) |
 | `src/ipi.zig` | [process.md](process.md#核间中断) | [riscv-sbi.md](riscv-sbi.md#用到的扩展)、[trap.md](trap.md#分发) |
 | `src/dtb.zig` | [devicetree.md](devicetree.md) | |
 | `src/page.zig` | [page-allocator.md](page-allocator.md) | |
-| `src/vm.zig` | [paging.md](paging.md) | [syscalls.md](syscalls.md#访问用户内存) |
+| `src/vm.zig` | [paging.md](paging.md) | [syscalls.md](syscalls.md#访问用户内存)、[process.md](process.md#按需分页) |
 | `src/proc.zig` | [process.md](process.md) | |
 | `src/canary.zig` | [process.md](process.md#进程表) | [boot.md](boot.md#每个-hart-的启动栈) |
+| `src/kstack.zig` | [process.md](process.md#进程表) | [trap.md](trap.md#内核栈溢出)、[paging.md](paging.md#内核页表)、[boot.md](boot.md#每个-hart-的启动栈) |
 | `src/spinlock.zig` | [process.md](process.md#锁) | [boot.md](boot.md#panic) |
 | `src/file.zig` | [files.md](files.md) | [syscalls.md](syscalls.md#closeduppipe) |
 | `src/pipe.zig` | [files.md](files.md#管道) | |
@@ -70,6 +71,7 @@ liviana-kernel 的详细文档，按功能组织，讲这个用 Zig 写的 RISC-
 | `user/echo.zig`、`user/cat.zig`、`user/wc.zig` | [user-programs.md](user-programs.md#echocatwc) | [shell.md](shell.md#管道) |
 | `user/ls.zig`、`user/mkdir.zig`、`user/rm.zig`、`user/mv.zig`、`user/ln.zig` | [user-programs.md](user-programs.md#lsmkdirrmmvln) | [fs.md](fs.md) |
 | `user/scrub.zig` | [user-programs.md](user-programs.md#scrub) | [fs.md](fs.md#检查整个文件系统checkscrub) |
+| `user/test.zig`、`user/expr.zig`、`user/seq.zig`、`user/sleep.zig`、`user/head.zig`、`user/tail.zig`、`user/grep.zig`、`user/cp.zig`、`user/touch.zig`、`user/tee.zig`、`user/xargs.zig` | [user-programs.md](user-programs.md#写脚本用的程序) | [shell.md](shell.md) |
 | `user/tests/*.zig`、`user/tests/noperm.ld` | [testing.md](testing.md#回归测试程序) | [build.md](build.md#用户程序) |
 | `src/tests.zig` | [testing.md](testing.md#单元测试zig-build-test) | [build.md](build.md#单元测试) |
 | `tools/qemu_test.py` | [testing.md](testing.md#qemu-测试toolsqemu_testpy) | |

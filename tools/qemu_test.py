@@ -9,7 +9,7 @@
   python3 tools/qemu_test.py --smp 4          # 只用 4 个 hart 跑（可以给几个；默认 1 和 4 各跑一遍）
 
 每种模式只构建一次（带上 user/tests/ 里的测试程序），所有用例共用一次启动。启动日志每次都检查；
-结束时比较前后两次 mem 的空闲页数（不能漏页）、shutdown 后 QEMU 的退出码必须为 0、输出里不能有 KERNEL PANIC。
+结束时比较前后两次 mem 的空闲页数（不能漏页；两次都在新启动的 shell 里看，见 fresh_mem）、shutdown 后 QEMU 的退出码必须为 0、输出里不能有 KERNEL PANIC。
 """
 
 import argparse
@@ -34,8 +34,8 @@ SPIN_SECONDS = 0.5  # 让 spin 转多久再按 Ctrl-C
 MIN_SPIN_TICKS = 10  # 这段时间里至少要有多少次时钟中断（100 Hz 下理论上约 50 次）
 TIMEBASE_HZ = 10_000_000  # QEMU virt 的 time CSR 频率
 
-# 用户地址空间里栈下面那一页保护页（src/proc.zig）
-GUARD_PAGE = (0x7FFFB000, 0x7FFFC000)
+# 用户地址空间里栈下面那一页保护页（src/vm.zig 的 heap_limit..stack_limit，栈最多 1 MiB）
+GUARD_PAGE = (0x7FEFF000, 0x7FF00000)
 USER_SPACE = (0x40000000, 0x80000000)
 MAX_PROCS = 64  # src/abi.zig 的 max_procs，其中两个槽位是 init 和 sh
 MAX_ARGS = 32  # src/abi.zig 的 max_args
@@ -179,8 +179,8 @@ def case_shell(q, c, mode):
     c.contains(q.command("uptime"), r"up \d+\.\d\ds\n", "uptime")
     c.contains(q.command("nope"), r"unknown command: nope", "unknown command")
     # /bin 里的程序按名字排序（测试程序 t_* 也在里面）
-    c.contains(q.command("run"), r"programs: cat echo fault hello init ln ls mkdir mv rm scrub sh spin( t_\w+)+ ticker wc\n",
-               "run without a name")
+    c.contains(q.command("run"), r"programs: cat cp echo expr fault grep head hello init ln ls mkdir mv rm scrub seq sh sleep spin"
+               r"( t_\w+)+ tail tee test ticker touch wc xargs\n", "run without a name")
     c.contains(q.command("run nope"), r"no such program: nope\nprograms: ", "run nope")
     # 不写 run，直接写程序名；管道、重定向照样能用。不是内置命令也不是程序的才是 unknown command
     out = q.command("hello")
@@ -579,7 +579,11 @@ def case_pipe(q, c, mode):
 
 
 def case_sbrk(q, c, mode):
-    check_counts(c, q.command("run t_sbrk"), "t_sbrk")
+    # 按需分配：堆比空闲内存还大时，把它写满的子进程在内存用完时被结束
+    out = q.command("run t_sbrk")
+    c.contains(out, r"\[proc\] pid \d+ \(t_sbrk\) killed: out of memory \(demand paging\) at 0x[0-9a-f]+, stval=0x[0-9a-f]+\n",
+               "run t_sbrk: touching more heap than there is memory")
+    check_counts(c, out, "t_sbrk")
 
 
 def case_cow(q, c, mode):
@@ -591,6 +595,110 @@ def case_cow(q, c, mode):
     c.contains(out, r"\[proc\] pid \d+ \(t_cow\) killed: out of memory \(copy-on-write\) at 0x[0-9a-f]+, stval=0x[0-9a-f]+\n",
                "run t_cow: writing a shared page without memory")
     check_counts(c, out, "t_cow")
+
+
+def case_demand(q, c, mode):
+    # 按需分页：t_demand 自己检查程序的页用到才读进来、内核替它访问没读进来的页、栈按需长、
+    # 正在运行的程序文件不能改不能删
+    out = q.command("run t_demand")
+    m = c.contains(out, r"reading 16 untouched pages of the program used (\d+) pages\n", "run t_demand")
+    c.contains(out, r"\nthis line comes from a page that was never touched\n", "run t_demand: console write")
+    c.contains(out, r"512 KiB of stack used \d+ pages\n", "run t_demand: deep stack")
+    check_counts(c, out, "t_demand")
+
+
+def no_proc_lines(out):
+    """去掉内核打印的 [proc] 那几行（每个程序结束时一行），剩下的是程序自己的输出。"""
+    return "\n".join(l for l in out.split("\n") if not l.startswith("[proc] "))
+
+
+def case_tools(q, c, mode):
+    """写脚本用的程序：test、expr、seq、sleep、head、tail、grep、cp、touch、tee、xargs。"""
+    def out_of(cmd):
+        return no_proc_lines(q.command(cmd))
+
+    for cmd, pattern in [
+        ("seq 3", r"\n1\n2\n3\n> $"),
+        ("seq 10 -3 1", r"\n10\n7\n4\n1\n> $"),
+        ("seq 2 2", r"\n2\n> $"),
+        ("seq 3 1", r"seq 3 1\n> $"),  # 一个都没有
+        ("seq 1 0 3", r"seq: the step must not be 0\n"),
+        ("seq 20 | head -n 3", r"\n1\n2\n3\n> $"),
+        ("seq 20 | head | wc", r"\n10 10 21\n"),
+        ("seq 5 | tail -n 2", r"\n4\n5\n> $"),
+        ("seq 3 | tail -n 0", r"tail -n 0\n> $"),
+        ("seq 3 | tail -n 9", r"\n1\n2\n3\n> $"),
+        ("seq 3000 | tail -n 1", r"\n3000\n> $"),  # 输入比一次 read 大
+        ("seq 12 | grep -n 1", r"\n1:1\n10:10\n11:11\n12:12\n> $"),
+        ("seq 12 | grep -c '^1.$'", r"\n3\n> $"),
+        ("seq 12 | grep -v 1", r"\n2\n3\n4\n5\n6\n7\n8\n9\n> $"),
+        ("echo aab ab b | xargs -n 1 | grep '^a*b$'", r"\naab\nab\nb\n> $"),
+        ("echo Hello | grep -i hello", r"\nHello\n> $"),
+        ("echo a.c abc | grep -c 'a\\.c'", r"\n1\n> $"),
+        ("echo xyz | grep 'x.*z$' && echo hit", r"\nxyz\nhit\n"),
+        ("echo abc | grep -q d; echo $?", r"\n1\n> $"),
+        ("grep x /nope; echo $?", r"grep: /nope: NotFound\n2\n"),
+        ("expr 2 + 3 '*' 4", r"\n14\n> $"),
+        ("expr '(' 2 + 3 ')' '*' 4 - -6", r"\n26\n> $"),
+        ("expr 7 / 2; expr 7 % 2; expr -7 / 2", r"\n3\n1\n-3\n> $"),
+        ("expr 3 '<' 5 '&' 2 = 2", r"\n1\n> $"),
+        ("expr 0 '|' 5", r"\n5\n> $"),
+        ("expr 1 - 1; echo $?", r"\n0\n1\n> $"),
+        ("expr 7 / 0; echo $?", r"expr: division by zero\n2\n"),
+        ("expr 9223372036854775807 + 1", r"expr: overflow\n"),
+        ("expr 1 +", r"expr: syntax error\n"),
+        ("expr x + 1", r"expr: not a number: 'x'\n"),
+        ("test 3 -lt 10 && echo yes", r"\nyes\n"),
+        ("test -5 -ge -4 || echo no", r"\nno\n"),
+        ("test -d /bin -a ! -f /bin && echo dir", r"\ndir\n"),
+        ("test abc = abd || echo differ", r"\ndiffer\n"),
+        ("test ! = ! && echo eq", r"\neq\n"),
+        ("test -z '' -a -n x && echo zn", r"\nzn\n"),
+        ("test ( 1 -eq 2 -o 2 -eq 2 ) -a x && echo paren", r"\nparen\n"),
+        ("test; echo $?", r"\n1\n> $"),
+        ("test 1 -eq x; echo $?", r"test: not an integer: 'x'\n2\n"),
+        ("test -e /nope || echo missing", r"\nmissing\n"),
+        ("echo a b c d e | xargs -n 2", r"\na b\nc d\ne\n> $"),
+        ("seq 3 | xargs", r"\n1 2 3\n> $"),
+        ("seq 2 4 | xargs -n 1 echo hi", r"\nhi 2\nhi 3\nhi 4\n> $"),
+        ("seq 3 | xargs -n 1 test 2 -eq; echo $?", r"\n123\n> $"),
+        ("echo x | xargs nope; echo $?", r"xargs: nope: NoSuchProgram\n127\n"),
+        ("sleep 0.05 && echo slept", r"\nslept\n"),
+        ("sleep x", r"sleep: invalid time: 'x'\n"),
+    ]:
+        c.contains(out_of(cmd), pattern, cmd)
+
+    # 文件：cp、touch、tee
+    q.command("mkdir /ttools")
+    for cmd, pattern in [
+        ("echo hello > /ttools/a; cp /ttools/a /ttools/b; cat /ttools/b", r"\nhello\n> $"),
+        ("cp /ttools/a /ttools/./a; cat /ttools/a", r"cp: /ttools/a and /ttools/./a are the same file\nhello\n"),
+        ("mkdir /ttools/d; cp /ttools/a /ttools/b /ttools/d; ls /ttools/d", r"\nfile +1 +6 a\nfile +1 +6 b\n"),
+        ("cp /ttools/a /ttools/b /ttools/nodir", r"cp: /ttools/nodir: not a directory\n"),
+        ("cp /ttools/d /ttools/e", r"cp: /ttools/d: IsDir\n"),
+        ("touch /ttools/c /ttools/a; test -f /ttools/c -a ! -s /ttools/c -a -s /ttools/a && echo touched", r"\ntouched\n"),
+        ("seq 3 | tee /ttools/t | wc; cat /ttools/t", r"\n3 3 6\n1\n2\n3\n> $"),
+        ("echo 4 | tee -a /ttools/t > /dev/null; tail -n 2 /ttools/t", r"\n3\n4\n> $"),
+        ("head -n 1 /ttools/t /ttools/a", r"\n==> /ttools/t <==\n1\n\n==> /ttools/a <==\nhello\n> $"),
+        ("grep -n l /ttools/a /ttools/t", r"\n/ttools/a:1:hello\n> $"),
+    ]:
+        c.contains(out_of(cmd), pattern, cmd)
+    # 一个用这些程序的脚本：数到 3，每个数判断奇偶
+    q.command("echo 'seq 3 | xargs -n 1 sh /ttools/odd.sh' > /ttools/count.sh")
+    q.command("echo 'expr $1 % 2 > /dev/null && echo $1 odd || echo $1 even' > /ttools/odd.sh")
+    c.contains(out_of("sh /ttools/count.sh"), r"\n1 odd\n2 even\n3 odd\n", "sh /ttools/count.sh")
+    # 正在运行的程序不能被覆盖、删掉（按需分页要从它读页）；结束之后可以
+    q.command("cp /bin/spin /ttools/s")
+    m = c.contains(q.command("/ttools/s &"), r"\[proc\] pid (\d+) \(/ttools/s\) started in the background", "/ttools/s &")
+    if m:
+        q.wait_for(lambda t: re.search(rf"pid {m.group(1)} spinning", t), COMMAND_TIMEOUT, "/ttools/s to start")
+        c.contains(out_of("cp /bin/hello /ttools/s"), r"cp: /ttools/s: TextBusy\n", "cp over a running program")
+        c.contains(out_of("rm /ttools/s"), r"rm: /ttools/s: TextBusy\n", "rm a running program")
+        q.command(f"kill {m.group(1)}")
+        out = q.command("cp /bin/hello /ttools/s && /ttools/s")
+        c.contains(out, r"Hello from U-mode!", "cp over a program after it exited")
+    q.command("rm /ttools/d/a /ttools/d/b /ttools/d /ttools/a /ttools/b /ttools/c /ttools/t /ttools/s /ttools/count.sh /ttools/odd.sh /ttools")
+    c.contains(q.command("ls /ttools"), r"ls: /ttools: NotFound", "cleanup /ttools")
 
 
 def case_ipi(q, c, mode):
@@ -866,7 +974,7 @@ def case_smp(q, c, mode):
 # 每个用例覆盖的文件。改了 CORE 里的文件（或者没列出的内核文件）就跑全部用例。
 CORE = ["build.zig", "linker.ld", "src/main.zig", "src/riscv.zig", "src/trap.zig", "src/vm.zig", "src/page.zig",
         "src/dtb.zig", "src/uart.zig", "src/proc.zig", "src/syscall.zig", "src/abi.zig", "src/spinlock.zig", "src/hart.zig", "src/ipi.zig",
-        "src/canary.zig",
+        "src/canary.zig", "src/kstack.zig",
         "src/file.zig", "user/start.zig", "user/sys.zig", "user/init.zig", "user/sh.zig", "tools/qemu_test.py"]
 NOT_KERNEL = ["src/tests.zig"]  # 只在单元测试里用
 CASES = {
@@ -887,6 +995,11 @@ CASES = {
                          "user/tests/t_args.zig"]),
     "sbrk": (case_sbrk, ["user/tests/t_sbrk.zig"]),
     "cow": (case_cow, ["user/tests/t_cow.zig"]),
+    "demand": (case_demand, ["src/fsys.zig", "user/spin.zig", "user/tests/t_demand.zig"]),
+    "tools": (case_tools, ["src/fsys.zig", "user/test.zig", "user/expr.zig", "user/seq.zig", "user/sleep.zig", "user/head.zig",
+                           "user/tail.zig", "user/grep.zig", "user/cp.zig", "user/touch.zig", "user/tee.zig", "user/xargs.zig",
+                           "user/echo.zig", "user/cat.zig", "user/wc.zig", "user/ls.zig", "user/rm.zig", "user/spin.zig",
+                           "user/hello.zig"]),
     "ipi": (case_ipi, ["src/sbi.zig", "user/tests/t_ipi.zig"]),
     "disk": (case_disk, ["src/sleeplock.zig", "src/bio.zig", "src/virtio_disk.zig", "src/fsys.zig", "src/mkfs.zig",
                          "user/tests/t_disk.zig"]),
@@ -941,13 +1054,24 @@ def check_boot(q, c, smp):
         r"\[trap\] breakpoint at 0x[0-9a-f]+, skipping it",
         rf"\[ok\] device tree: \d+ MiB RAM at 0x80000000, timebase {TIMEBASE_HZ} Hz",
         r"\[ok\] page allocator: \d+ free pages",
-        r"\[ok\] Sv39 paging enabled",
+        r"\[ok\] Sv39 paging enabled: .*, 80 stack guard pages unmapped\n",
+        r"\[ok\] stack overflow check: hitting a guard page traps onto the trap stack\n",
         r"\[ok\] virtio disk: 8192 blocks of 4 KiB \(32 MiB\), irq 1\n",
         rf"\[ok\] file system: \d+ of {FS_BLOCKS} blocks free, generation \d+\n",
         r"\[ok\] interrupt sources enabled: timer at 100 Hz, keyboard via UART \+ PLIC, IPIs, disk\n",
         rf"\[ok\] {smp} harts? running, booted on hart \d+\n",
     ]:
         c.contains(text, pattern, "boot log")
+
+
+def fresh_mem(q, c):
+    """在一个新的 shell 里看空闲页数，用来比较前后有没有漏页。
+    按需分页：进程的页用到才分配，一直在运行的 shell 执行过的命令越多、用到的页越多，前后直接比较不出漏页。
+    所以每次都先让 shell 自己结束，init 重新启动一个（init 自己的这段代码第一次就分配好了），新的 shell 第一条命令就是 mem，
+    两次走的是同一条路，用到的页一样多。"""
+    out = q.command("kill $$")
+    c.contains(out, r"init: sh exited, restarting it\n", "kill $$ before mem")
+    return free_pages(q.command("mem"))
 
 
 def run_session(kernel, disk, log_path, names, mode, smp):
@@ -958,13 +1082,13 @@ def run_session(kernel, disk, log_path, names, mode, smp):
     q = Qemu(kernel, smp, disk)
     try:
         check_boot(q, session, smp)
-        before = free_pages(q.command("mem"))
+        before = fresh_mem(q, session)
         for name in names:
             current = Checks()
             results.append((name, current))
             CASES[name][0](q, current, mode)
         current = session  # 收尾的检查也记在 boot 上
-        after = free_pages(q.command("mem"))
+        after = fresh_mem(q, session)
         session.expect(before is not None and before == after, f"mem: free pages changed from {before} to {after} (leak?)")
         q.send("shutdown\r")
         code = q.finish(COMMAND_TIMEOUT)

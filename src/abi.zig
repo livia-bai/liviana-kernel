@@ -231,6 +231,8 @@ pub const Errno = enum(usize) {
     pipe = 32,
     /// 不能 lseek 的文件（串口、管道）
     spipe = 29,
+    /// 文件正在被运行，不能改、不能删（write、截断、unlink、rename 换掉它）；或者正在被改，不能运行（exec）
+    txtbsy = 26,
     /// 没有这个系统调用
     nosys = 38,
     _,

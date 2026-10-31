@@ -104,14 +104,14 @@ pub fn errnoOf(ret: usize) ?Errno      // 返回值在 [-4095, -1] 内时取出�
 | 号 | 调用 | 参数 | 返回 | 说明 |
 | --- | --- | --- | --- | --- |
 | 0 | `exit` | `a0` = 退出码 | 不返回 | 只取低 8 位（`@truncate` 成 `u8`）。打印 `[proc] pid N (NAME) exited with code C`，变成 zombie 等父进程回收（[process.md](process.md#结束进程)） |
-| 1 | `write` | `a0` = fd，`a1` = 用户缓冲区地址，`a2` = 长度 | 写出的字节数；`-EBADF`、`-EFAULT`、`-EPIPE`；文件：`-ENOSPC`、`-EFBIG`、`-EIO`、`-ENOENT`（文件被删了） | 写进串口、管道或文件，详见下文 |
+| 1 | `write` | `a0` = fd，`a1` = 用户缓冲区地址，`a2` = 长度 | 写出的字节数；`-EBADF`、`-EFAULT`、`-EPIPE`；文件：`-ENOSPC`、`-EFBIG`、`-EIO`、`-ENOENT`（文件被删了）、`-ETXTBSY`（文件是正在运行的程序） | 写进串口、管道或文件，详见下文 |
 | 2 | `getpid` | 无 | 进程号 | 每创建一个进程加 1，不复用。init 是 1，shell 是 2 |
 | 3 | `uptime` | 无 | 开机以来的毫秒数 | `timer.uptimeMs()`，精度 10 ms（一个时钟 tick） |
 | 4 | `yield` | 无 | 0 | 让出 CPU：回到调度器，别的 runnable 进程先运行，轮到它时返回。没有别的 runnable 进程时很快就会返回 |
 | 5 | `sleep` | `a0` = 毫秒数 | 0 | 睡至少 `a0` 毫秒（按 10 ms 的 tick 向上取整），期间不被调度、不占 CPU。`0` 立刻返回 |
 | 6 | `read` | `a0` = fd，`a1` = 缓冲区地址，`a2` = 长度 | 读到的字节数，0 表示读到结尾；`-EBADF`、`-EFAULT`；文件：`-EISDIR`、`-EIO`、`-ENOENT` | 从串口、管道或文件读，详见下文 |
 | 7 | `fork` | 无 | 父进程得到子进程的 pid，子进程得到 0；或 `-EAGAIN`、`-ENOMEM` | 复制当前进程（[process.md](process.md#fork)） |
-| 8 | `exec` | `a0` = 路径地址，`a1` = 路径长度，`a2` = `Arg` 数组的地址，`a3` = 参数个数 | 成功时不返回（新程序的 `a0` = 参数个数）；`-ENOENT`、`-ENOEXEC`、`-ENOMEM`、`-EFAULT`、`-E2BIG`、`-ENAMETOOLONG`、`-ENOTDIR`、`-ELOOP`、`-EIO`、`-ENODEV` | 换成文件系统里的程序运行（名字里没有 `/` 时在 `/bin` 里找，跟着符号链接走），打开的文件不变，详见下文 |
+| 8 | `exec` | `a0` = 路径地址，`a1` = 路径长度，`a2` = `Arg` 数组的地址，`a3` = 参数个数 | 成功时不返回（新程序的 `a0` = 参数个数）；`-ENOENT`、`-ENOEXEC`、`-ENOMEM`、`-EFAULT`、`-E2BIG`、`-ENAMETOOLONG`、`-ENOTDIR`、`-ELOOP`、`-EIO`、`-ENODEV`、`-ETXTBSY`（程序文件正在被改） | 换成文件系统里的程序运行（名字里没有 `/` 时在 `/bin` 里找，跟着符号链接走），打开的文件不变，详见下文 |
 | 9 | `wait` | `a0` = pid（`wait_any` 表示任意一个），`a1` = 状态的地址（0 表示不要），`a2` = options | 回收的子进程的 pid；`nohang` 时没有已结束的子进程返回 0；`-ECHILD`、`-EFAULT`、`-EINVAL` | 详见下文 |
 | 10 | `kill` | `a0` = pid | 0；`-ESRCH`、`-EPERM`（init） | 只做标记，目标进程回到 U 模式之前结束（[process.md](process.md#kill只做标记)） |
 | 11 | `getppid` | 无 | 父进程的 pid；init 是 0 | |
@@ -123,18 +123,18 @@ pub fn errnoOf(ret: usize) ?Errno      // 返回值在 [-4095, -1] 内时取出�
 | 17 | `close` | `a0` = fd | 0；`-EBADF` | 关掉 fd。是这个文件的最后一个引用的话，真正关掉它（[files.md](files.md)） |
 | 18 | `dup` | `a0` = fd | 新的 fd；`-EBADF`、`-EMFILE` | 编号最小的空闲 fd 指向同一个文件 |
 | 19 | `pipe` | `a0` = 两个 `u32` 的地址 | 0；`-EFAULT`、`-EMFILE`、`-ENFILE`、`-ENOMEM` | 创建管道，读端、写端的 fd 写进 `a0` 指向的地方（[files.md](files.md#管道)） |
-| 20 | `sbrk` | `a0` = 增量（有符号） | 原来的堆末尾；`-ENOMEM`、`-EINVAL` | 堆变大或变小（[process.md](process.md#sbrk堆)）。`sbrk(0)` 只查询 |
+| 20 | `sbrk` | `a0` = 增量（有符号） | 原来的堆末尾；`-ENOMEM`、`-EINVAL` | 堆变大或变小（[process.md](process.md#sbrk堆)）。`sbrk(0)` 只查询。变大时不分配页，用到时才分配（按需分页），所以比空闲内存大也能成功；堆比整个物理内存还大时才是 `-ENOMEM` |
 | 21 | `blockcount` | 无 | 磁盘的原始区域（文件系统之后的块）有多少块，没有磁盘时是 0 | 每块 `abi.block_size` = 4096 字节（[disk.md](disk.md#系统调用)） |
 | 22 | `readblock` | `a0` = 块号，`a1` = 缓冲区地址 | 0；`-EINVAL`（块号超出原始区域）、`-ENODEV`、`-EFAULT` | 经过缓冲区缓存读原始区域的一块，4096 字节写进缓冲区 |
 | 23 | `writeblock` | `a0` = 块号，`a1` = 缓冲区地址 | 0；`-EINVAL`、`-ENODEV`、`-EFAULT` | 缓冲区的 4096 字节写到原始区域的这一块，写完才返回 |
-| 24 | `open` | `a0` = 路径地址，`a1` = 路径长度，`a2` = flags | 新的 fd；`-ENOENT`、`-ENOTDIR`、`-EISDIR`、`-EEXIST`、`-ENAMETOOLONG`、`-EINVAL`、`-ELOOP`、`-ENOSPC`、`-EIO`、`-ENODEV`、`-EFAULT`、`-ENFILE`、`-EMFILE`、`-ENXIO`（不认识的设备） | 打开文件、目录或设备文件（[fs.md](fs.md#接进内核fsyszig)，设备见 [files.md](files.md#设备文件)）。flags：`open_read`/`open_write`/`open_rdwr` 加上 `open_create`（没有就建一个空文件）、`open_trunc`（可写时截成 0 字节）、`open_append`（0x800，每次写都写在末尾）；别的位、读写方式是 3 都是 `-EINVAL`。目录只能只读地打开。相对路径从当前目录开始。跟着符号链接走；带 `open_create` 时最后一段是悬空的符号链接的话，建的是它指向的文件 |
+| 24 | `open` | `a0` = 路径地址，`a1` = 路径长度，`a2` = flags | 新的 fd；`-ENOENT`、`-ENOTDIR`、`-EISDIR`、`-EEXIST`、`-ENAMETOOLONG`、`-EINVAL`、`-ELOOP`、`-ENOSPC`、`-EIO`、`-ENODEV`、`-EFAULT`、`-ENFILE`、`-EMFILE`、`-ENXIO`（不认识的设备）、`-ETXTBSY`（截断正在运行的程序文件） | 打开文件、目录或设备文件（[fs.md](fs.md#接进内核fsyszig)，设备见 [files.md](files.md#设备文件)）。flags：`open_read`/`open_write`/`open_rdwr` 加上 `open_create`（没有就建一个空文件）、`open_trunc`（可写时截成 0 字节）、`open_append`（0x800，每次写都写在末尾）；别的位、读写方式是 3 都是 `-EINVAL`。目录只能只读地打开。相对路径从当前目录开始。跟着符号链接走；带 `open_create` 时最后一段是悬空的符号链接的话，建的是它指向的文件 |
 | 25 | `mkdir` | `a0` = 路径地址，`a1` = 路径长度 | 0；`-EEXIST`、`-ENOENT`、`-ENOTDIR`、`-EINVAL`、`-ENAMETOOLONG`、`-ENOSPC` 等 | 建一个空目录 |
-| 26 | `unlink` | 同上 | 0；`-ENOENT`、`-ENOTEMPTY`、`-EINVAL` 等 | 删掉一个名字（文件、设备文件或空目录）。是最后一个名字的话文件也删掉，打开着它的 fd 之后读写是 `-ENOENT` |
+| 26 | `unlink` | 同上 | 0；`-ENOENT`、`-ENOTEMPTY`、`-EINVAL`、`-ETXTBSY`（正在运行的程序文件的最后一个名字）等 | 删掉一个名字（文件、设备文件或空目录）。是最后一个名字的话文件也删掉，打开着它的 fd 之后读写是 `-ENOENT` |
 | 27 | `chdir` | 同上 | 0；`-ENOENT`、`-ENOTDIR` 等 | 换当前目录（`Process.cwd`，`fork` 继承） |
 | 28 | `fstat` | `a0` = fd，`a1` = `Stat` 的地址 | 0；`-EBADF`、`-EFAULT`、`-ENOENT` | inode 号、长度、种类、设备号、链接数。串口、管道的 inode 号、长度、链接数是 0 |
 | 29 | `readdir` | `a0` = fd，`a1` = `Dirent` 的地址 | 1；列完了是 0；`-EBADF`、`-ENOTDIR`、`-EFAULT` | 目录的下一项（不含 `.`、`..`），按名字的散列排序。读写位置就是 `fs.readdir` 的 cookie，结果写进用户内存成功了才往后挪 |
 | 30 | `scrub` | `a0` = `ScrubInfo` 的地址 | 0；`-EIO`（文件系统坏了）、`-ENODEV`、`-EFAULT` | 检查整个文件系统：作废缓冲区缓存，B 树、每个数据块的校验和、条目之间的关系都核对一遍，只读不改（[fs.md](fs.md#检查整个文件系统checkscrub)）。统计（文件数、目录数、设备文件数、符号链接数、数据块数、B 树的节点数、条目数、层数、空闲块数、总块数、事务号）写进 `a0` 指向的地方 |
-| 31 | `rename` | `a0`、`a1` = 旧路径的地址、长度，`a2`、`a3` = 新路径的地址、长度 | 0；`-ENOENT`、`-ENOTDIR`、`-EISDIR`、`-ENOTEMPTY`、`-EINVAL`、`-ENAMETOOLONG`、`-ENOSPC`、`-EIO`、`-ENODEV`、`-EFAULT` | 改名，可以换目录，一个事务做完（[fs.md](fs.md#改名rename)）。新名字已经有了的话换掉它：文件换掉文件，目录换掉空目录（不空是 `-ENOTEMPTY`）；目录换文件是 `-ENOTDIR`，文件换目录是 `-EISDIR`；目录挪进它自己下面是 `-EINVAL`。打开着的 fd、当前目录照常能用 |
+| 31 | `rename` | `a0`、`a1` = 旧路径的地址、长度，`a2`、`a3` = 新路径的地址、长度 | 0；`-ENOENT`、`-ENOTDIR`、`-EISDIR`、`-ENOTEMPTY`、`-EINVAL`、`-ENAMETOOLONG`、`-ENOSPC`、`-EIO`、`-ENODEV`、`-EFAULT`、`-ETXTBSY`（新名字是正在运行的程序文件的最后一个名字，会被换掉） | 改名，可以换目录，一个事务做完（[fs.md](fs.md#改名rename)）。新名字已经有了的话换掉它：文件换掉文件，目录换掉空目录（不空是 `-ENOTEMPTY`）；目录换文件是 `-ENOTDIR`，文件换目录是 `-EISDIR`；目录挪进它自己下面是 `-EINVAL`。打开着的 fd、当前目录照常能用 |
 | 32 | `lseek` | `a0` = fd，`a1` = 偏移（有符号），`a2` = whence（`seek_set`、`seek_cur`、`seek_end`） | 新的位置；`-EBADF`、`-ESPIPE`（串口、管道、设备）、`-EINVAL`（负的位置、坏的 whence、目录挪到 0 以外）、`-ENOENT` | 挪文件的读写位置（[files.md](files.md#文件表)），可以挪到末尾之后。`lseek(fd, 0, seek_cur)` 查当前位置；目录只能 `lseek(fd, 0, seek_set)` 从头再列 |
 | 33 | `link` | `a0`、`a1` = 旧路径的地址、长度，`a2`、`a3` = 新路径的地址、长度 | 0；`-ENOENT`、`-EEXIST`、`-EPERM`（目录）、`-ENOTDIR`、`-EINVAL`、`-ENAMETOOLONG`、`-EMLINK`、`-ENOSPC`、`-EIO`、`-ENODEV`、`-EFAULT` | 硬链接：给文件（或设备文件）再起一个名字，两个名字是同一个文件，一个事务做完（[fs.md](fs.md#硬链接和设备文件)） |
 | 34 | `mknod` | `a0` = 路径地址，`a1` = 路径长度，`a2` = 设备号 | 0；`-EINVAL`（设备号是 0 或者超过 `u16`、名字是 `.`、`..`）、`-EEXIST`、`-ENOENT`、`-ENOTDIR`、`-ENAMETOOLONG`、`-ENOSPC`、`-EIO`、`-ENODEV`、`-EFAULT` | 建一个设备文件。不认识的设备号也能建，打开时才是 `-ENXIO` |
@@ -172,9 +172,12 @@ pub fn dispatch(frame: *TrapFrame) usize {
 ```zig
 fn write(fd: usize, ptr: usize, len: usize) usize {
     const f = fileOf(fd) orelse return abi.fail(.badf);
+    vm.prefault(space(), ptr, len);
     return file.write(f, space(), ptr, len) catch |err| fileError(err);
 }
 ```
+
+`vm.prefault` 先把来源里**来自程序文件、还没读进来**的页（比如字符串常量所在的只读数据页）读好：下面串口、管道、文件都是拿着锁复制用户内存的，那时读不了盘（[访问用户内存](#访问用户内存)）。
 
 `fileOf` 查当前进程的 fd 表：`fd >= max_fds` 或者那一项是空的，返回 `-EBADF`。不可写的文件（管道的读端）也是 `-EBADF`。真正的写由 `file.write` 按文件的种类分给串口、管道或文件系统（[files.md](files.md)）。串口和管道遵守同一个约定：
 
@@ -200,7 +203,7 @@ fn read(fd: usize, ptr: usize, len: usize) usize {
 }
 ```
 
-- **先检查整个目标范围可写，再读**（`vm.checkUser`）：从串口的缓冲区取出来的字符放不回去，要是取出来才发现用户给的地址写不进去，这些字符就丢了。所以坏地址立刻返回 `-EFAULT`，不阻塞、不消耗输入。
+- **先检查整个目标范围可写，再读**（`vm.checkUser`）：从串口的缓冲区取出来的字符放不回去，要是取出来才发现用户给的地址写不进去，这些字符就丢了。所以坏地址立刻返回 `-EFAULT`，不阻塞、不消耗输入。检查的同时把范围里还没分配的页都分配好（按需分页），所以之后拿着锁写进去一定成功；代价是整个缓冲区都分配了，哪怕只读到几个字节（`tail` 因此一次最多读 64 KiB，[user-programs.md](user-programs.md#写脚本用的程序)）。
 - `len = 0` 直接返回 0，不检查指针、不阻塞。
 - 没有数据时阻塞，至少读到一个字节才返回；有多少就读多少（最多 `len`），不等凑满。**返回 0 表示读到了结尾**：管道的写端都关了，或者在串口上按了 Ctrl-D。
 - 串口：**不回显、不做行编辑**，原样返回收到的字节（回车是 `\r`），shell 自己回显；Ctrl-C 不会被读到。管道：写进去什么读出来什么。文件：从读写位置开始读，不阻塞，到末尾返回 0。细节见 [files.md](files.md)。
@@ -247,27 +250,28 @@ fn wait(pid: usize, status_ptr: usize, options: usize) usize {
 
 - 怎么找、怎么等子进程、怎么写状态和回收见 [process.md](process.md#wait回收子进程)：这些都要拿着 `wait_lock` 和子进程的锁做，所以整个放在 `proc.wait` 里，系统调用这一层只转换错误码。
 - 结束状态是一个 `u32`：正常退出时是退出码（0..255），被杀（异常、`kill`、Ctrl-C）时是 `abi.killed_status`（`0x100`）。
-- **写状态失败时不回收**，返回 `-EFAULT`：子进程还是 zombie，可以换个地址再 `wait`。
+- **写状态失败时不回收**，返回 `-EFAULT`：子进程还是 zombie，可以换个地址再 `wait`。状态是拿着锁写的，`proc.wait` 一开始先 `vm.prefault` 这 4 个字节（[访问用户内存](#访问用户内存)）。
 - 不认识的 options 位返回 `-EINVAL`。
 
 ## 访问用户内存
 
 ```zig
-pub fn copyFromUser(root: *PageTable, dst: []u8, src: usize) error{BadAddress}!void
-pub fn copyToUser(root: *PageTable, dst: usize, src: []const u8) error{BadAddress}!void
-pub fn checkUser(root: *PageTable, va: usize, len: usize, write: bool) error{BadAddress}!void
+pub fn copyFromUser(s: *Space, dst: []u8, src: usize) error{BadAddress}!void
+pub fn copyToUser(s: *Space, dst: usize, src: []const u8) error{BadAddress}!void
+pub fn checkUser(s: *Space, va: usize, len: usize, write: bool) error{BadAddress}!void
+pub fn prefault(s: *Space, va: usize, len: usize) void
 ```
 
 系统调用拿到的指针完全由用户程序控制，可能是：没有映射的地址、内核的地址（比如 `hello` 故意传的 `0x8020_0000`）、跨越地址空间末尾的范围、或者让 `src + len` 溢出的长度。`copyFromUser` 对每一页：
 
 1. `src + done` 用 `std.math.add` 计算，溢出就是 `BadAddress`。
-2. `translateUser`：地址必须在 `[user_base, user_end)` 里；用**软件**走一遍进程的页表，叶子必须有效、带 U 位、可读。任何一条不满足就是 `BadAddress`。
+2. `translateUser`：地址必须在 `[user_base, user_end)` 里；用**软件**走一遍进程的页表，叶子必须有效、带 U 位、可读。翻译不了的话，和用户程序自己访问一样按缺页处理（`vm.fault`：还没分配的页按需分配，[paging.md](paging.md#按需分页)），再翻译一次。还不行就是 `BadAddress`。
 3. 用翻译得到的物理地址，通过内核的恒等映射读出这一页里需要的部分。
 
 为什么不直接让内核去读用户地址（打开 `sstatus.SUM`，让 S 模式可以访问 U 页）：
 
 - 那样用户传进来一个**内核地址**，内核会照读不误（内核页在 S 模式下本来就可读），用户程序就能借 `write` 把内核内存打印出来。软件查页表时要求 U 位，内核地址自然被拒绝。
-- 用户地址没有映射时，内核会在 S 模式下触发缺页，而现在内核里的缺页一律 panic。
+- 用户地址没有映射时，内核会在 S 模式下触发缺页。按需分页之后这是正常情况（页还没分配），内核就得在 S 模式的缺页里分辨“是替用户程序访问的”还是“内核自己的 bug”，还要在任意的锁下处理它。软件查页表时缺页就在 `copyFromUser` 这些函数里处理，什么时候能读盘（见下面）由调用的地方决定。
 
 所以 `sstatus.SUM` 始终为 0，这也意味着内核里任何地方不小心解引用了用户指针都会立刻缺页 panic，而不是悄悄成功。
 
@@ -277,7 +281,9 @@ pub fn checkUser(root: *PageTable, va: usize, len: usize, write: bool) error{Bad
 - 也不能改写自己的只读页：硬件不会替内核检查这一点（内核的映射可写，S 模式写的是物理地址的恒等映射），不检查的话，用户程序可以让 `read` 把输入写进自己的代码段。
 - **写时复制的页**（`fork` 之后和别的进程共用、还没写过的页）W 也是 0，但它本来是可写的：`copyToUser` 先 `vm.breakCow` 给这个进程复制一份，再往复制出来的页里写。不这样做的话，`wait` 写回的结束状态、`read` 读到的字符会直接写进共用的物理页，同时改掉另一个进程的内存。复制时内存不够就是 `BadAddress`（`-EFAULT`），和 Linux 一样（[paging.md](paging.md#写时复制)）。
 
-`copyToUser` 逐页写，中途遇到坏页时前面的页已经写进去了。需要“要么全写、要么不写”的调用方先用 `checkUser` 检查整个范围（`read` 就是这样）。`checkUser` 逐页查页表，`len = 0` 时不检查，`va + len - 1` 溢出是 `BadAddress`；检查可写时顺便把范围里的写时复制页都复制好，所以检查通过之后的 `copyToUser` 一定成功（复制要内存，放到检查之后才做的话，取走的输入可能又写不进去）。这三个函数在 `vm.zig` 里有单元测试（跨页、只读页、没有映射、溢出）。
+**拿着锁时不能读盘**：按需分页的页有两种。堆、栈、`.bss` 的页是清零的，随时都能分配（只拿页分配器的锁）；段里来自程序文件的页要读盘、睡着等，拿着自旋锁不能睡，拿着睡眠锁（可能是缓冲区的锁）也不行。所以这三个函数在拿着锁的时候（`canSleep()` 为 false）不读盘，碰到那样的页就是 `BadAddress`。拿着锁复制用户内存的系统调用先调用 `prefault`，把范围里来自程序文件的页读好：`write`（写串口拿着输出锁、写管道拿着管道锁、写文件拿着文件系统的写锁和缓冲区的锁）、`readdir`（拿着读写位置的锁）、`wait`（拿着进程的锁写状态）。只拿着文件系统快照的（`readlink`、`getcwd`、`lstat`、`fstat`）可以直接读盘：再拿一个快照不用等谁。`t_demand` 检查了这些路径（[testing.md](testing.md#回归测试程序)）。
+
+`copyToUser` 逐页写，中途遇到坏页时前面的页已经写进去了。需要“要么全写、要么不写”的调用方先用 `checkUser` 检查整个范围（`read` 就是这样）。`checkUser` 逐页查页表，`len = 0` 时不检查，`va + len - 1` 溢出是 `BadAddress`；检查时顺便把范围里还没分配的页都分配好、（检查可写时）写时复制页都复制好，所以检查通过之后的 `copyToUser` 一定成功（分配、复制要内存，放到检查之后才做的话，取走的输入可能又写不进去）。这几个函数在 `vm.zig` 里有单元测试（跨页、只读页、没有映射、溢出、按需分配）。
 
 ## 用户态封装
 

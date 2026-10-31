@@ -160,17 +160,25 @@ pub fn main() u8 {
     return failures;
 }
 
-/// 用户栈的范围（src/proc.zig）。
+/// 栈顶（src/vm.zig 的 stack_top）。栈最多 1 MiB、按需分配，这个程序只用得到最上面的一点
 const stack_top = 0x8000_0000;
-const stack_bottom = stack_top - 16 * 1024;
+const stack_used = 16 * 1024;
 
-/// 把整个栈的每一页都读出来再原样写回去：fork 之后共用的栈页就都变成了自己的。
+/// 把栈最上面 stack_used 字节的每一页都读出来再原样写回去：fork 之后共用的栈页就都变成了自己的，
+/// 还没分配的也分配好。
 fn ownStack() void {
-    var addr: usize = stack_bottom;
+    var addr: usize = stack_top - stack_used;
     while (addr < stack_top) : (addr += page) {
         const p: *volatile u8 = @ptrFromInt(addr);
         p.* = p.*;
     }
+}
+
+/// 把程序的各个段（从用户区的起点到堆的起点）每一页都读一遍：按需分页，没访问过的代码页这时才读进来。
+/// 内存用完之后再执行到没读进来的代码，进程就会因为没内存被结束。
+fn touchProgram(heap_start: usize) void {
+    var addr: usize = 0x4000_0000;
+    while (addr < heap_start) : (addr += page) _ = @as(*const volatile u8, @ptrFromInt(addr)).*;
 }
 
 /// 5. 内存用完时的写时复制。子进程先睡着；父进程把空闲页全部用掉（堆和管道），再叫醒它。
@@ -179,9 +187,15 @@ fn ownStack() void {
 ///
 /// 内存用完之后，父子进程都不能再写任何还和对方共用的页（包括栈和全局变量），否则自己也会被结束：
 /// 两边都先 ownStack，父进程把结果先记在栈上，放开内存之后才调用 expect（它要写全局变量）。
+/// 也不能再用到还没分配的页（按需分页）：fork 之前先把程序的每一页都读进来，栈的页也都分配好。
 fn outOfMemory() void {
     const go = pipe();
     const result = pipe();
+    touchProgram(@intFromPtr(heap));
+    const zero = sys.open("/dev/zero", .{}) catch {
+        sys.print("FAIL: open /dev/zero\n", .{});
+        sys.exit(202);
+    };
     const pid = fork();
     ownStack();
     if (pid == 0) {
@@ -194,14 +208,13 @@ fn outOfMemory() void {
     }
     await(result[0]);
 
-    // 把内存用完：堆每次长 1 MiB，长不动了减半，直到一页也长不动；剩下的零星几页（新的页表要用）给管道
+    // 把内存用完：堆按需分配，sbrk 不用内存。堆长得比空闲内存多一些，让内核替自己把它写满（读 /dev/zero）：
+    // 内核一页一页地分配，没内存了就停下、返回 EFAULT，自己不会被结束（自己写的话会）。
+    // 剩下的零星几页（新的页表要用，内核分配页表失败时把刚分配的页还回去了）给管道
     const start = sys.sbrk(0) catch unreachable;
-    var chunk: isize = 1 << 20;
-    while (chunk >= page) {
-        _ = sys.sbrk(chunk) catch {
-            chunk = @divExact(chunk, 2);
-        };
-    }
+    const want = (freePages() + 16) * page;
+    _ = sys.sbrk(@intCast(want)) catch unreachable;
+    _ = sys.read(zero, @as([*]u8, @ptrFromInt(start))[0..want]) catch {};
     var pipes: [8][2]sys.Fd = undefined;
     var npipes: usize = 0;
     while (npipes < pipes.len) : (npipes += 1) pipes[npipes] = sys.pipe() catch break;
@@ -218,7 +231,7 @@ fn outOfMemory() void {
         sys.close(p[1]) catch {};
     }
     _ = sys.sbrk(@as(isize, @intCast(start)) - @as(isize, @intCast(sys.sbrk(0) catch unreachable))) catch {};
-    for ([_]sys.Fd{ go[0], go[1], result[0], result[1] }) |fd| sys.close(fd) catch {};
+    for ([_]sys.Fd{ go[0], go[1], result[0], result[1], zero }) |fd| sys.close(fd) catch {};
 
     expect(free == 0, "could not use up memory: {d} pages left", .{free});
     expect(answer[0] == 'y', "kernel write into a cow page without memory did not return EFAULT", .{});
