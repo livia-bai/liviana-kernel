@@ -1,10 +1,10 @@
 //! 内核里的文件系统：唯一的一个 Volume，第一个进程启动时挂载（xv6 在 forkret 里调用 fsinit）。
 //! 文件系统本身的逻辑在 fs.zig；这里是内核这一侧：加锁、用户内存、错误码、打开的文件（file.zig 的 .inode）。
 //!
-//! - **读**（read、fstat、readdir、lseek、chdir、不建不截的 open、exec 加载程序）不拿锁：reader() 拿一个
+//! - **读**（read、fstat、lstat、readdir、readlink、getcwd、lseek、chdir、不建不截的 open、exec 加载程序）不拿锁：reader() 拿一个
 //!   已提交的树的快照（ctree 的 beginRead），在它上面读，读完 end()。几个读者、读者和修改的一方都同时进行；
 //!   读者看到的是开始读时最近一次提交的样子，修改的一方做到一半的东西看不到。
-//! - **修改**（write、mkdir、unlink、rename、建文件、截断、scrub）拿 write_lock（睡眠锁）：
+//! - **修改**（write、mkdir、unlink、rename、link、symlink、mknod、建文件、截断、scrub）拿 write_lock（睡眠锁）：
 //!   B 树同一时刻只能有一个事务，所以修改之间还是一个一个来。每个修改是一个事务（fs.Fs.run）：
 //!   成功就提交，出错就作废。
 //! - 加锁顺序：File.pos_lock → write_lock → 缓冲区的睡眠锁。拿着快照时不能去等 pos_lock、write_lock：
@@ -97,6 +97,8 @@ pub fn errno(err: anyerror) abi.Errno {
         error.NoDevice => .nodev,
         error.IsDirLink => .perm,
         error.TooManyLinks => .mlink,
+        error.SymlinkLoop => .loop,
+        error.NotSymlink => .inval,
         else => .io, // Corrupt 等：磁盘上的东西不对
     };
 }

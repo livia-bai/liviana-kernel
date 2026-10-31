@@ -28,6 +28,7 @@ pub const Syscall = enum(usize) {
     blockcount = 21, readblock = 22, writeblock = 23,
     open = 24, mkdir = 25, unlink = 26, chdir = 27, fstat = 28, readdir = 29,
     scrub = 30, rename = 31, lseek = 32, link = 33, mknod = 34,
+    symlink = 35, readlink = 36, getcwd = 37, lstat = 38,
     _,
 };
 pub const Major = enum(u16) { console = 1, null = 2, zero = 3, _ };   // 设备文件的设备号
@@ -55,9 +56,11 @@ pub const Errno = enum(usize) {
     nomem = 12,   // ENOMEM：物理内存不够（fork、exec、pipe），或者堆不能再长了（sbrk）
     fault = 14,   // EFAULT：指针指向的内存不属于用户空间、没有映射，或者要写的页不可写
     inval = 22,   // EINVAL：参数不对（wait 的 options，sbrk 缩到堆的起点下面，块号超出原始区域，open 的 flags，名字是 "."、".."，
-                  //         rename 把目录挪进它自己下面，lseek 到负的位置、坏的 whence）
+                  //         rename 把目录挪进它自己下面，lseek 到负的位置、坏的 whence，readlink 的不是符号链接）
     nfile = 23,   // ENFILE：系统的文件表满了（pipe）
     mfile = 24,   // EMFILE：进程的 fd 表满了（dup、pipe）
+    loop = 40,    // ELOOP：解析路径时跟着走的符号链接超过 10 个（多半是有环）
+    range = 34,   // ERANGE：给的缓冲区放不下（getcwd）
     spipe = 29,   // ESPIPE：lseek 串口、管道
     pipe = 32,    // EPIPE：管道的读端都关了（write）
     nosys = 38,   // ENOSYS：没有这个系统调用
@@ -82,7 +85,7 @@ pub const killed_status: u32 = 0x100; // wait 拿到的“被杀”状态（正�
 pub const ProcState = enum(u8) { unused, runnable, running, sleeping, zombie };
 pub const ProcInfo = extern struct { pid: u64, ppid: u64, ticks: u64, state: ProcState, name_len: u8, name: [16]u8 };
 pub const MemInfo = extern struct { free_pages: u64, total_pages: u64, page_size: u64 };
-pub const FileKind = enum(u8) { file = 1, dir = 2, console = 3, pipe = 4, device = 5, _ };
+pub const FileKind = enum(u8) { file = 1, dir = 2, console = 3, pipe = 4, device = 5, symlink = 6, _ };
 pub const Stat = extern struct { ino: u64, size: u64, kind: FileKind, _pad: u8, major: u16, nlink: u32 };
 pub const Dirent = extern struct { ino: u64, kind: FileKind, name_len: u8, _pad: [6]u8, name: [max_name]u8 };
 
@@ -108,7 +111,7 @@ pub fn errnoOf(ret: usize) ?Errno      // 返回值在 [-4095, -1] 内时取出�
 | 5 | `sleep` | `a0` = 毫秒数 | 0 | 睡至少 `a0` 毫秒（按 10 ms 的 tick 向上取整），期间不被调度、不占 CPU。`0` 立刻返回 |
 | 6 | `read` | `a0` = fd，`a1` = 缓冲区地址，`a2` = 长度 | 读到的字节数，0 表示读到结尾；`-EBADF`、`-EFAULT`；文件：`-EISDIR`、`-EIO`、`-ENOENT` | 从串口、管道或文件读，详见下文 |
 | 7 | `fork` | 无 | 父进程得到子进程的 pid，子进程得到 0；或 `-EAGAIN`、`-ENOMEM` | 复制当前进程（[process.md](process.md#fork)） |
-| 8 | `exec` | `a0` = 路径地址，`a1` = 路径长度，`a2` = `Arg` 数组的地址，`a3` = 参数个数 | 成功时不返回（新程序的 `a0` = 参数个数）；`-ENOENT`、`-ENOEXEC`、`-ENOMEM`、`-EFAULT`、`-E2BIG`、`-ENAMETOOLONG`、`-ENOTDIR`、`-EIO`、`-ENODEV` | 换成文件系统里的程序运行（名字里没有 `/` 时在 `/bin` 里找），打开的文件不变，详见下文 |
+| 8 | `exec` | `a0` = 路径地址，`a1` = 路径长度，`a2` = `Arg` 数组的地址，`a3` = 参数个数 | 成功时不返回（新程序的 `a0` = 参数个数）；`-ENOENT`、`-ENOEXEC`、`-ENOMEM`、`-EFAULT`、`-E2BIG`、`-ENAMETOOLONG`、`-ENOTDIR`、`-ELOOP`、`-EIO`、`-ENODEV` | 换成文件系统里的程序运行（名字里没有 `/` 时在 `/bin` 里找，跟着符号链接走），打开的文件不变，详见下文 |
 | 9 | `wait` | `a0` = pid（`wait_any` 表示任意一个），`a1` = 状态的地址（0 表示不要），`a2` = options | 回收的子进程的 pid；`nohang` 时没有已结束的子进程返回 0；`-ECHILD`、`-EFAULT`、`-EINVAL` | 详见下文 |
 | 10 | `kill` | `a0` = pid | 0；`-ESRCH`、`-EPERM`（init） | 只做标记，目标进程回到 U 模式之前结束（[process.md](process.md#kill只做标记)） |
 | 11 | `getppid` | 无 | 父进程的 pid；init 是 0 | |
@@ -124,17 +127,21 @@ pub fn errnoOf(ret: usize) ?Errno      // 返回值在 [-4095, -1] 内时取出�
 | 21 | `blockcount` | 无 | 磁盘的原始区域（文件系统之后的块）有多少块，没有磁盘时是 0 | 每块 `abi.block_size` = 4096 字节（[disk.md](disk.md#系统调用)） |
 | 22 | `readblock` | `a0` = 块号，`a1` = 缓冲区地址 | 0；`-EINVAL`（块号超出原始区域）、`-ENODEV`、`-EFAULT` | 经过缓冲区缓存读原始区域的一块，4096 字节写进缓冲区 |
 | 23 | `writeblock` | `a0` = 块号，`a1` = 缓冲区地址 | 0；`-EINVAL`、`-ENODEV`、`-EFAULT` | 缓冲区的 4096 字节写到原始区域的这一块，写完才返回 |
-| 24 | `open` | `a0` = 路径地址，`a1` = 路径长度，`a2` = flags | 新的 fd；`-ENOENT`、`-ENOTDIR`、`-EISDIR`、`-EEXIST`、`-ENAMETOOLONG`、`-EINVAL`、`-ENOSPC`、`-EIO`、`-ENODEV`、`-EFAULT`、`-ENFILE`、`-EMFILE`、`-ENXIO`（不认识的设备） | 打开文件、目录或设备文件（[fs.md](fs.md#接进内核fsyszig)，设备见 [files.md](files.md#设备文件)）。flags：`open_read`/`open_write`/`open_rdwr` 加上 `open_create`（没有就建一个空文件）、`open_trunc`（可写时截成 0 字节）、`open_append`（0x800，每次写都写在末尾）；别的位、读写方式是 3 都是 `-EINVAL`。目录只能只读地打开。相对路径从当前目录开始 |
+| 24 | `open` | `a0` = 路径地址，`a1` = 路径长度，`a2` = flags | 新的 fd；`-ENOENT`、`-ENOTDIR`、`-EISDIR`、`-EEXIST`、`-ENAMETOOLONG`、`-EINVAL`、`-ELOOP`、`-ENOSPC`、`-EIO`、`-ENODEV`、`-EFAULT`、`-ENFILE`、`-EMFILE`、`-ENXIO`（不认识的设备） | 打开文件、目录或设备文件（[fs.md](fs.md#接进内核fsyszig)，设备见 [files.md](files.md#设备文件)）。flags：`open_read`/`open_write`/`open_rdwr` 加上 `open_create`（没有就建一个空文件）、`open_trunc`（可写时截成 0 字节）、`open_append`（0x800，每次写都写在末尾）；别的位、读写方式是 3 都是 `-EINVAL`。目录只能只读地打开。相对路径从当前目录开始。跟着符号链接走；带 `open_create` 时最后一段是悬空的符号链接的话，建的是它指向的文件 |
 | 25 | `mkdir` | `a0` = 路径地址，`a1` = 路径长度 | 0；`-EEXIST`、`-ENOENT`、`-ENOTDIR`、`-EINVAL`、`-ENAMETOOLONG`、`-ENOSPC` 等 | 建一个空目录 |
 | 26 | `unlink` | 同上 | 0；`-ENOENT`、`-ENOTEMPTY`、`-EINVAL` 等 | 删掉一个名字（文件、设备文件或空目录）。是最后一个名字的话文件也删掉，打开着它的 fd 之后读写是 `-ENOENT` |
 | 27 | `chdir` | 同上 | 0；`-ENOENT`、`-ENOTDIR` 等 | 换当前目录（`Process.cwd`，`fork` 继承） |
 | 28 | `fstat` | `a0` = fd，`a1` = `Stat` 的地址 | 0；`-EBADF`、`-EFAULT`、`-ENOENT` | inode 号、长度、种类、设备号、链接数。串口、管道的 inode 号、长度、链接数是 0 |
 | 29 | `readdir` | `a0` = fd，`a1` = `Dirent` 的地址 | 1；列完了是 0；`-EBADF`、`-ENOTDIR`、`-EFAULT` | 目录的下一项（不含 `.`、`..`），按名字的散列排序。读写位置就是 `fs.readdir` 的 cookie，结果写进用户内存成功了才往后挪 |
-| 30 | `scrub` | `a0` = `ScrubInfo` 的地址 | 0；`-EIO`（文件系统坏了）、`-ENODEV`、`-EFAULT` | 检查整个文件系统：作废缓冲区缓存，B 树、每个数据块的校验和、条目之间的关系都核对一遍，只读不改（[fs.md](fs.md#检查整个文件系统checkscrub)）。统计（文件数、目录数、设备文件数、数据块数、B 树的节点数、条目数、层数、空闲块数、总块数、事务号）写进 `a0` 指向的地方 |
+| 30 | `scrub` | `a0` = `ScrubInfo` 的地址 | 0；`-EIO`（文件系统坏了）、`-ENODEV`、`-EFAULT` | 检查整个文件系统：作废缓冲区缓存，B 树、每个数据块的校验和、条目之间的关系都核对一遍，只读不改（[fs.md](fs.md#检查整个文件系统checkscrub)）。统计（文件数、目录数、设备文件数、符号链接数、数据块数、B 树的节点数、条目数、层数、空闲块数、总块数、事务号）写进 `a0` 指向的地方 |
 | 31 | `rename` | `a0`、`a1` = 旧路径的地址、长度，`a2`、`a3` = 新路径的地址、长度 | 0；`-ENOENT`、`-ENOTDIR`、`-EISDIR`、`-ENOTEMPTY`、`-EINVAL`、`-ENAMETOOLONG`、`-ENOSPC`、`-EIO`、`-ENODEV`、`-EFAULT` | 改名，可以换目录，一个事务做完（[fs.md](fs.md#改名rename)）。新名字已经有了的话换掉它：文件换掉文件，目录换掉空目录（不空是 `-ENOTEMPTY`）；目录换文件是 `-ENOTDIR`，文件换目录是 `-EISDIR`；目录挪进它自己下面是 `-EINVAL`。打开着的 fd、当前目录照常能用 |
 | 32 | `lseek` | `a0` = fd，`a1` = 偏移（有符号），`a2` = whence（`seek_set`、`seek_cur`、`seek_end`） | 新的位置；`-EBADF`、`-ESPIPE`（串口、管道、设备）、`-EINVAL`（负的位置、坏的 whence、目录挪到 0 以外）、`-ENOENT` | 挪文件的读写位置（[files.md](files.md#文件表)），可以挪到末尾之后。`lseek(fd, 0, seek_cur)` 查当前位置；目录只能 `lseek(fd, 0, seek_set)` 从头再列 |
 | 33 | `link` | `a0`、`a1` = 旧路径的地址、长度，`a2`、`a3` = 新路径的地址、长度 | 0；`-ENOENT`、`-EEXIST`、`-EPERM`（目录）、`-ENOTDIR`、`-EINVAL`、`-ENAMETOOLONG`、`-EMLINK`、`-ENOSPC`、`-EIO`、`-ENODEV`、`-EFAULT` | 硬链接：给文件（或设备文件）再起一个名字，两个名字是同一个文件，一个事务做完（[fs.md](fs.md#硬链接和设备文件)） |
 | 34 | `mknod` | `a0` = 路径地址，`a1` = 路径长度，`a2` = 设备号 | 0；`-EINVAL`（设备号是 0 或者超过 `u16`、名字是 `.`、`..`）、`-EEXIST`、`-ENOENT`、`-ENOTDIR`、`-ENAMETOOLONG`、`-ENOSPC`、`-EIO`、`-ENODEV`、`-EFAULT` | 建一个设备文件。不认识的设备号也能建，打开时才是 `-ENXIO` |
+| 35 | `symlink` | `a0`、`a1` = 目标的地址、长度，`a2`、`a3` = 新路径的地址、长度 | 0；`-ENOENT`（目标是空的、新路径的目录没有）、`-ENAMETOOLONG`（目标长于 256 字节）、`-EEXIST`、`-ENOTDIR`、`-EINVAL`、`-ELOOP`、`-ENOSPC`、`-EIO`、`-ENODEV`、`-EFAULT` | 建符号链接，内容就是目标这个字符串，不检查它在不在（[fs.md](fs.md#符号链接)） |
+| 36 | `readlink` | `a0`、`a1` = 路径的地址、长度，`a2`、`a3` = 缓冲区的地址、长度 | 写了几个字节；`-EINVAL`（不是符号链接）、`-ENOENT`、`-ENOTDIR`、`-ELOOP`、`-EIO`、`-ENODEV`、`-EFAULT` | 符号链接的目标写进缓冲区，不以 0 结尾，放不下就截断（和 Linux 一样）。最后一段不跟着走 |
+| 37 | `getcwd` | `a0` = 缓冲区地址，`a1` = 缓冲区长度 | 路径的长度；`-ERANGE`（放不下）、`-ENOENT`（当前目录被删掉了）、`-EIO`、`-ENODEV`、`-EFAULT` | 当前目录的绝对路径，不以 0 结尾。是真实的位置：经过符号链接 `chdir` 进来的，得到的是目标目录的路径（[fs.md](fs.md#当前目录的路径getcwd)） |
+| 38 | `lstat` | `a0`、`a1` = 路径的地址、长度，`a2` = `Stat` 的地址 | 0；`-ENOENT`、`-ENOTDIR`、`-ELOOP`、`-ENAMETOOLONG`、`-EIO`、`-ENODEV`、`-EFAULT` | 路径自己的 `Stat`，最后一段是符号链接时不跟着走（种类 `symlink`，长度是目标的长度）。不用打开文件，所以内核不认识的设备文件也查得到 |
 | 其他 | | | `-ENOSYS` | |
 
 ### 分发
@@ -302,10 +309,16 @@ pub fn fstat(fd: Fd) FsError!abi.Stat
 pub fn readdir(fd: Fd, ent: *abi.Dirent) FsError!bool        // 列完了是 false
 pub fn scrub() FsError!abi.ScrubInfo                         // 坏了是 IoError
 pub fn rename(old: []const u8, new: []const u8) FsError!void
+pub fn link(old: []const u8, new: []const u8) FsError!void    // 目录是 PermissionDenied
+pub fn mknod(path: []const u8, major: abi.Major) FsError!void
+pub fn symlink(target: []const u8, path: []const u8) FsError!void
+pub fn readlink(path: []const u8, buf: []u8) FsError![]const u8   // 不是符号链接是 InvalidArgument
+pub fn getcwd(buf: []u8) FsError![]const u8                   // 放不下是 BufferTooSmall
+pub fn lstat(path: []const u8) FsError!abi.Stat               // 不跟着最后一段的符号链接走
 pub fn lseek(fd: Fd, offset: i64, whence: Whence) FsError!u64 // Whence = enum { set, cur, end }；串口、管道是 NotSeekable
 // FsError = error{ NotFound, Exists, NotDir, IsDir, NotEmpty, NameTooLong, InvalidArgument, NoSpace,
 //                  FileTooBig, IoError, NoDevice, BadAddress, BadFd, TooManyOpenFiles, SystemFdQuotaExceeded,
-//                  NotSeekable, Unexpected }
+//                  NotSeekable, PermissionDenied, TooManyLinks, NoSuchDevice, SymlinkLoop, BufferTooSmall, Unexpected }
 pub fn close(fd: Fd) error{ BadFd, Unexpected }!void
 pub fn dup(fd: Fd) error{ BadFd, TooManyOpenFiles, Unexpected }!Fd
 pub fn pipe() error{ TooManyOpenFiles, SystemFdQuotaExceeded, OutOfMemory, Unexpected }![2]Fd   // { 读端, 写端 }
@@ -318,7 +331,7 @@ pub fn writeBlock(n: u64, buf: *const [block_size]u8) BlockError!void
 pub fn fork() error{ TooManyProcesses, OutOfMemory, Unexpected }!usize
 pub fn exec(name: []const u8, args: []const []const u8) ExecError!noreturn
 pub fn execRaw(name: []const u8, args: []const abi.Arg) ExecError!noreturn
-// ExecError = error{ NoSuchProgram, OutOfMemory, BadElf, BadAddress, ArgsTooLong, NameTooLong, NotDir, IoError, NoDevice, Unexpected }
+// ExecError = error{ NoSuchProgram, OutOfMemory, BadElf, BadAddress, ArgsTooLong, NameTooLong, NotDir, IoError, NoDevice, SymlinkLoop, Unexpected }
 pub fn wait(pid: ?usize, nohang: bool) error{ NoChildren, Unexpected }!?WaitResult   // WaitResult{ pid, status }
 pub fn kill(pid: usize) error{ NoSuchProcess, PermissionDenied, Unexpected }!void
 pub fn setfg(pid: ?usize) error{ NoSuchProcess, Unexpected }!void
@@ -338,7 +351,7 @@ pub fn fprint(fd: Fd, comptime fmt: []const u8, args: anytype) void
 - 系统调用在陷阱处理程序里执行，**全程关着中断**，所以每个调用都要短。一个很长的 `write` 会在输出期间挡住时钟中断，但不会丢失中断：挂起的中断在 `sret` 回到 U 模式后立刻被处理（这时进程马上让出 CPU），计时也不会少，`timer` 按预约时刻补上错过的 tick（[devices.md](devices.md#定时器timerzig)）。
 - 会等待的调用（`yield`、`sleep`、`read`、管道的 `write`、`wait`）不在里面开中断等待，而是切回调度器，由调度器开着中断去处理别的事。
 - `exec` 一次加载整个程序（分配页、从文件系统读内容），`fork` 一次复制整个地址空间，`sbrk` 一次映射所有新的页，期间都关着中断。现在的程序都只有几十 KiB，没有问题；`sbrk` 一次要上百 MiB 时会关着中断清零这么多页，`t_sbrk` 里长到超过物理内存（约 125 MiB）再失败、回滚，QEMU 里测试照常通过。
-- 运行在当前进程自己的内核栈上（16 KiB），系统调用里不要放大的局部数组，也不要按值复制大的结构体（[fs.md](fs.md#接进内核fsyszig)：8 KiB 的位图按值传过一次，把栈撑爆了）。局部数组最大的是 `exec` 复制参数和路径用的约 1.8 KiB（参数 1024 字节、`Arg` 数组和切片各 256 字节、路径 256 字节）；栈用得最深的是文件系统的调用（实测 Debug 模式不到 10 KiB，[process.md](process.md#进程表)）。
+- 运行在当前进程自己的内核栈上（16 KiB），系统调用里不要放大的局部数组，也不要按值复制大的结构体（[fs.md](fs.md#接进内核fsyszig)：8 KiB 的位图按值传过一次，把栈撑爆了）。局部数组最大的是 `exec` 复制参数和路径用的约 1.8 KiB（参数 1024 字节、`Arg` 数组和切片各 256 字节、路径 256 字节）；栈用得最深的是文件系统的调用（实测 Debug 模式约 11.4 KiB，[process.md](process.md#进程表)）。
 - 文件系统的调用读写磁盘，要等磁盘时和 `read` 一样切回调度器。读的调用在快照上读、不拿锁，改的调用拿着睡眠锁 `fsys.write_lock`（[fs.md](fs.md#接进内核fsyszig)）。
 - `exit`、`shutdown` 和成功的 `exec` 不返回；其他调用返回后，用户程序从 `ecall` 的下一条指令继续执行，除 `a0` 以外的寄存器都不变。
 

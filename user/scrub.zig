@@ -8,7 +8,9 @@ pub fn main() u8 {
         sys.print("scrub: the file system is damaged: {s}\n", .{@errorName(err)});
         return 1;
     };
-    sys.print("scrub: ok: {d} files, {d} dirs, {d} devices, {d} data blocks verified\n", .{ st.files, st.dirs, st.devices, st.data_blocks });
+    sys.print("scrub: ok: {d} files, {d} dirs, {d} devices, {d} symlinks, {d} data blocks verified\n", .{
+        st.files, st.dirs, st.devices, st.symlinks, st.data_blocks,
+    });
     sys.print("scrub: tree of {d} nodes, {d} items, height {d}; {d} of {d} blocks free, generation {d}\n", .{
         st.nodes, st.items, st.height, st.free_blocks, st.blocks, st.generation,
     });

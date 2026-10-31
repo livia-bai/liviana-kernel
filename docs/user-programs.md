@@ -129,7 +129,7 @@ pub fn main() u8 {
 ```
 
 - 启动 shell，然后一直 `wait` 任意一个子进程。父进程先结束的进程会被内核交给 init（[process.md](process.md#exit变成-zombie)），它们结束后变成 zombie，靠 init 的 `wait` 回收。
-- 等到的是 shell 的话（shell 被 `kill` 了），打印一行，再启动一个新的。
+- 等到的是 shell 的话（shell 被 `kill` 了，或者执行了 `exit`），打印一行，再启动一个新的。
 - init 不能结束：它一结束内核就 panic（`init exited`），`kill` 也不允许杀它。`fork` 失败时打印原因，睡一秒再试。
 
 **sh**（`user/sh.zig`）是 shell，详见 [shell.md](shell.md)。它的父进程是 init，`run` 启动的程序都是它的子进程。
@@ -255,11 +255,11 @@ pub fn main() u8 {
 
 文件系统的几个小命令（[fs.md](fs.md)），出错时都打印 `程序名: 路径: 错误名`（比如 `rm: /d: NotEmpty`），接着处理下一个参数，最后以 1 结束：
 
-- `ls`（`user/ls.zig`）：`ls [路径...]`，不给路径时是当前目录。目录的每一项一行：种类（`file`、`dir`、`dev`）、链接数、字节数（设备文件是设备号）、名字；给的是文件的话只列它自己。目录项里没有长度、链接数，每一项要再 `open`、`fstat` 一次（打不开的，比如内核不认识的设备，记成 0）。顺序是名字的散列的顺序，不是字母顺序。
+- `ls`（`user/ls.zig`）：`ls [路径...]`，不给路径时是当前目录。目录的每一项一行：种类（`file`、`dir`、`dev`、`link`）、链接数、字节数（设备文件是设备号，符号链接是目标的长度）、名字，符号链接后面再加 ` -> 目标`（`readlink`）。给的是目录、或者指向目录的符号链接，列里面的东西（先 `open`，它跟着链接走）；别的（文件、设备、符号链接，包括悬空的）只列它自己。目录项里没有长度、链接数，每一项要再 `lstat` 一次（不跟着符号链接走、不用打开，所以内核不认识的设备也查得到）。顺序是名字的散列的顺序，不是字母顺序。
 - `mkdir`（`user/mkdir.zig`）：`mkdir 目录...`，按顺序建，所以 `mkdir /a /a/b` 可以。
-- `rm`（`user/rm.zig`）：`rm 路径...`，删文件、设备文件或空目录（删掉一个名字；文件还有别的硬链接的话照常在）。
+- `rm`（`user/rm.zig`）：`rm 路径...`，删文件、设备文件、符号链接或空目录（删掉一个名字；文件还有别的硬链接的话照常在；删符号链接不动它指向的东西）。
 - `mv`（`user/mv.zig`）：`mv 旧 新` 改名（`rename` 系统调用，可以换目录；新名字已经有了就换掉它）；最后一个参数是已有的目录时，前面的都挪进去、名字不变（`mv a b /d` 是 `/d/a`、`/d/b`），和 Unix 的 `mv` 一样。给了两个以上的源、最后一个却不是目录，打印 `mv: DIR: not a directory`。出错打印 `mv: 旧 -> 新: 错误名`（比如把目录挪进自己下面：`mv: /m -> /m/sub: InvalidArgument`）。
-- `ln`（`user/ln.zig`）：`ln 旧 新` 建硬链接（`link` 系统调用）；最后一个参数是已有的目录时，在里面建同名的链接。用法和出错的格式都和 `mv` 一样；目录不能链接（`ln: /bin -> /b2: PermissionDenied`）。
+- `ln`（`user/ln.zig`）：`ln 旧 新` 建硬链接（`link` 系统调用）；最后一个参数是已有的目录时，在里面建同名的链接。用法和出错的格式都和 `mv` 一样；目录不能链接（`ln: /bin -> /b2: PermissionDenied`）。`ln -s 目标 新` 建符号链接（`symlink` 系统调用，[fs.md](fs.md#符号链接)）：目标原样存下，可以还不存在，相对的目标从链接所在的目录算起（`ln -s sd/f /sl` 指向 `/sd/f`）。
 
 ```
 > run ls /bin
@@ -276,6 +276,12 @@ dev   1        1 console
 > run ls /docs
 file  1        7 count.txt
 file  2       13 hi.txt
+> ln -s /bin /b
+> ls /
+link  1        4 b -> /bin
+...
+> ls /b/ls
+file  1   107248 /b/ls
 ```
 
 （Debug 构建，`/bin` 只摘了两行，`[proc] ... exited` 的行略去了。）
@@ -286,7 +292,7 @@ file  2       13 hi.txt
 
 ```
 > run scrub
-scrub: ok: 35 files, 3 dirs, 3 devices, 987 data blocks verified
+scrub: ok: 35 files, 3 dirs, 3 devices, 0 symlinks, 987 data blocks verified
 scrub: tree of 30 nodes, 1068 items, height 2; 6149 of 7168 blocks free, generation 1114
 [proc] pid 494 (scrub) exited with code 0
 ```

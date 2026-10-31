@@ -1,5 +1,5 @@
 //! 回归测试：文件系统的系统调用（open、read、write、mkdir、unlink、chdir、fstat、readdir、lseek、rename、
-//! link、mknod）和设备文件（/dev/null、/dev/zero、/dev/console）。
+//! link、mknod、symlink、readlink、lstat、getcwd）和设备文件（/dev/null、/dev/zero、/dev/console）。
 //! - `run t_fs`：正常情况和边界情况，失败的项打印 "FAIL: ..."，最后打印检查了几项、失败了几项。
 //!   所有东西建在 /t_fs 下面，结束时删干净（开始时也先删掉上一次留下的）。
 //! - `run t_fs churn &`：掉电测试的写的一方，一直写到被杀（或者 QEMU 被杀）：往 /churn.dat 末尾追加记录，
@@ -65,11 +65,13 @@ fn writeAll(fd: sys.Fd, bytes: []const u8) bool {
     return n == bytes.len;
 }
 
-/// 删掉 path 和它下面的所有东西（不存在就算了）。
+/// 删掉 path 和它下面的所有东西（不存在就算了）。用 lstat 看种类：指向目录的符号链接只删链接自己，
+/// 不能跟着它走进去（指向 / 的链接会把整个文件系统删掉）。
 fn removeTree(path: []const u8) void {
-    if (sys.open(path, .{})) |fd| {
-        defer sys.close(fd) catch {};
-        if ((sys.fstat(fd) catch return).kind == .dir) {
+    const st = sys.lstat(path) catch return;
+    if (st.kind == .dir) {
+        if (sys.open(path, .{})) |fd| {
+            defer sys.close(fd) catch {};
             var ent: abi.Dirent = undefined;
             // 边列边删：readdir 的位置是键，删掉的名字不影响后面的
             while (sys.readdir(fd, &ent) catch false) {
@@ -77,8 +79,8 @@ fn removeTree(path: []const u8) void {
                 const child = std.fmt.bufPrint(&buf, "{s}/{s}", .{ path, ent.name[0..ent.name_len] }) catch continue;
                 removeTree(child);
             }
-        }
-    } else |_| {} // 打不开的（比如内核不认识的设备文件）也删
+        } else |_| {}
+    }
     sys.unlink(path) catch {};
 }
 
@@ -390,6 +392,8 @@ pub fn main() u8 {
     testRename();
     testLink();
     testDevices();
+    testSymlinks();
+    testGetcwd();
 
     removeTree("/t_fs");
     expect(sys.open("/t_fs", .{}) == error.NotFound, "everything removed", .{});
@@ -681,6 +685,123 @@ fn testDevices() void {
     expect(sys.open("/dev/null/x", .{}) == error.NotDir, "path through a device", .{});
     expect(sys.exec("/dev/zero", &.{"zero"}) == error.BadElf, "exec a device", .{});
     for ([_][]const u8{ "/t_fs/mynull", "/t_fs/null2", "/t_fs/weird" }) |p| sys.unlink(p) catch expect(false, "unlink {s}", .{p});
+}
+
+fn succeeded(r: anytype) bool {
+    return if (r) |_| true else |_| false;
+}
+
+/// 符号链接：symlink、readlink、lstat；open、chdir、exec 跟着走，unlink、rename、link 对链接自己；
+/// open_create 穿过悬空的链接建目标；环是 SymlinkLoop；坏指针、截断。
+fn testSymlinks() void {
+    var buf: [64]u8 = undefined;
+    var tbuf: [abi.max_path]u8 = undefined;
+    sys.mkdir("/t_fs/s") catch {};
+    sys.mkdir("/t_fs/s/dir") catch {};
+    {
+        const fd = mustOpen("/t_fs/s/dir/f", .{ .write = true, .create = true });
+        _ = writeAll(fd, "via link");
+        sys.close(fd) catch {};
+    }
+    expect(succeeded(sys.symlink("dir/f", "/t_fs/s/rel")), "symlink (relative target)", .{});
+    expect(succeeded(sys.symlink("/t_fs/s/dir", "/t_fs/s/abs")), "symlink (absolute target, a directory)", .{});
+    // open 跟着走；lstat 不跟；readlink 读出目标，放不下就截断
+    var n = readAll("/t_fs/s/rel", &buf, 64);
+    expect(std.mem.eql(u8, buf[0..n], "via link"), "read through a relative symlink: \"{s}\"", .{buf[0..n]});
+    n = readAll("/t_fs/s/abs/f", &buf, 64);
+    expect(n == 8, "read through a symlink to a directory: {d}", .{n});
+    const lst = sys.lstat("/t_fs/s/rel") catch std.mem.zeroes(abi.Stat);
+    expect(lst.kind == .symlink and lst.size == 5 and lst.nlink == 1 and lst.ino != inoOf("/t_fs/s/dir/f"), "lstat a symlink: kind {d} size {d}", .{ @backingInt(lst.kind), lst.size });
+    expect(inoOf("/t_fs/s/rel") == inoOf("/t_fs/s/dir/f"), "open + fstat follows the symlink", .{});
+    expect((sys.lstat("/t_fs/s/dir/f") catch std.mem.zeroes(abi.Stat)).kind == .file, "lstat a file", .{});
+    const t = sys.readlink("/t_fs/s/abs", &tbuf) catch "";
+    expect(std.mem.eql(u8, t, "/t_fs/s/dir"), "readlink: \"{s}\"", .{t});
+    const short = sys.readlink("/t_fs/s/abs", tbuf[0..3]) catch "";
+    expect(std.mem.eql(u8, short, "/t_"), "readlink into a short buffer truncates: \"{s}\"", .{short});
+    expect(sys.readlink("/t_fs/s/dir/f", &tbuf) == error.InvalidArgument, "readlink a file", .{});
+    expect(sys.readlink("/t_fs/s/nope", &tbuf) == error.NotFound, "readlink a missing name", .{});
+    expect(sys.readlink("/t_fs/s/abs", @as([*]u8, @ptrFromInt(0x8020_0000))[0..8]) == error.BadAddress, "readlink into a kernel pointer", .{});
+    expect(sys.lstat(@as([*]const u8, @ptrFromInt(0x8020_0000))[0..4]) == error.BadAddress, "lstat a kernel pointer", .{});
+    // 目录里建东西、chdir 穿过链接
+    {
+        const fd = mustOpen("/t_fs/s/abs/g", .{ .write = true, .create = true });
+        sys.close(fd) catch {};
+    }
+    expect(sys.open("/t_fs/s/dir/g", .{}) != error.NotFound, "create through a symlinked directory", .{});
+    expect(succeeded(sys.chdir("/t_fs/s/abs")), "chdir through a symlink", .{});
+    expect(inoOf(".") == inoOf("/t_fs/s/dir"), "cwd is the target directory", .{});
+    expect(inoOf("..") == inoOf("/t_fs/s"), ".. after chdir through a symlink is the target's parent", .{});
+    sys.chdir("/") catch {};
+    // 悬空的链接：open 是 NotFound，带 create 时建它指向的文件
+    expect(succeeded(sys.symlink("made", "/t_fs/s/dangling")), "symlink to a missing file", .{});
+    expect(sys.open("/t_fs/s/dangling", .{}) == error.NotFound, "open a dangling symlink", .{});
+    expect((sys.lstat("/t_fs/s/dangling") catch std.mem.zeroes(abi.Stat)).kind == .symlink, "lstat a dangling symlink", .{});
+    {
+        const fd = sys.open("/t_fs/s/dangling", .{ .write = true, .create = true }) catch 99;
+        expect(fd != 99, "open_create through a dangling symlink", .{});
+        if (fd != 99) {
+            _ = writeAll(fd, "made");
+            sys.close(fd) catch {};
+        }
+    }
+    n = readAll("/t_fs/s/made", &buf, 64);
+    expect(std.mem.eql(u8, buf[0..n], "made"), "open_create made the target: \"{s}\"", .{buf[0..n]});
+    expect(sys.mkdir("/t_fs/s/dangling") == error.Exists, "mkdir over a symlink", .{});
+    // 环
+    expect(succeeded(sys.symlink("loop2", "/t_fs/s/loop1")), "symlink loop1", .{});
+    expect(succeeded(sys.symlink("loop1", "/t_fs/s/loop2")), "symlink loop2", .{});
+    expect(sys.open("/t_fs/s/loop1", .{}) == error.SymlinkLoop, "open a symlink loop", .{});
+    expect(sys.open("/t_fs/s/loop1", .{ .write = true, .create = true }) == error.SymlinkLoop, "create through a symlink loop", .{});
+    expect(sys.chdir("/t_fs/s/loop2/x") == error.SymlinkLoop, "chdir through a symlink loop", .{});
+    expect(sys.exec("/t_fs/s/loop1", &.{"loop"}) == error.SymlinkLoop, "exec a symlink loop", .{});
+    // exec 跟着走：进程名是链接的名字
+    expect(succeeded(sys.symlink("/bin/echo", "/t_fs/s/say")), "symlink to a program", .{});
+    {
+        const pid = fork();
+        if (pid == 0) {
+            sys.exec("/t_fs/s/say", &.{ "say", "t_fs: exec through a symlink" }) catch {};
+            sys.exit(99);
+        }
+        expect(waitStatus(pid) == 0, "exec through a symlink", .{});
+    }
+    // 错误：已有的名字、空的和太长的目标
+    expect(sys.symlink("x", "/t_fs/s/rel") == error.Exists, "symlink onto an existing name", .{});
+    expect(sys.symlink("", "/t_fs/s/empty") == error.NotFound, "symlink with an empty target", .{});
+    const long: [abi.max_path + 1]u8 = @splat('a');
+    expect(sys.symlink(&long, "/t_fs/s/long") == error.NameTooLong, "symlink with a too long target", .{});
+    expect(succeeded(sys.symlink(long[0..abi.max_path], "/t_fs/s/long")), "symlink with the longest target", .{});
+    const longest: []const u8 = sys.readlink("/t_fs/s/long", &tbuf) catch "";
+    expect(longest.len == abi.max_path, "readlink the longest target: {d}", .{longest.len});
+    expect(sys.symlink(@as([*]const u8, @ptrFromInt(0x8020_0000))[0..4], "/t_fs/s/k") == error.BadAddress, "symlink from a kernel pointer", .{});
+    // rename、link、unlink 对的是链接自己
+    expect(succeeded(sys.rename("/t_fs/s/rel", "/t_fs/s/rel2")), "rename a symlink", .{});
+    expect(inoOf("/t_fs/s/rel2") == inoOf("/t_fs/s/dir/f"), "a renamed symlink still works", .{});
+    expect(succeeded(sys.link("/t_fs/s/rel2", "/t_fs/s/hard")), "hard link to a symlink", .{});
+    expect((sys.lstat("/t_fs/s/hard") catch std.mem.zeroes(abi.Stat)).nlink == 2, "nlink of a hard-linked symlink", .{});
+    expect(nlinkOf("/t_fs/s/dir/f") == 1, "linking a symlink does not link its target", .{});
+    for ([_][]const u8{ "/t_fs/s/rel2", "/t_fs/s/hard", "/t_fs/s/abs" }) |p| expect(succeeded(sys.unlink(p)), "unlink symlink {s}", .{p});
+    expect(sys.open("/t_fs/s/dir/f", .{}) != error.NotFound, "unlinking a symlink keeps its target", .{});
+    // 指向 / 的链接：removeTree 不能跟着它走进去
+    expect(succeeded(sys.symlink("/", "/t_fs/s/root")), "symlink to /", .{});
+}
+
+/// getcwd：根目录、深处、经过符号链接（真实路径）、放不下、被删掉的当前目录。
+fn testGetcwd() void {
+    var buf: [abi.max_path]u8 = undefined;
+    var cwd = sys.getcwd(&buf) catch "";
+    expect(std.mem.eql(u8, cwd, "/"), "getcwd at /: \"{s}\"", .{cwd});
+    sys.mkdir("/t_fs/g") catch {};
+    sys.mkdir("/t_fs/g/deeper") catch {};
+    sys.symlink("/t_fs/g/deeper", "/t_fs/g/l") catch {};
+    sys.chdir("/t_fs/g/l") catch {};
+    cwd = sys.getcwd(&buf) catch "";
+    expect(std.mem.eql(u8, cwd, "/t_fs/g/deeper"), "getcwd after chdir through a symlink: \"{s}\"", .{cwd});
+    expect(sys.getcwd(buf[0..5]) == error.BufferTooSmall, "getcwd into a short buffer", .{});
+    expect(sys.getcwd(@as([*]u8, @ptrFromInt(0x8020_0000))[0..64]) == error.BadAddress, "getcwd into a kernel pointer", .{});
+    // 当前目录被删掉了：NotFound，chdir 走开之后照常
+    expect(succeeded(sys.unlink("/t_fs/g/deeper")), "unlink the current directory", .{});
+    expect(sys.getcwd(&buf) == error.NotFound, "getcwd in a removed directory", .{});
+    sys.chdir("/") catch {};
 }
 
 // ---- 掉电测试 ----

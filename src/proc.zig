@@ -291,7 +291,7 @@ pub fn fork() ForkError!usize {
     return pid;
 }
 
-pub const ExecError = error{ NoSuchProgram, OutOfMemory, BadElf, IoError, NoDevice, NotDir, NameTooLong };
+pub const ExecError = error{ NoSuchProgram, OutOfMemory, BadElf, IoError, NoDevice, NotDir, NameTooLong, SymlinkLoop };
 
 /// 用文件系统里的程序 path 替换当前进程的地址空间（对应 xv6 的 exec），args 是命令行参数（在内核内存里，
 /// 个数和总长度由调用方检查过）。path 里没有 '/' 时在 /bin 里找，有的话按路径找（相对路径从当前目录开始）。
@@ -339,6 +339,7 @@ fn openProgram(root: *fs.Fs, cwd: u64, path: []const u8) ExecError!Source {
         error.NotFound => error.NoSuchProgram,
         error.NotDir => error.NotDir,
         error.NameTooLong => error.NameTooLong,
+        error.SymlinkLoop => error.SymlinkLoop,
         else => error.IoError,
     };
     const st = root.stat(ino) catch return error.IoError;

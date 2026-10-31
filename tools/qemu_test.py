@@ -188,6 +188,101 @@ def case_shell(q, c, mode):
     exited(c, out, "hello", 0)
     c.contains(q.command("echo one two|wc"), r"\n1 2 8\n", "a pipeline without run")
     c.contains(q.command("nope|wc"), r"unknown command: nope \(try 'help'\)\n", "unknown program in a pipeline")
+    shell_language(q, c)
+    shell_editing(q, c)
+    shell_scripts(q, c)
+    shell_jobs(q, c)
+
+
+def shell_language(q, c):
+    """引号、转义、变量、$?、; && ||、注释、glob、语法错误、内置命令的重定向和管道。"""
+    c.contains(q.command("echo 'a  b' \"c  d\" e\\ f 'it''s'"), r"\na  b c  d e f its\n", "quotes and backslash")
+    out = q.command("X=hello; echo \"$X world\" '$X' ${X}x $NOPE \"\\$X\"")
+    c.contains(out, r"\nhello world \$X hellox \$X\n", "variables")
+    c.contains(q.command("set"), r"\nX=hello\n", "set lists the variables")
+    q.command("unset X")
+    c.expect("X=hello" not in q.command("set"), "unset removes the variable")
+    c.contains(q.command("false; echo $?"), r"\n1\n", "$? after false")
+    c.contains(q.command("nope; echo $?"), r"unknown command: nope \(try 'help'\)\n127\n", "$? of an unknown command")
+    c.contains(q.command("true && echo yes || echo no"), r"\nyes\n", "&&")
+    out = q.command("false && echo no || echo yes")
+    c.contains(out, r"\nyes\n", "|| after a skipped &&")
+    c.expect("\nno\n" not in out, f"false && echo no ran echo:\n{indent(out)}")
+    c.contains(q.command("echo a; echo b # echo c"), r"\na\n(.*\n)?b\n", "; and a comment")
+    # 语法错误：整行都不执行
+    for line, err in (("echo first; echo 'open", "unterminated quote"), ("echo first &&", "empty command"),
+                      ("echo first | ; echo x", "empty command"), ("echo first > ", "missing file name after < or >"),
+                      ("echo ${X", r"bad substitution \(\$\{NAME\}\)")):
+        out = q.command(line)
+        c.contains(out, rf"sh: {err}\n", line)
+        c.expect("first\n" not in out.split("\n", 1)[1], f"'{line}': ran a command before the syntax error:\n{indent(out)}")
+    c.contains(q.command("echo $?"), r"\n2\n", "$? after a syntax error")
+    # 文件名匹配：只有最后一段；没匹配到的原样留着；引号里的不展开
+    c.contains(q.command("echo /bin/t_f*"), r"\n/bin/t_fork /bin/t_fp /bin/t_fs /bin/t_fsmp\n", "glob *")
+    c.contains(q.command("echo /bin/?c /bin/zz* '/bin/t_f*'"), r"\n/bin/wc /bin/zz\* /bin/t_f\*\n", "glob ?, no match, quoted")
+    c.contains(q.command("cd /dev; echo *; cd /"), r"\nconsole null zero\n", "glob in the current directory")
+    # cd、pwd、cd -
+    c.contains(q.command("cd /dev; pwd; cd /bin; cd -; pwd"), r"\n/dev\n/dev\n/dev\n", "cd, pwd, cd -")
+    q.command("cd")
+    c.contains(q.command("pwd"), r"\n/\n", "cd without arguments")
+    # 内置命令在管道里（在子进程里运行）、重定向之后标准输出换回来
+    c.contains(q.command("pwd | wc"), r"\n1 1 2\n", "a builtin in a pipeline")
+    q.command("pwd > /pwd.txt")
+    c.contains(q.command("cat /pwd.txt; rm /pwd.txt"), r"\n/\n", "a builtin with > F")
+    c.contains(q.command("uptime"), r"\nup \d+\.\d\ds\n", "stdout is back after a builtin with > F")
+
+
+def shell_editing(q, c):
+    """交互的行编辑：上下方向键翻历史、Ctrl-U、Tab 补全。"""
+    q.command("echo history one")
+    q.command("echo history two")
+    c.contains(q.command("\x1b[A\x1b[A\x1b[B"), r"\nhistory two\n", "up, up, down recalls the last command")
+    c.contains(q.command("\x1b[A\x1b[A"), r"\nhistory one\n", "up twice")
+    c.contains(q.command("history"), r"\d+  echo history one\n +\d+  echo history two\n", "history")
+    c.contains(q.command("garbage\x15echo cleared"), r"\ncleared\n", "Ctrl-U clears the line")
+    # Tab：唯一的候选补全它，目录后面加 /；几个候选列出来，重新打印这一行
+    out = q.command("hell\t")
+    c.contains(out, r"Hello from U-mode!", "Tab completes a program name")
+    out = q.command("ls /de\t")
+    c.contains(out, r"ls /dev/\n", "Tab completes a directory")
+    c.contains(out, r"\ndev +1 +1 console\n", "ls /dev/ after Tab")
+    q.send("t_f\t")
+    q.wait_for(lambda t: "\nt_fork  t_fp  t_fs  t_fsmp  \n> t_f" in t, COMMAND_TIMEOUT, "the list of completions")
+    c.contains(q.command("\x15echo after the list"), r"\nafter the list\n", "a command after listing completions")
+
+
+def shell_scripts(q, c):
+    """sh 文件 参数、sh -c、从管道读命令；脚本里的 cd、exit 不影响交互的 shell。"""
+    q.command("echo 'echo script $0: $# args, $1, $2 # comment' > /t.sh")
+    q.command("echo 'cd /dev; pwd; exit 5' >> /t.sh")
+    q.command("echo 'echo not reached' >> /t.sh")
+    out = q.command("sh /t.sh one 'two three'; echo status $?")
+    c.contains(out, r"\nscript /t\.sh: 2 args, one, two three\n", "sh FILE ARGS")
+    c.contains(out, r"\n/dev\n", "cd in a script")
+    c.contains(out, r"\nstatus 5\n", "exit in a script")
+    c.expect("not reached" not in out, f"a script went on after exit:\n{indent(out)}")
+    c.contains(q.command("pwd"), r"\n/\n", "a script's cd does not change the shell's directory")
+    c.contains(q.command("sh -c 'echo $0 $1; false' x y; echo $?"), r"\nx y\n(.*\n)*1\n", "sh -c")
+    c.contains(q.command("echo 'echo from a pipe' | sh"), r"\nfrom a pipe\n", "sh reading commands from a pipe")
+    c.contains(q.command("sh < /t.sh"), r"\nscript sh: 0 args, ,\n", "sh < FILE")
+    c.contains(q.command("sh /nope"), r"sh: /nope: NotFound\n", "sh a missing file")
+    q.command("rm /t.sh")
+
+
+def shell_jobs(q, c):
+    """jobs、wait、$!、time、kill 几个进程；最后 exit：init 重新启动一个 shell。"""
+    pid = start_background(q, c, "spin")
+    if pid is not None:
+        c.contains(q.command("jobs"), rf"\n\[{pid}\] \w+ +spin\n", "jobs")
+        c.contains(q.command("echo $!"), rf"\n{pid}\n", "$!")
+        c.contains(q.command("kill $!"), rf"pid {pid} \(spin\) killed: kill\(\)", "kill $!")
+    c.expect("[" not in q.command("jobs").split("\n", 1)[1], "jobs after killing the background process")
+    c.contains(q.command("hello & wait $!; echo waited $?"), r"Hello from U-mode!(.*\n)*waited 0\n", "wait PID")
+    c.contains(q.command("time hello"), r"\nreal \d+\.\d\ds\n", "time")
+    c.contains(q.command("kill 9999 1"), r"kill: no such process: 9999\nkill: cannot kill pid 1: permission denied\n",
+               "kill several pids")
+    out = q.command("exit 3")
+    c.contains(out, r"\(sh\) exited with code 3\ninit: sh exited, restarting it\nType 'help' for commands\.\n", "exit")
 
 
 def case_interrupts(q, c, mode):
@@ -344,9 +439,11 @@ def case_sched(q, c, mode):
     # 杀掉它之后，子进程发现自己交给了 init，各自结束
     start = len(q.text())
     m = c.contains(q.command("run t_fork fill &"), r"\[proc\] pid (\d+) \(t_fork\) started in the background", "run t_fork fill &")
-    q.wait_for(lambda t: "t_fork: filled the process table" in t[start:], COMMAND_TIMEOUT, "t_fork fill")
+    # 等整行都到了再检查：串口的输出是一块一块到的，只等开头的话可能只读到半行
+    q.wait_for(lambda t: re.search(r"t_fork: filled the process table with \d+ children\n", t[start:]), COMMAND_TIMEOUT,
+               "t_fork fill")
     c.contains(q.text()[start:], rf"t_fork: filled the process table with {MAX_PROCS - 3} children\n", "t_fork fill")
-    c.contains(q.command("run hello"), rf"run: too many processes \(at most {MAX_PROCS}\)", "run with a full table")
+    c.contains(q.command("run hello"), rf"sh: too many processes \(at most {MAX_PROCS}\)", "run with a full table")
     if m:
         q.command(f"kill {m.group(1)}")
     wait_ps_empty(q, c, "the children of t_fork fill")
@@ -373,7 +470,7 @@ def case_protection(q, c, mode):
     # sstatus.FS = Off，浮点指令是非法指令。stval 是 fmv.d.x f1, a0 的编码
     check_killed(c, q.command("run t_fp"), "t_fp", "illegal_instruction", stval=0xF20500D3)
     out = q.command("run t_noperm")
-    c.contains(out, r"run: cannot load t_noperm: BadElf", "run t_noperm")
+    c.contains(out, r"sh: cannot load t_noperm: BadElf", "run t_noperm")
     c.expect("should never run" not in out, "run t_noperm: the program ran")
 
 
@@ -434,7 +531,7 @@ def case_args(q, c, mode):
     exited(c, out, "t_args", 4)
     c.contains(q.command("run echo hello,   world"), r"\nhello, world\n", "run echo")
     c.contains(q.command("run echo"), r"echo\n\n\[proc\]", "run echo without arguments")
-    c.contains(q.command("run t_args " + " ".join(["x"] * MAX_ARGS)), rf"run: too many arguments \(at most {MAX_ARGS}\)",
+    c.contains(q.command("run t_args " + " ".join(["x"] * MAX_ARGS)), rf"sh: too many arguments \(at most {MAX_ARGS}\)",
                f"run t_args x*{MAX_ARGS}")
     check_counts(c, q.command("run t_args check"), "t_args")
 
@@ -450,9 +547,9 @@ def case_pipe(q, c, mode):
     c.contains(q.command("run echo a b c | cat | cat | wc"), r"\n1 3 6\n", "run echo | cat | cat | wc")
     c.contains(q.command("run t_args x y|wc"), r"\n5 7 62\n", "run t_args | wc")
     c.contains(q.command("run echo a | nope"), r"no such program: nope", "run echo | nope")
-    c.contains(q.command("run echo a |"), r"run: empty command in the pipeline", "run echo |")
+    c.contains(q.command("run echo a |"), r"sh: empty command\n", "run echo |")
     c.contains(q.command("run echo a b c | cat | cat | cat | cat | cat | cat | wc"), r"\n1 3 6\n", "run with 8 programs")
-    c.contains(q.command("run " + " | ".join(["echo"] * 9)), r"run: too many programs in the pipeline \(at most 8\)",
+    c.contains(q.command("run " + " | ".join(["echo"] * 9)), r"sh: too many programs in the pipeline \(at most 8\)",
                "run with 9 programs")
     # 后台管道
     m = c.contains(q.command("run echo bg | wc &"), r"\[proc\] pid (\d+) \(pipeline\) started in the background",
@@ -570,7 +667,7 @@ def reboot(q, c, what, steps):
 
 def scrub_ok(c, out, what):
     """scrub 通过了，返回它数出来的文件数。"""
-    m = c.contains(out, r"scrub: ok: (\d+) files, \d+ dirs, 3 devices, \d+ data blocks verified\n", what)
+    m = c.contains(out, r"scrub: ok: (\d+) files, \d+ dirs, 3 devices, \d+ symlinks, \d+ data blocks verified\n", what)
     exited(c, out, "scrub", 0)
     return int(m.group(1)) if m else None
 
@@ -603,6 +700,7 @@ def check_fs_reboots(q, c):
 
     def second(r):
         c.contains(r.command("run cat /keep.txt"), r"\npersist across reboots\n", "reboot: cat /keep.txt")
+        c.contains(r.command("cat /keep.lnk"), r"\npersist across reboots\n", "reboot: cat a symlink")
         r.send("run t_fs churn &\r")
         r.wait_for(lambda t: "churn: started" in t, COMMAND_TIMEOUT, "churn: started")
         time.sleep(delay)
@@ -680,9 +778,9 @@ def case_fs(q, c, mode):
     c.contains(q.command("cd /nope"), r"cd: /nope: NotFound\n", "cd /nope")
     c.contains(q.command("cd /bin/hello"), r"cd: /bin/hello: NotDir\n", "cd /bin/hello")
     c.contains(q.command("run cat /nope"), r"cat: /nope: NotFound\n", "run cat /nope")
-    c.contains(q.command("run cat < /nope"), r"run: /nope: NotFound\n", "run cat < /nope")
-    c.contains(q.command("run echo x > /bin"), r"run: /bin: IsDir\n", "run echo x > /bin")
-    c.contains(q.command("run echo x >"), r"run: missing file name after < or >\n", "run echo x >")
+    c.contains(q.command("run cat < /nope"), r"sh: /nope: NotFound\n", "run cat < /nope")
+    c.contains(q.command("run echo x > /bin"), r"sh: /bin: IsDir\n", "run echo x > /bin")
+    c.contains(q.command("run echo x >"), r"sh: missing file name after < or >\n", "run echo x >")
     c.contains(q.command("run mkdir /bin"), r"mkdir: /bin: Exists\n", "run mkdir /bin")
     # >> 追加；mv 改名、挪进目录、换掉已有的文件
     q.command("echo one > /log")
@@ -699,13 +797,14 @@ def case_fs(q, c, mode):
     c.contains(q.command("mv /nope /x"), r"mv: /nope -> /x: NotFound\n", "mv a missing file")
     c.contains(q.command("mv /m /m/sub"), r"mv: /m -> /m/sub: InvalidArgument\n", "mv a directory into itself")
     exited(c, q.command("rm /m/log2 /m"), "rm", 0)
+    fs_symlinks(q, c)
     # 程序从文件系统加载：复制一个程序、按路径运行它（进程名是文件名）；不是 ELF 的文件、目录不能运行
     q.command("run cat /bin/hello > /h")
     out = q.command("run /h")
     c.contains(out, r"Hello from U-mode!", "run /h (a copy of hello)")
     exited(c, out, "h", 0)
     q.command("run echo not an ELF > /bad")
-    c.contains(q.command("run /bad"), r"run: cannot load /bad: BadElf\n", "run /bad")
+    c.contains(q.command("run /bad"), r"sh: cannot load /bad: BadElf\n", "run /bad")
     c.contains(q.command("run /bin"), r"no such program: /bin\n", "run /bin")
     exited(c, q.command("run rm /h /bad"), "rm", 0)
     # 系统调用的边界情况、并发；之后整个文件系统检查一遍
@@ -715,7 +814,31 @@ def case_fs(q, c, mode):
     scrub_ok(c, q.command("run scrub"), "run scrub")
     # 关机之后：重新启动看文件还在，再测掉电
     q.command("run echo persist across reboots > /keep.txt")
+    q.command("ln -s keep.txt /keep.lnk")
     q.after_shutdown.append((c, lambda c: check_fs_reboots(q, c)))
+
+
+def fs_symlinks(q, c):
+    """符号链接：ln -s、ls 显示目标、跟着走的 cat、cd、建文件；悬空的、有环的；rm 只删链接。"""
+    q.command("mkdir /sd; echo via symlink > /sd/f")
+    exited(c, q.command("ln -s sd/f /sl"), "ln", 0)  # 相对的目标从链接所在的目录（/）算起
+    c.contains(q.command("ls /sl"), r"\nlink +1 +4 /sl -> sd/f\n", "ls a symlink")
+    c.contains(q.command("cat /sl"), r"\nvia symlink\n", "cat through a symlink")
+    q.command("ln -s /sd /sdl")
+    c.contains(q.command("ls /sdl"), r"\nfile +1 +12 f\n", "ls a symlink to a directory lists the directory")
+    c.contains(q.command("ls /"), r"\nlink +1 +3 sdl -> /sd\n", "ls shows symlinks in a directory")
+    c.contains(q.command("cd /sdl; pwd; cat f; cd /"), r"\n/sd\nvia symlink\n", "cd through a symlink")
+    q.command("ln -s /nowhere /dl")
+    c.contains(q.command("ls /dl"), r"\nlink +1 +8 /dl -> /nowhere\n", "ls a dangling symlink")
+    c.contains(q.command("cat /dl"), r"cat: /dl: NotFound\n", "cat a dangling symlink")
+    q.command("echo made > /dl")
+    c.contains(q.command("cat /nowhere"), r"\nmade\n", "> through a dangling symlink creates the target")
+    q.command("ln -s lp /lp")
+    c.contains(q.command("cat /lp"), r"cat: /lp: SymlinkLoop\n", "cat a symlink loop")
+    c.contains(q.command("ln -s /x /sl"), r"ln: /x -> /sl: Exists\n", "ln -s onto an existing name")
+    exited(c, q.command("rm /sl /sdl /dl /lp"), "rm", 0)
+    c.contains(q.command("cat /sd/f /nowhere"), r"\nvia symlink\nmade\n", "rm a symlink keeps the target")
+    exited(c, q.command("rm /sd/f /sd /nowhere"), "rm", 0)
 
 
 def case_smp(q, c, mode):

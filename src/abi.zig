@@ -89,6 +89,19 @@ pub const Syscall = enum(usize) {
     link = 33,
     /// mknod(path_ptr, path_len, major) 建一个设备文件，返回 0。major 见 Major；不认识的也能建，打开时才是 -ENXIO
     mknod = 34,
+    /// symlink(target_ptr, target_len, path_ptr, path_len) 建一个符号链接 path，内容是 target（不用存在），返回 0。
+    /// 别的调用解析路径时遇到符号链接就换成 target 接着走（相对的 target 从链接所在的目录开始），最多 10 次，
+    /// 再多是 -ELOOP。unlink、rename、link 对的是链接自己
+    symlink = 35,
+    /// readlink(path_ptr, path_len, buf_ptr, buf_len) 把符号链接 path 的目标写进 buf（不以 0 结尾，
+    /// 放不下就截断），返回写了几个字节。path 不是符号链接是 -EINVAL
+    readlink = 36,
+    /// getcwd(buf_ptr, buf_len) 把当前目录的绝对路径写进 buf（不以 0 结尾），返回它的长度。放不下是 -ERANGE；
+    /// 当前目录被删掉了是 -ENOENT
+    getcwd = 37,
+    /// lstat(path_ptr, path_len, ptr) 把 path 的 Stat 写进用户内存，返回 0。path 是符号链接的话是链接自己的
+    /// （种类 symlink，长度是目标的长度），不跟着走
+    lstat = 38,
     _,
 };
 
@@ -131,13 +144,15 @@ pub const FileKind = enum(u8) {
     pipe = 4,
     /// 文件系统里的设备文件
     device = 5,
+    /// 符号链接（lstat、readdir 才看得到：open 跟着它走）
+    symlink = 6,
     _,
 };
 
 pub const Stat = extern struct {
     /// 文件系统里的 inode 号，串口和管道是 0
     ino: u64,
-    /// 文件的字节数，目录、设备、串口、管道是 0
+    /// 文件的字节数，符号链接的目标的长度；目录、设备、串口、管道是 0
     size: u64,
     kind: FileKind,
     _pad: u8 = 0,
@@ -202,12 +217,16 @@ pub const Errno = enum(usize) {
     /// 指针指向的内存不属于用户空间，或者没有映射
     fault = 14,
     /// 参数不对；块号超出原始区域（readblock、writeblock）；名字是 "."、".."；
-    /// rename 把目录挪进它自己下面；lseek 挪到负的位置、whence 不对
+    /// rename 把目录挪进它自己下面；lseek 挪到负的位置、whence 不对；readlink 的不是符号链接
     inval = 22,
     /// 系统的文件表满了（pipe、fork）
     nfile = 23,
     /// 进程的 fd 表满了（dup、pipe）
     mfile = 24,
+    /// 解析路径时跟着走的符号链接太多（多半是有环）
+    loop = 40,
+    /// 给的缓冲区放不下（getcwd）
+    range = 34,
     /// 管道的读端都关了，写进去没人读（write）
     pipe = 32,
     /// 不能 lseek 的文件（串口、管道）
@@ -291,6 +310,7 @@ pub const ScrubInfo = extern struct {
     files: u64,
     dirs: u64,
     devices: u64,
+    symlinks: u64,
     /// 读过、校验和对得上的数据块（不算内联在树里的小文件）
     data_blocks: u64,
     /// B 树的节点数、条目数、层数

@@ -134,6 +134,10 @@ pub const FsError = error{
     TooManyLinks,
     /// 打开的设备文件的设备号内核不认识
     NoSuchDevice,
+    /// 跟着走的符号链接太多（多半是有环）
+    SymlinkLoop,
+    /// 给的缓冲区放不下（getcwd）
+    BufferTooSmall,
     Unexpected,
 };
 
@@ -159,6 +163,8 @@ fn fsResult(ret: usize) FsError!usize {
         .perm => error.PermissionDenied,
         .mlink => error.TooManyLinks,
         .nxio => error.NoSuchDevice,
+        .loop => error.SymlinkLoop,
+        .range => error.BufferTooSmall,
         else => error.Unexpected,
     };
 }
@@ -221,6 +227,30 @@ pub fn link(old: []const u8, new: []const u8) FsError!void {
 /// 建一个设备文件（见 abi.Syscall.mknod）。
 pub fn mknod(path: []const u8, major: abi.Major) FsError!void {
     _ = try fsResult(syscall(.mknod, @intFromPtr(path.ptr), path.len, @backingInt(major)));
+}
+
+/// 建符号链接 path，指向 target（见 abi.Syscall.symlink）。
+pub fn symlink(target: []const u8, path: []const u8) FsError!void {
+    _ = try fsResult(syscall4(.symlink, @intFromPtr(target.ptr), target.len, @intFromPtr(path.ptr), path.len));
+}
+
+/// 符号链接 path 的目标，写进 buf，返回写了的那一段（放不下就截断）。不是符号链接是 InvalidArgument。
+pub fn readlink(path: []const u8, buf: []u8) FsError![]const u8 {
+    const n = try fsResult(syscall4(.readlink, @intFromPtr(path.ptr), path.len, @intFromPtr(buf.ptr), buf.len));
+    return buf[0..n];
+}
+
+/// 当前目录的绝对路径，写进 buf，返回那一段。
+pub fn getcwd(buf: []u8) FsError![]const u8 {
+    const n = try fsResult(syscall(.getcwd, @intFromPtr(buf.ptr), buf.len, 0));
+    return buf[0..n];
+}
+
+/// path 自己的 Stat：是符号链接的话不跟着走（open + fstat 是跟着走的）。
+pub fn lstat(path: []const u8) FsError!abi.Stat {
+    var st: abi.Stat = undefined;
+    _ = try fsResult(syscall(.lstat, @intFromPtr(path.ptr), path.len, @intFromPtr(&st)));
+    return st;
 }
 
 pub const Whence = enum(usize) { set = abi.seek_set, cur = abi.seek_cur, end = abi.seek_end };
@@ -332,7 +362,7 @@ pub fn fork() ForkError!usize {
     return ret;
 }
 
-pub const ExecError = error{ NoSuchProgram, OutOfMemory, BadElf, BadAddress, ArgsTooLong, NameTooLong, NotDir, IoError, NoDevice, Unexpected };
+pub const ExecError = error{ NoSuchProgram, OutOfMemory, BadElf, BadAddress, ArgsTooLong, NameTooLong, NotDir, IoError, NoDevice, SymlinkLoop, Unexpected };
 
 /// 换成文件系统里的程序 name 运行（name 里没有 '/' 时在 /bin 里找），命令行参数是 args（按惯例第一个是程序名）。
 /// 成功时不返回。
@@ -357,6 +387,7 @@ pub fn execRaw(name: []const u8, args: []const abi.Arg) ExecError!noreturn {
         .notdir => error.NotDir,
         .io => error.IoError,
         .nodev => error.NoDevice,
+        .loop => error.SymlinkLoop,
         else => error.Unexpected,
     };
 }

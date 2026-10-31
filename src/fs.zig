@@ -12,6 +12,8 @@
 //! - 硬链接：文件和设备可以有几个名字（link），Inode.nlink 记着有几个，最后一个名字删掉才删 inode。
 //!   目录只有一个名字（它的 parent 才有意义）。
 //! - 设备文件（mknod）：只有 inode，没有内容，Inode.major 说是哪个设备，打开它的读写交给内核的设备（file.zig）。
+//! - 符号链接（symlink）：inode 的长度是目标路径的长度，目标内联在第 0 页的内容条目里（btrfs 也这样存）。
+//!   解析路径时遇到它就换成目标接着走（最多 max_follows 次）；unlink、rename、link 对的是链接自己。
 //! - 文件按 4 KiB 一页存。不超过 inline_max 字节的文件整个内联在第 0 页的条目里（btrfs 的 inline extent），
 //!   省一个数据块；长大之后换成数据块。没有条目的页是“洞”，读出来是 0。长度之外的字节总是 0。
 //! - 数据块也写时复制：改一页就分配一个新块、写好，再改条目指向它，旧块交给 Volume.freeData
@@ -34,13 +36,17 @@ pub const max_name = 255;
 pub const inline_max = 512;
 /// 文件最大多少（页号乘 4096 不能溢出，留够余量）
 pub const max_file_size: u64 = 1 << 40;
+/// 符号链接的目标最长多少字节（目标是一个路径，和 abi.max_path 一样长）
+pub const max_symlink = 256;
+/// 解析一个路径最多跟着走多少次符号链接，再多就当作有环（SymlinkLoop）。xv6 的 symlink 实验建议的也是 10
+pub const max_follows = 10;
 
 const type_inode: u8 = 1;
 const type_dir: u8 = 2;
 const type_extent: u8 = 3;
 
 /// inode 的种类。数值和 abi.FileKind 一样（3、4 是串口、管道，不在文件系统里）
-pub const Kind = enum(u8) { file = 1, dir = 2, device = 5, _ };
+pub const Kind = enum(u8) { file = 1, dir = 2, device = 5, symlink = 6, _ };
 
 pub const Inode = extern struct {
     kind: Kind,
@@ -82,6 +88,7 @@ const BlockExtent = extern struct {
 comptime {
     std.debug.assert(@sizeOf(Inode) == 24 and @sizeOf(DirHeader) == 16 and @sizeOf(BlockExtent) == 24);
     std.debug.assert(@sizeOf(DirHeader) + max_name <= btree.max_data and @sizeOf(ExtentHeader) + inline_max <= btree.max_data);
+    std.debug.assert(max_symlink <= inline_max); // 符号链接的目标总是内联的
 }
 
 pub const Error = ctree.Error || error{
@@ -101,6 +108,10 @@ pub const Error = ctree.Error || error{
     IsDirLink,
     /// 链接数到上限了
     TooManyLinks,
+    /// 解析路径时跟着走的符号链接太多（多半是有环）
+    SymlinkLoop,
+    /// readlink 的不是符号链接
+    NotSymlink,
 };
 
 pub const Stat = struct {
@@ -232,12 +243,34 @@ pub const Fs = struct {
             std.mem.indexOfScalar(u8, name, '/') != null) return error.InvalidName;
     }
 
-    /// 路径对应的 inode 号。以 '/' 开头的从根目录找，否则从 cwd 找；多个 '/' 当一个，"." 和 ".." 照常。
+    /// 路径对应的 inode 号，跟着符号链接走（最后一段是符号链接的话，返回它指向的东西）。
+    /// 以 '/' 开头的从根目录找，否则从 cwd 找；多个 '/' 当一个，"." 和 ".." 照常。
     pub fn resolve(fs: *Fs, cwd: u64, path: []const u8) Error!u64 {
-        if (path.len == 0) return error.NotFound;
+        return fs.walk(cwd, path, true);
+    }
+
+    /// 和 resolve 一样，但最后一段是符号链接的话返回链接自己（lstat、readlink、link 用）。中间的符号链接照样跟着走。
+    pub fn resolveNoFollow(fs: *Fs, cwd: u64, path: []const u8) Error!u64 {
+        return fs.walk(cwd, path, false);
+    }
+
+    /// 一段一段地走路径。遇到符号链接（不是不跟的最后一段）就把“目标 + 还没走的部分”拼成新的路径接着走：
+    /// 目标是绝对路径的从根目录重新开始，相对的从链接所在的目录开始。拼好的路径放在 buf 里，
+    /// 不递归，栈上只多一个 buf。跟着走超过 max_follows 次是 SymlinkLoop，拼出来超过 buf 是 NameTooLong。
+    /// 符号链接后面的 ".." 是目标的父目录（按 Inode.parent），不是链接所在的目录（和 Unix 一样）。
+    fn walk(fs: *Fs, cwd: u64, path0: []const u8, follow_last: bool) Error!u64 {
+        if (path0.len == 0) return error.NotFound;
+        var buf: [max_symlink]u8 = undefined;
+        var path = path0;
+        var pos: usize = 0;
         var ino = if (path[0] == '/') root_ino else cwd;
-        var it = std.mem.tokenizeScalar(u8, path, '/');
-        while (it.next()) |part| {
+        var follows: usize = 0;
+        while (true) {
+            while (pos < path.len and path[pos] == '/') pos += 1;
+            if (pos == path.len) return ino;
+            const end = std.mem.indexOfScalarPos(u8, path, pos, '/') orelse path.len;
+            const part = path[pos..end];
+            pos = end;
             const ind = try fs.getInode(ino);
             if (ind.kind != .dir) return error.NotDir;
             if (std.mem.eql(u8, part, ".")) continue;
@@ -247,9 +280,26 @@ pub const Fs = struct {
             }
             if (part.len > max_name) return error.NameTooLong;
             const found, _ = try fs.scan(ino, part);
-            ino = (found orelse return error.NotFound).ino;
+            const e = found orelse return error.NotFound;
+            const rest = path[pos..]; // 以 '/' 开头，或者是空的
+            const last = std.mem.trimStart(u8, rest, "/").len == 0;
+            if (e.kind != .symlink or (last and !follow_last)) {
+                ino = e.ino;
+                continue;
+            }
+            follows += 1;
+            if (follows > max_follows) return error.SymlinkLoop;
+            // 先把还没走的部分挪到目标后面（它可能就在 buf 里，所以用 memmove），再把目标读到 buf 的开头
+            const size = (try fs.getInode(e.ino)).size;
+            if (size == 0 or size > max_symlink) return error.Corrupt;
+            const n: usize = @intCast(size);
+            if (n + rest.len > buf.len) return error.NameTooLong;
+            @memmove(buf[n..][0..rest.len], rest);
+            _ = try fs.readlink(e.ino, &buf);
+            path = buf[0 .. n + rest.len];
+            pos = 0;
+            if (path[0] == '/') ino = root_ino; // 相对的目标从链接所在的目录（还是 ino）开始
         }
-        return ino;
     }
 
     /// 路径的父目录和最后一段名字（创建、删除用）。最后一段不能是 "."、".."，父目录必须是目录。
@@ -267,23 +317,111 @@ pub const Fs = struct {
     /// 新建一个空文件或空目录，返回它的 inode 号。已经有这个名字时返回 Exists。
     pub fn create(fs: *Fs, cwd: u64, path: []const u8, kind: Kind) Error!u64 {
         std.debug.assert(kind == .file or kind == .dir);
-        return fs.makeNode(cwd, path, kind, 0);
+        return fs.makeNode(cwd, path, kind, 0, 0);
     }
 
     /// 新建一个设备文件，返回它的 inode 号（mknod）。major 是哪个设备，文件系统不管它是不是真有这个设备。
     pub fn mknod(fs: *Fs, cwd: u64, path: []const u8, major: u16) Error!u64 {
-        return fs.makeNode(cwd, path, .device, major);
+        return fs.makeNode(cwd, path, .device, major, 0);
     }
 
-    fn makeNode(fs: *Fs, cwd: u64, path: []const u8, kind: Kind, major: u16) Error!u64 {
+    /// 新建一个符号链接 path，指向 target，返回它的 inode 号。target 不用存在（可以以后再建，也可以永远不存在），
+    /// 原样存下，用到时才解析。target 是空的是 NotFound（和 Linux 一样），超过 max_symlink 字节是 NameTooLong。
+    pub fn symlink(fs: *Fs, cwd: u64, target: []const u8, path: []const u8) Error!u64 {
+        if (target.len == 0) return error.NotFound;
+        if (target.len > max_symlink) return error.NameTooLong;
+        const ino = try fs.makeNode(cwd, path, .symlink, 0, target.len);
+        const h = @sizeOf(ExtentHeader);
+        var buf: [h + max_symlink]u8 = undefined;
+        @memcpy(buf[0..h], std.mem.asBytes(&ExtentHeader{ .kind = .inline_data }));
+        @memcpy(buf[h..][0..target.len], target);
+        try fs.vol.insert(extentKey(ino, 0), buf[0 .. h + target.len]);
+        return ino;
+    }
+
+    /// 符号链接 ino 的目标，复制进 out，返回那一段。不是符号链接是 NotSymlink。
+    pub fn readlink(fs: *Fs, ino: u64, out: *[max_symlink]u8) Error![]u8 {
+        const ind = try fs.getInode(ino);
+        if (ind.kind != .symlink) return error.NotSymlink;
+        if (ind.size == 0 or ind.size > max_symlink) return error.Corrupt;
+        const n: usize = @intCast(ind.size);
+        const h = @sizeOf(ExtentHeader);
+        var buf: [h + max_symlink]u8 = undefined;
+        const size = try fs.lookup(extentKey(ino, 0), &buf) orelse return error.Corrupt;
+        if (size != h + n or std.mem.bytesToValue(ExtentHeader, buf[0..h]).kind != .inline_data) return error.Corrupt;
+        @memcpy(out[0..n], buf[h..][0..n]);
+        return out[0..n];
+    }
+
+    fn makeNode(fs: *Fs, cwd: u64, path: []const u8, kind: Kind, major: u16, size: u64) Error!u64 {
         const dir, const name = try fs.resolveParent(cwd, path);
         const found, const seq = try fs.scan(dir, name);
         if (found != null) return error.Exists;
+        return fs.newNode(dir, name, seq, kind, major, size);
+    }
+
+    /// 在目录 dir 里建名字是 name（scan 过、没有）的新 inode，seq 是 scan 给的序号。
+    fn newNode(fs: *Fs, dir: u64, name: []const u8, seq: u64, kind: Kind, major: u16, size: u64) Error!u64 {
         const ino = fs.next_ino;
         fs.next_ino += 1;
-        try fs.vol.insert(Key.init(ino, type_inode, 0), std.mem.asBytes(&Inode{ .kind = kind, .major = major, .size = 0, .parent = dir }));
+        try fs.vol.insert(Key.init(ino, type_inode, 0), std.mem.asBytes(&Inode{ .kind = kind, .major = major, .size = size, .parent = dir }));
         try fs.addEntry(dir, nameHash(name) << 32 | seq, ino, kind, name);
         return ino;
+    }
+
+    /// open(O_CREATE) 用：path 跟着符号链接走到的文件，没有就建一个空文件，返回 inode 号。
+    /// 最后一段是指向不存在的东西的符号链接时，建的是它指向的那个文件（和 Unix 一样）；中间缺的目录不建（NotFound）。
+    pub fn createFollow(fs: *Fs, cwd: u64, path: []const u8) Error!u64 {
+        var buf: [max_symlink]u8 = undefined;
+        var at = cwd;
+        var p = path;
+        for (0..max_follows + 1) |_| {
+            const dir, const name = try fs.resolveParent(at, p);
+            const found, const seq = try fs.scan(dir, name);
+            const e = found orelse return fs.newNode(dir, name, seq, .file, 0, 0);
+            if (e.kind != .symlink) return e.ino;
+            p = try fs.readlink(e.ino, &buf); // 相对的目标从链接所在的目录开始
+            at = dir;
+        }
+        return error.SymlinkLoop;
+    }
+
+    /// 目录 ino 从根目录开始的路径（getcwd），写在 out 的末尾，返回那一段。沿着 parent 往上走，
+    /// 在每一层的父目录里找指向它的目录项（目录只有一个名字）。out 放不下是 NameTooLong。
+    /// 走的是真实的目录（parent），所以经过符号链接 cd 进来的目录，得到的是它真正的位置。
+    pub fn dirPath(fs: *Fs, ino: u64, out: []u8) Error![]u8 {
+        var at = ino;
+        var ind = try fs.getInode(at);
+        if (ind.kind != .dir) return error.NotDir;
+        var start = out.len;
+        var name: [max_name]u8 = undefined;
+        while (at != root_ino) {
+            const parent = ind.parent;
+            const n = try fs.nameOf(parent, at, &name);
+            if (n + 1 > start) return error.NameTooLong; // 磁盘上有环的话也停在这里
+            start -= n;
+            @memcpy(out[start..][0..n], name[0..n]);
+            start -= 1;
+            out[start] = '/';
+            at = parent;
+            ind = try fs.getInode(at);
+        }
+        if (start == out.len) {
+            if (start == 0) return error.NameTooLong;
+            start -= 1;
+            out[start] = '/';
+        }
+        return out[start..];
+    }
+
+    /// 目录 dir 里指向 child 的目录项的名字，返回长度。没有是 Corrupt（child 的 parent 是 dir，dir 里却没有它）。
+    fn nameOf(fs: *Fs, dir: u64, child: u64, name: *[max_name]u8) Error!usize {
+        var cookie: u64 = 0;
+        while (try fs.readdir(dir, cookie, name)) |d| {
+            if (d.ino == child) return d.name_len;
+            cookie = d.next;
+        }
+        return error.Corrupt;
     }
 
     /// 在目录 dir 里插一个目录项：键的 offset 是 offset，指向 ino。
@@ -297,8 +435,9 @@ pub const Fs = struct {
 
     /// 硬链接：给 old 指着的文件（或设备）再起一个名字 new，链接数加 1。目录不行（IsDirLink），
     /// new 已经有了是 Exists。两个名字是同一个 inode：改了内容两边都看得到，删掉一个另一个照常。
+    /// old 是符号链接的话，链接的是符号链接自己（和 Linux 的 link 一样，不跟着走）。
     pub fn link(fs: *Fs, cwd: u64, old: []const u8, new: []const u8) Error!void {
-        const ino = try fs.resolve(cwd, old);
+        const ino = try fs.resolveNoFollow(cwd, old);
         var ind = try fs.getInode(ino);
         if (ind.kind == .dir) return error.IsDirLink;
         if (ind.nlink == std.math.maxInt(u32)) return error.TooManyLinks;
@@ -584,6 +723,7 @@ pub const Fs = struct {
         files: u64 = 0,
         dirs: u64 = 0,
         devices: u64 = 0,
+        symlinks: u64 = 0,
         /// 读过、校验和对得上的数据块
         data_blocks: u64 = 0,
     };
@@ -601,6 +741,7 @@ pub const Fs = struct {
     ///   目录项的个数、指向的 inode 号之和、之和的散列版本，都和每个 inode 按 nlink 次算的一样
     ///   （一个 inode 多一个名字、另一个少一个，这三个同时对上的概率可以忽略）。
     /// - 设备文件没有内容、长度是 0；只有设备文件的 major 不是 0。
+    /// - 符号链接的长度是 1..max_symlink，正好有一个内联在第 0 页的内容条目（目标），长度就是 inode 的长度。
     pub fn check(fs: *Fs) Error!CheckStats {
         var stats: CheckStats = .{ .tree = try fs.vol.check() };
         var buf: [btree.max_data]u8 = undefined;
@@ -617,6 +758,7 @@ pub const Fs = struct {
             if (f.key.type != type_inode and (cur == null or cur_ino != ino)) return error.Corrupt; // 没有 inode 的条目
             switch (f.key.type) {
                 type_inode => {
+                    if (missingTarget(cur, cur_inline)) return error.Corrupt;
                     if (f.key.offset != 0 or data.len != @sizeOf(Inode)) return error.Corrupt;
                     const ind = std.mem.bytesToValue(Inode, data);
                     if (ind.nlink == 0 or (ind.kind != .device and ind.major != 0) or ind._pad != 0) return error.Corrupt;
@@ -630,6 +772,10 @@ pub const Fs = struct {
                         .device => {
                             if (ind.size != 0) return error.Corrupt;
                             stats.devices += 1;
+                        },
+                        .symlink => {
+                            if (ind.size == 0 or ind.size > max_symlink) return error.Corrupt;
+                            stats.symlinks += 1;
                         },
                         _ => return error.Corrupt,
                     }
@@ -655,8 +801,8 @@ pub const Fs = struct {
                 },
                 type_extent => {
                     const ind = cur.?;
-                    if (ind.kind != .file or f.key.offset % block_size != 0 or f.key.offset >= ind.size or cur_inline or
-                        data.len < @sizeOf(ExtentHeader)) return error.Corrupt;
+                    if ((ind.kind != .file and ind.kind != .symlink) or f.key.offset % block_size != 0 or f.key.offset >= ind.size or
+                        cur_inline or data.len < @sizeOf(ExtentHeader)) return error.Corrupt;
                     const head = std.mem.bytesToValue(ExtentHeader, data[0..@sizeOf(ExtentHeader)]);
                     switch (head.kind) {
                         .inline_data => {
@@ -664,7 +810,7 @@ pub const Fs = struct {
                             cur_inline = true;
                         },
                         .block => {
-                            if (data.len != @sizeOf(BlockExtent)) return error.Corrupt;
+                            if (data.len != @sizeOf(BlockExtent) or ind.kind == .symlink) return error.Corrupt;
                             const b = try fs.readData(std.mem.bytesToValue(BlockExtent, data));
                             bio.release(b);
                             stats.data_blocks += 1;
@@ -675,8 +821,14 @@ pub const Fs = struct {
                 else => return error.Corrupt,
             }
         }
-        if (stats.dirs == 0 or !std.meta.eql(names, inodes)) return error.Corrupt;
+        if (missingTarget(cur, cur_inline) or stats.dirs == 0 or !std.meta.eql(names, inodes)) return error.Corrupt;
         return stats;
+    }
+
+    /// check 用：刚看完的 inode 是符号链接，却没有内联的目标
+    fn missingTarget(ind: ?Inode, has_inline: bool) bool {
+        const i = ind orelse return false;
+        return i.kind == .symlink and !has_inline;
     }
 
     /// 目录 ino（inode 是 ind）沿着 parent 往上走得到根目录。一路上都得是目录；走的步数比 inode 号的个数还多就是有环。
@@ -1164,6 +1316,136 @@ test "硬链接：几个名字一个 inode，删到最后一个才删内容；�
     _ = try fs.check();
 }
 
+test "符号链接：解析路径时跟着走，unlink/rename/link 对链接自己，环、太长、悬空" {
+    const expectEqual = std.testing.expectEqual;
+    const expectError = std.testing.expectError;
+    var fs = try testSetup(256);
+    defer testFree();
+    const a = try fs.run(Fs.create, .{ root_ino, "/a", Kind.dir });
+    const b = try fs.run(Fs.create, .{ root_ino, "/a/b", Kind.dir });
+    const f = try fs.run(Fs.create, .{ root_ino, "/a/b/f", Kind.file });
+    try writeAt(&fs, f, 0, "content");
+    var buf: [64]u8 = undefined;
+    var tbuf: [max_symlink]u8 = undefined;
+
+    // 绝对的、相对的目标；最后一段跟着走，NoFollow 停在链接上
+    const l1 = try fs.run(Fs.symlink, .{ root_ino, "/a/b/f", "/abs" });
+    const l2 = try fs.run(Fs.symlink, .{ a, "b/f", "rel" }); // 在 /a 里，相对于 /a
+    try expectEqual(f, try fs.resolve(root_ino, "/abs"));
+    try expectEqual(f, try fs.resolve(root_ino, "/a/rel"));
+    try expectEqual(l1, try fs.resolveNoFollow(root_ino, "/abs"));
+    try expectEqual(l2, try fs.resolveNoFollow(b, "../rel"));
+    try std.testing.expectEqualStrings("content", try readAll(&fs, "/a/rel", &buf));
+    try std.testing.expectEqualStrings("b/f", try fs.readlink(l2, &tbuf));
+    const st = try fs.stat(l2);
+    try expectEqual(Kind.symlink, st.kind);
+    try expectEqual(3, st.size);
+    try expectError(error.NotSymlink, fs.readlink(f, &tbuf));
+    try expectError(error.IsDir, fs.read(l1, 0, 1, SliceOut{ .buf = &buf })); // 读写由调用方先跟着走
+
+    // 中间一段是链接：指向目录，后面接着走；链接后面的 .. 是目标的父目录
+    const tob = try fs.run(Fs.symlink, .{ root_ino, "a/b", "/tob" });
+    try expectEqual(f, try fs.resolve(root_ino, "/tob/f"));
+    try expectEqual(f, try fs.resolve(root_ino, "tob//./f/"));
+    try expectEqual(a, try fs.resolve(root_ino, "/tob/.."));
+    try expectEqual(tob, try fs.resolveNoFollow(root_ino, "/tob/")); // 后面只有 '/' 也算最后一段
+    // 链接的链：/c -> /tob -> a/b
+    _ = try fs.run(Fs.symlink, .{ root_ino, "/tob", "/c" });
+    try expectEqual(f, try fs.resolve(root_ino, "/c/f"));
+    // 在链接后面建东西（resolveParent 跟着走）
+    const g = try fs.run(Fs.create, .{ root_ino, "/c/g", Kind.file });
+    try expectEqual(b, (try fs.getInode(g)).parent);
+
+    // 悬空的链接：解析是 NotFound，NoFollow 找得到；建文件时建的是它指向的那个
+    const d = try fs.run(Fs.symlink, .{ root_ino, "/a/new", "/dangling" });
+    try expectError(error.NotFound, fs.resolve(root_ino, "/dangling"));
+    try expectEqual(d, try fs.resolveNoFollow(root_ino, "/dangling"));
+    const made = try fs.run(Fs.createFollow, .{ root_ino, "/dangling" });
+    try expectEqual(made, try fs.resolve(root_ino, "/a/new"));
+    try expectEqual(made, try fs.run(Fs.createFollow, .{ root_ino, "/dangling" })); // 有了就返回它
+    _ = try fs.run(Fs.symlink, .{ root_ino, "/nodir/x", "/d2" });
+    try expectError(error.NotFound, fs.run(Fs.createFollow, .{ root_ino, "/d2" }));
+    try expectError(error.Exists, fs.run(Fs.create, .{ root_ino, "/dangling", Kind.file })); // 不跟着走的 create
+
+    // 环：自己指自己、两个互指；跟 max_follows 次可以，多一次不行
+    _ = try fs.run(Fs.symlink, .{ root_ino, "/self", "/self" });
+    _ = try fs.run(Fs.symlink, .{ root_ino, "/p2", "/p1" });
+    _ = try fs.run(Fs.symlink, .{ root_ino, "/p1", "/p2" });
+    try expectError(error.SymlinkLoop, fs.resolve(root_ino, "/self"));
+    try expectError(error.SymlinkLoop, fs.resolve(root_ino, "/p1/x"));
+    try expectError(error.SymlinkLoop, fs.run(Fs.createFollow, .{ root_ino, "/p1" }));
+    try expectError(error.SymlinkLoop, fs.run(Fs.create, .{ root_ino, "/p1/x", Kind.file }));
+    var name: [8]u8 = undefined;
+    var target: [8]u8 = undefined;
+    for (0..max_follows + 1) |i| { // /s0 -> /s1 -> ... -> /s10 -> /a/b/f
+        const t = if (i == max_follows) "/a/b/f" else try std.fmt.bufPrint(&target, "/s{d}", .{i + 1});
+        _ = try fs.run(Fs.symlink, .{ root_ino, t, try std.fmt.bufPrint(&name, "/s{d}", .{i}) });
+    }
+    try expectEqual(f, try fs.resolve(root_ino, "/s1"));
+    try expectError(error.SymlinkLoop, fs.resolve(root_ino, "/s0"));
+
+    // 目标的长度：空的、超长的不行，正好 max_symlink 可以；拼出来的路径超过 max_symlink 是 NameTooLong
+    try expectError(error.NotFound, fs.run(Fs.symlink, .{ root_ino, "", "/e" }));
+    const long: [max_symlink + 1]u8 = @splat('/');
+    try expectError(error.NameTooLong, fs.run(Fs.symlink, .{ root_ino, &long, "/e" }));
+    const lmax = try fs.run(Fs.symlink, .{ root_ino, long[0..max_symlink], "/e" });
+    try expectEqual(max_symlink, (try fs.readlink(lmax, &tbuf)).len);
+    try expectEqual(root_ino, try fs.resolve(root_ino, "/e"));
+    try expectError(error.NameTooLong, fs.resolve(root_ino, "/e/a"));
+    try expectError(error.Exists, fs.run(Fs.symlink, .{ root_ino, "/x", "/abs" }));
+    try expectError(error.InvalidName, fs.run(Fs.symlink, .{ root_ino, "/x", "/" }));
+    _ = try fs.check();
+
+    // unlink、rename 对的是链接自己，目标不动；link 链接的也是链接自己
+    try fs.run(Fs.rename, .{ root_ino, "/abs", "/a/abs2" });
+    try expectEqual(f, try fs.resolve(root_ino, "/a/abs2"));
+    try fs.run(Fs.link, .{ root_ino, "/a/abs2", "/hard" });
+    try expectEqual(l1, try fs.resolveNoFollow(root_ino, "/hard"));
+    try expectEqual(2, (try fs.stat(l1)).nlink);
+    try fs.run(Fs.unlink, .{ root_ino, "/a/abs2" });
+    try fs.run(Fs.unlink, .{ root_ino, "/hard" });
+    try expectError(error.NotFound, fs.stat(l1));
+    try expectEqual(1, (try fs.stat(f)).nlink);
+    try fs.run(Fs.unlink, .{ root_ino, "/tob" }); // 指向目录的链接像文件一样删，不管目录空不空
+    try expectEqual(b, try fs.resolve(root_ino, "/a/b"));
+    try expectError(error.NotFound, fs.resolve(root_ino, "/c")); // 链里断了一环
+    const stats = try fs.check();
+    try expectEqual(19, stats.symlinks); // rel、c、dangling、d2、self、p1、p2、s0..s10、e
+
+    // 重新挂载之后还在
+    testReboot();
+    fs = try Fs.mount(&test_vol);
+    try expectEqual(f, try fs.resolve(root_ino, "/a/rel"));
+    try std.testing.expectEqualStrings("b/f", try fs.readlink(l2, &tbuf));
+    _ = try fs.check();
+}
+
+test "dirPath：目录的路径（getcwd）" {
+    var fs = try testSetup(256);
+    defer testFree();
+    var out: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("/", try fs.dirPath(root_ino, &out));
+    const x = try fs.run(Fs.create, .{ root_ino, "/x", Kind.dir });
+    const y = try fs.run(Fs.create, .{ root_ino, "/x/yy", Kind.dir });
+    const f = try fs.run(Fs.create, .{ root_ino, "/x/f", Kind.file });
+    _ = try fs.run(Fs.create, .{ root_ino, "/x/zz", Kind.dir }); // 同一个目录里别的名字
+    try std.testing.expectEqualStrings("/x", try fs.dirPath(x, &out));
+    try std.testing.expectEqualStrings("/x/yy", try fs.dirPath(y, &out));
+    try std.testing.expectError(error.NotDir, fs.dirPath(f, &out));
+    // 经过符号链接到的目录：路径是它真正的位置
+    _ = try fs.run(Fs.symlink, .{ root_ino, "/x/yy", "/l" });
+    try std.testing.expectEqualStrings("/x/yy", try fs.dirPath(try fs.resolve(root_ino, "/l"), &out));
+    // 改名之后跟着变；放不下是 NameTooLong（正好放得下可以）
+    try fs.run(Fs.rename, .{ root_ino, "/x", "/renamed" });
+    try std.testing.expectEqualStrings("/renamed/yy", try fs.dirPath(y, &out));
+    try std.testing.expectError(error.NameTooLong, fs.dirPath(y, out[0..10]));
+    try std.testing.expectEqualStrings("/renamed/yy", try fs.dirPath(y, out[0..11]));
+    try std.testing.expectError(error.NameTooLong, fs.dirPath(root_ino, out[0..0]));
+    // 删掉了的目录
+    try fs.run(Fs.unlink, .{ root_ino, "/renamed/yy" });
+    try std.testing.expectError(error.NotFound, fs.dirPath(y, &out));
+}
+
 test "check：条目之间对不上的都是 Corrupt" {
     var fs = try testSetup(256);
     defer testFree();
@@ -1173,6 +1455,7 @@ test "check：条目之间对不上的都是 Corrupt" {
     const dev = try fs.run(Fs.mknod, .{ root_ino, "/d/dev", 2 });
     try writeAt(&fs, f, 0, "hello");
     try fs.run(Fs.link, .{ root_ino, "/d/f", "/f2" });
+    const sym = try fs.run(Fs.symlink, .{ root_ino, "f", "/d/sym" });
     _ = try fs.check();
     const v = fs.vol;
     const n = fs.next_ino;
@@ -1193,6 +1476,9 @@ test "check：条目之间对不上的都是 Corrupt" {
         file_major,
         cycle,
         entry_in_file,
+        symlink_no_target,
+        symlink_wrong_size,
+        symlink_in_block,
     };
     for (std.enums.values(Bad)) |bad| {
         var entry: [@sizeOf(DirHeader) + 1]u8 = undefined;
@@ -1239,6 +1525,12 @@ test "check：条目之间对不上的都是 Corrupt" {
             },
             // 文件里有目录项
             .entry_in_file => try v.insert(Key.init(f, type_dir, nameHash("x") << 32), dirEntry(&entry, d, .dir)),
+            // 符号链接没有目标
+            .symlink_no_target => try v.delete(Fs.extentKey(sym, 0)),
+            // 符号链接的长度和目标对不上
+            .symlink_wrong_size => try v.update(Key.init(sym, type_inode, 0), std.mem.asBytes(&Inode{ .kind = .symlink, .size = 2, .parent = d })),
+            // 符号链接的目标在数据块里
+            .symlink_in_block => try v.update(Fs.extentKey(sym, 0), std.mem.asBytes(&BlockExtent{ .head = .{ .kind = .block }, .blockno = 2, .generation = 1 })),
         }
         std.testing.expectError(error.Corrupt, fs.check()) catch |err| {
             std.debug.print("not detected: {s}\n", .{@tagName(bad)});

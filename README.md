@@ -13,9 +13,9 @@
 - 多进程，照 xv6 的结构：时间片轮转调度（每个 hart 一个调度器循环、`sleep`/`wakeup`、`kill` 只做标记）；`fork`/`exec`/`wait`、父子进程、zombie 和孤儿回收；最多 64 个进程，每个最多 32 个 fd，整个系统最多 128 个打开的文件
 - 写时复制的 `fork`：父子进程共用物理页（页分配器记引用数），谁先写哪一页谁在缺页异常里复制一份
 - 磁盘：virtio 块设备驱动（DMA + 中断，等磁盘时进程睡着），睡眠锁，照 xv6 的缓冲区缓存（LRU）
-- 文件系统，类似 btrfs：所有东西（inode、目录项、文件内容）都是一棵写时复制 B 树里的条目，每个操作一个事务，掉电后总是某个操作做完的样子；小文件内联在树里，数据块带校验和；硬链接；设备文件（`/dev/console`、`/dev/null`、`/dev/zero`）；构建时由主机上的 `mkfs` 生成磁盘镜像，用户程序装在 `/bin`
-- 34 个系统调用：文件描述符（`read`/`write`/`close`/`dup`）和管道（`pipe`），文件系统（`open`（含 `O_APPEND`）/`lseek`/`rename`/`link`/`mknod`/`mkdir`/`unlink`/`chdir`/`fstat`/`readdir`，检查整个文件系统的 `scrub`），命令行参数（`exec` 带 `argv`，最多 32 个），堆（`sbrk`），读写磁盘的原始区域（`readblock`/`writeblock`）
-- 用户态的 init 和 shell：init 启动 shell，shell 用 `fork` + `exec` 运行程序（直接写程序名，或者 `run 程序名`），可以带参数、在后台运行、用 `|` 接成管道、用 `<`、`>`、`>>` 重定向到文件，`cd` 换当前目录
+- 文件系统，类似 btrfs：所有东西（inode、目录项、文件内容）都是一棵写时复制 B 树里的条目，每个操作一个事务，掉电后总是某个操作做完的样子；小文件内联在树里，数据块带校验和；硬链接、符号链接；设备文件（`/dev/console`、`/dev/null`、`/dev/zero`）；构建时由主机上的 `mkfs` 生成磁盘镜像，用户程序装在 `/bin`
+- 38 个系统调用：文件描述符（`read`/`write`/`close`/`dup`）和管道（`pipe`），文件系统（`open`（含 `O_APPEND`）/`lseek`/`rename`/`link`/`symlink`/`readlink`/`mknod`/`mkdir`/`unlink`/`chdir`/`getcwd`/`fstat`/`lstat`/`readdir`，检查整个文件系统的 `scrub`），命令行参数（`exec` 带 `argv`，最多 32 个），堆（`sbrk`），读写磁盘的原始区域（`readblock`/`writeblock`）
+- 用户态的 init 和 shell：init 启动 shell，shell 用 `fork` + `exec` 运行程序（直接写程序名，或者 `run 程序名`），可以带参数、在后台运行、用 `|` 接成管道、用 `<`、`>`、`>>` 重定向到文件；`;`、`&&`、`||`，引号和转义，变量和 `$?`，`*`、`?` 匹配文件名，`cd`/`pwd`/`cd -`，上下方向键翻历史、Tab 补全，`sh 脚本`、`sh -c`
 - 照 xv6 加锁，并且尽量细：每个进程、每个管道、每个打开的文件一把锁；页分配器每个 hart 一条空闲链表；缓冲区缓存按块号分桶；文件系统的读者在已提交的树的快照上读、不拿锁，修改之间才排队
 
 ```
@@ -118,13 +118,22 @@ shell 是用户程序（`user/sh.zig`），由 init 启动。
 | `uptime` | 开机时长，精度 10 ms |
 | `mem` | 物理页的使用情况 |
 | `disk` | 磁盘的原始区域（文件系统之后的块）有多大 |
-| `cd [DIR]` | 换当前目录，不给时回到 `/` |
-| `NAME [ARGS...]` 或 `run NAME [ARGS...]` | 用 `fork` + `exec` 运行用户程序 `NAME`（`hello`、`fault`、`spin`、`ticker`、`echo`、`cat`、`wc`、`ls`、`mkdir`、`rm`、`mv`、`ln`、`scrub`），带上参数，等它结束，Ctrl-C 结束它；只写 `run` 时列出所有程序。下面几行的 `run` 也都可以不写 |
-| `run A \| B \| ...` | 管道：A 的输出接到 B 的输入，最多 8 个程序；Ctrl-C 结束整条管道 |
-| `run ... > F`、`run ... >> F`、`run ... < F` | 标准输出写进文件 `F`（没有就建，有就清空）、追加到 `F` 末尾、标准输入从 `F` 读 |
-| `run ... &` | 在后台运行，马上回到提示符 |
-| `ps` | 列出进程：pid、父进程、状态、用掉的时钟 tick 数 |
-| `kill PID` | 结束进程（init 不能杀；杀掉 shell 的话 init 会重新启动一个） |
+| `cd [DIR]`、`cd -` | 换当前目录，不给时回到 `/`，`-` 回到上一个目录 |
+| `pwd` | 当前目录的绝对路径 |
+| `NAME [ARGS...]` 或 `run NAME [ARGS...]` | 用 `fork` + `exec` 运行用户程序 `NAME`（`hello`、`fault`、`spin`、`ticker`、`echo`、`cat`、`wc`、`ls`、`mkdir`、`rm`、`mv`、`ln`、`scrub`、`sh`），带上参数，等它结束，Ctrl-C 结束它；只写 `run` 时列出所有程序 |
+| `A \| B \| ...` | 管道：A 的输出接到 B 的输入，最多 8 个程序；Ctrl-C 结束整条管道 |
+| `... > F`、`... >> F`、`... < F` | 标准输出写进文件 `F`（没有就建，有就清空）、追加到 `F` 末尾、标准输入从 `F` 读 |
+| `... &` | 在后台运行，马上回到提示符（`$!` 是它的 pid） |
+| `A ; B`、`A && B`、`A \|\| B` | 依次执行；A 成功才执行 B；A 失败才执行 B |
+| `'...'`、`"..."`、`\x` | 引号、转义：参数里可以有空格和特殊字符，`"..."` 里展开变量 |
+| `NAME=VALUE`、`$NAME`、`$?`、`set`、`unset NAME` | 变量；`$?` 是上一个命令的退出码 |
+| `*`、`?` | 匹配文件名（`echo /bin/t_*`） |
+| `time A` | 运行 A，打印用了多久 |
+| `sh FILE [ARGS...]`、`sh -c CMDS` | 执行脚本里的命令（`$1`、`$2`... 是参数）、执行 CMDS |
+| `ps`、`jobs` | 列出进程：pid、父进程、状态、用掉的时钟 tick 数；只列这个 shell 的后台进程 |
+| `kill PID...`、`wait [PID]` | 结束进程（init 不能杀；杀掉 shell 的话 init 会重新启动一个）；等后台进程结束 |
+| `history`、↑、↓、Tab | 最近的命令；方向键翻历史；Tab 补全程序名和路径 |
+| `true`、`false`、`exit [N]` | 以 0、1 结束；shell 以 N 结束（init 再启动一个） |
 | `shutdown` | 通过 SBI 关机，QEMU 随之退出 |
 
 ## 文档
@@ -159,4 +168,5 @@ tools/          QEMU 测试脚本
 
 - 从设备树读串口、PLIC 的地址和中断号
 - 按需分页（`sbrk` 先不分配，第一次访问时再分配）；内核栈两侧的保护页
-- 文件系统：`rename`、`lseek`、把几个操作攒进一个事务、按文件分锁
+- 文件系统：把几个操作攒进一个事务、按文件分锁、权限和时间戳
+- shell：`if`/`while`、命令替换 `$(...)`、环境变量（要先有传环境的 `exec`）

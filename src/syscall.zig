@@ -16,7 +16,13 @@ const proc = @import("proc.zig");
 const file = @import("file.zig");
 const bio = @import("bio.zig");
 const fsys = @import("fsys.zig");
+const fs = @import("fs.zig");
 const Fs = fsys.Fs;
+
+comptime {
+    // 符号链接的目标、getcwd 的结果都是路径
+    std.debug.assert(fs.max_symlink == abi.max_path);
+}
 const TrapFrame = @import("trap.zig").TrapFrame;
 
 /// 返回值会写回用户程序的 a0。
@@ -58,6 +64,10 @@ pub fn dispatch(frame: *TrapFrame) usize {
         .lseek => lseek(args[0], args[1], args[2]),
         .link => link(args[0], args[1], args[2], args[3]),
         .mknod => mknod(args[0], args[1], args[2]),
+        .symlink => symlink(args[0], args[1], args[2], args[3]),
+        .readlink => readlink(args[0], args[1], args[2], args[3]),
+        .getcwd => getcwd(args[0], args[1]),
+        .lstat => lstat(args[0], args[1], args[2]),
         _ => abi.fail(.nosys),
     };
 }
@@ -255,9 +265,10 @@ fn open(path_ptr: usize, path_len: usize, flags: usize) usize {
 }
 
 /// 找到（或者建好、截断）要打开的 inode，返回它的 Stat。root 是读者的话 flags 里不会有要改文件系统的（见 open）。
-fn openPath(root: *Fs, cwd: u64, path: []const u8, flags: usize, writable: bool) @import("fs.zig").Error!@import("fs.zig").Stat {
+/// 跟着符号链接走；没有并且带 open_create 时建文件，最后一段是悬空的符号链接的话建的是它指向的那个（createFollow）。
+fn openPath(root: *Fs, cwd: u64, path: []const u8, flags: usize, writable: bool) fs.Error!fs.Stat {
     const ino = root.resolve(cwd, path) catch |err| switch (err) {
-        error.NotFound => if (flags & abi.open_create != 0) return root.stat(try root.run(Fs.create, .{ cwd, path, .file })) else return err,
+        error.NotFound => if (flags & abi.open_create != 0) return root.stat(try root.run(Fs.createFollow, .{ cwd, path })) else return err,
         else => return err,
     };
     const st = try root.stat(ino);
@@ -330,6 +341,62 @@ fn mknod(path_ptr: usize, path_len: usize, major: usize) usize {
     return 0;
 }
 
+/// 建符号链接：两个路径都先复制进内核，再拿着写锁一个事务做完（fs.Fs.symlink）。target 原样存下，不检查它在不在。
+fn symlink(target_ptr: usize, target_len: usize, path_ptr: usize, path_len: usize) usize {
+    var target_buf: [abi.max_path]u8 = undefined;
+    var path_buf: [abi.max_path]u8 = undefined;
+    const target = userPath(target_ptr, target_len, &target_buf) catch |err| return abi.fail(fsys.errno(err));
+    const path = userPath(path_ptr, path_len, &path_buf) catch |err| return abi.fail(fsys.errno(err));
+    const root = fsys.writer() catch return abi.fail(.nodev);
+    defer fsys.unlock();
+    _ = root.run(Fs.symlink, .{ proc.current().?.cwd, target, path }) catch |err| return abi.fail(fsys.errno(err));
+    return 0;
+}
+
+/// 符号链接的目标写进用户内存，放不下就截断（和 Linux 一样），返回写了几个字节。在快照上读。
+fn readlink(path_ptr: usize, path_len: usize, buf_ptr: usize, buf_len: usize) usize {
+    var buf: [abi.max_path]u8 = undefined;
+    const path = userPath(path_ptr, path_len, &buf) catch |err| return abi.fail(fsys.errno(err));
+    var r = fsys.reader() catch return abi.fail(.nodev);
+    defer r.end();
+    const ino = r.fs.resolveNoFollow(proc.current().?.cwd, path) catch |err| return abi.fail(fsys.errno(err));
+    var target: [fs.max_symlink]u8 = undefined;
+    const t = r.fs.readlink(ino, &target) catch |err| return abi.fail(fsys.errno(err));
+    const n = @min(t.len, buf_len);
+    vm.copyToUser(space(), buf_ptr, t[0..n]) catch return abi.fail(.fault);
+    return n;
+}
+
+/// 当前目录的绝对路径（fs.Fs.dirPath，沿着 parent 往上找名字），在快照上找。
+fn getcwd(buf_ptr: usize, buf_len: usize) usize {
+    var r = fsys.reader() catch return abi.fail(.nodev);
+    defer r.end();
+    var out: [abi.max_path]u8 = undefined;
+    const path = r.fs.dirPath(proc.current().?.cwd, &out) catch |err| return abi.fail(switch (err) {
+        error.NameTooLong => .range, // 比 max_path 还长：用户的缓冲区不会比它大，当作放不下
+        else => fsys.errno(err),
+    });
+    if (path.len > buf_len) return abi.fail(.range);
+    vm.copyToUser(space(), buf_ptr, path) catch return abi.fail(.fault);
+    return path.len;
+}
+
+/// path 自己（是符号链接的话不跟着走）的 Stat。
+fn lstat(path_ptr: usize, path_len: usize, ptr: usize) usize {
+    var buf: [abi.max_path]u8 = undefined;
+    const path = userPath(path_ptr, path_len, &buf) catch |err| return abi.fail(fsys.errno(err));
+    var r = fsys.reader() catch return abi.fail(.nodev);
+    defer r.end();
+    const ino = r.fs.resolveNoFollow(proc.current().?.cwd, path) catch |err| return abi.fail(fsys.errno(err));
+    const s = r.fs.stat(ino) catch |err| return abi.fail(fsys.errno(err));
+    vm.copyToUser(space(), ptr, std.mem.asBytes(&abiStat(s))) catch return abi.fail(.fault);
+    return 0;
+}
+
+fn abiStat(s: fs.Stat) abi.Stat {
+    return .{ .ino = s.ino, .size = s.size, .kind = @fromBackingInt(@backingInt(s.kind)), .major = s.major, .nlink = s.nlink };
+}
+
 fn lseek(fd: usize, offset: usize, whence: usize) usize {
     const f = fileOf(fd) orelse return abi.fail(.badf);
     return file.seek(f, @bitCast(offset), whence) catch |err| fileError(err);
@@ -346,7 +413,7 @@ fn fstat(fd: usize, ptr: usize) usize {
             var r = fsys.reader() catch return abi.fail(.nodev);
             defer r.end();
             const s = r.fs.stat(f.ino) catch |err| return abi.fail(fsys.errno(err));
-            st = .{ .ino = s.ino, .size = s.size, .kind = @fromBackingInt(@backingInt(s.kind)), .major = s.major, .nlink = s.nlink };
+            st = abiStat(s);
         },
     }
     vm.copyToUser(space(), ptr, std.mem.asBytes(&st)) catch return abi.fail(.fault);
@@ -386,6 +453,7 @@ fn scrub(ptr: usize) usize {
     const info: abi.ScrubInfo = .{
         .files = st.files,
         .devices = st.devices,
+        .symlinks = st.symlinks,
         .dirs = st.dirs,
         .data_blocks = st.data_blocks,
         .nodes = st.tree.nodes,
@@ -435,6 +503,7 @@ fn exec(path_ptr: usize, path_len: usize, argv_ptr: usize, argc: usize) usize {
         error.NoDevice => .nodev,
         error.NotDir => .notdir,
         error.NameTooLong => .nametoolong,
+        error.SymlinkLoop => .loop,
     });
     return argc;
 }
